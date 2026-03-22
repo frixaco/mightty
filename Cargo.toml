@@ -3,6 +3,14 @@ name = "mightty"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "mightty"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mightty"
+path = "src/main.rs"
+
 [dependencies]
 gpui = "0.2"
 gpui-component = "0.5"
