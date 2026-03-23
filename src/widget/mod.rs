@@ -1,18 +1,27 @@
 //! Terminal Widget
 //!
 //! GPUI component that renders terminal content and handles user interaction.
-//! Combines ConPtyShell, libghostty Terminal, and InputMapper into a complete
+//! Combines ConPtyShell, libghostty Terminal, and GhosttyKeyEncoder into a complete
 //! terminal widget.
 
 use gpui::{
     div, prelude::*, px, Bounds, Context, FocusHandle, FontWeight, InteractiveElement, IntoElement,
-    KeyDownEvent, MouseButton, MouseDownEvent, Pixels, Render, Styled, Window,
+    KeyDownEvent, KeyUpEvent, MouseButton, MouseDownEvent, Pixels, Render, Styled, Window,
 };
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::{
+    mpsc::{channel, Receiver, Sender},
+    Arc, Condvar, Mutex,
+};
 use std::time::Duration;
 
-use crate::ghostty::{Cell, Color, GhosttyTerminalOptions, Terminal};
-use crate::input::{Arrow, InputMapper, Key, KeyCode, Modifiers};
+use crate::ghostty::{
+    ghostty_key_encoder_encode, ghostty_key_encoder_new, ghostty_key_encoder_setopt_from_terminal,
+    ghostty_key_event_new, ghostty_key_event_set_action, ghostty_key_event_set_composing,
+    ghostty_key_event_set_consumed_mods, ghostty_key_event_set_key, ghostty_key_event_set_mods,
+    ghostty_key_event_set_unshifted_codepoint, ghostty_key_event_set_utf8, Cell, Color, GhosttyKey,
+    GhosttyKeyAction, GhosttyKeyEncoder, GhosttyKeyEvent, GhosttyMods, GhosttyResult,
+    GhosttyTerminalOptions, Terminal,
+};
 #[cfg(windows)]
 use crate::shell::ConPtyShell;
 
@@ -63,12 +72,17 @@ impl Default for TerminalConfig {
 /// Output message from shell reader thread
 type OutputData = Vec<u8>;
 
+/// Wake signal for the shell I/O thread
+type IoWakeSignal = Arc<(Mutex<bool>, Condvar)>;
+
 /// Terminal widget state and rendering
 pub struct TerminalWidget {
     /// libghostty terminal emulator
     terminal: Terminal,
-    /// Input mapper for key events
-    input_mapper: InputMapper,
+    /// Key encoder for VT sequence generation
+    key_encoder: GhosttyKeyEncoder,
+    /// Key event for encoding
+    key_event: GhosttyKeyEvent,
     /// Configuration
     config: TerminalConfig,
     /// Output data receiver from reader thread
@@ -77,6 +91,8 @@ pub struct TerminalWidget {
     input_tx: Option<std::sync::mpsc::Sender<Vec<u8>>>,
     /// Resize event sender to shell I/O thread
     resize_tx: Option<Sender<(u16, u16)>>,
+    /// Wake signal for the shell I/O thread
+    io_wake: IoWakeSignal,
     /// Focus handle for tracking focus
     focus_handle: FocusHandle,
     /// Cursor blink state (visible/hidden)
@@ -145,11 +161,13 @@ impl TerminalWidget {
         let (output_tx, output_rx) = channel::<OutputData>();
         let (input_tx, input_rx) = channel::<Vec<u8>>();
         let (resize_tx, resize_rx) = channel::<(u16, u16)>();
+        let io_wake: IoWakeSignal = Arc::new((Mutex::new(false), Condvar::new()));
 
         // Clone config for the thread
         let shell_cmd = config.shell.clone();
         let rows = config.initial_rows;
         let cols = config.initial_cols;
+        let io_wake_thread = Arc::clone(&io_wake);
 
         // Start I/O thread that handles both reading and writing (Windows only)
         #[cfg(windows)]
@@ -164,51 +182,68 @@ impl TerminalWidget {
 
             let mut buf = [0u8; 4096];
             loop {
-                // Check for input (non-blocking)
-                match input_rx.try_recv() {
-                    Ok(data) => {
-                        if shell.write(&data).is_err() {
-                            break;
-                        }
-                    }
-                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        break;
-                    }
-                    Err(std::sync::mpsc::TryRecvError::Empty) => {}
-                }
+                let mut did_work = false;
 
-                // Check for resize events
-                match resize_rx.try_recv() {
-                    Ok((rows, cols)) => {
-                        if shell.resize(rows, cols).is_err() {
-                            break;
-                        }
-                    }
-                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        break;
-                    }
-                    Err(std::sync::mpsc::TryRecvError::Empty) => {}
-                }
-
-                // Non-blocking check for output using peek
-                match shell.peek() {
-                    Ok(true) => match shell.read(&mut buf) {
-                        Ok(n) if n > 0 => {
-                            if output_tx.send(buf[0..n].to_vec()).is_err() {
-                                break;
+                // Drain all pending input immediately so interactive input doesn't wait
+                // for the next polling tick.
+                loop {
+                    match input_rx.try_recv() {
+                        Ok(data) => {
+                            did_work = true;
+                            if shell.write(&data).is_err() {
+                                return;
                             }
                         }
-                        Ok(_) => {}
-                        Err(_) => break,
-                    },
-                    Ok(false) => {
-                        // Shell may have exited
+                        Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
                     }
-                    Err(_) => break,
                 }
 
-                // Standard polling interval (~60Hz)
-                std::thread::sleep(Duration::from_millis(16));
+                // Keep only the latest resize and apply it before reading output.
+                let mut pending_resize = None;
+                loop {
+                    match resize_rx.try_recv() {
+                        Ok(size) => {
+                            pending_resize = Some(size);
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
+                    }
+                }
+
+                if let Some((rows, cols)) = pending_resize {
+                    did_work = true;
+                    if shell.resize(rows, cols).is_err() {
+                        return;
+                    }
+                }
+
+                // Drain all available output before sleeping again.
+                loop {
+                    match shell.peek() {
+                        Ok(true) => match shell.read(&mut buf) {
+                            Ok(n) if n > 0 => {
+                                did_work = true;
+                                if output_tx.send(buf[0..n].to_vec()).is_err() {
+                                    return;
+                                }
+                            }
+                            Ok(_) => break,
+                            Err(_) => return,
+                        },
+                        Ok(false) => break,
+                        Err(_) => return,
+                    }
+                }
+
+                if !did_work {
+                    let (lock, cvar) = &*io_wake_thread;
+                    let pending = lock.lock().unwrap();
+                    let (mut pending, _) = cvar
+                        .wait_timeout(pending, Duration::from_millis(16))
+                        .unwrap();
+                    *pending = false;
+                }
             }
         });
 
@@ -217,18 +252,32 @@ impl TerminalWidget {
 
         let size = (config.initial_cols, config.initial_rows);
 
+        // Create key encoder and event
+        let mut key_encoder: GhosttyKeyEncoder = std::ptr::null_mut();
+        let mut key_event: GhosttyKeyEvent = std::ptr::null_mut();
+
+        unsafe {
+            if GhosttyResult::Success == ghostty_key_encoder_new(std::ptr::null(), &mut key_encoder)
+            {
+                ghostty_key_encoder_setopt_from_terminal(key_encoder, terminal.as_ptr());
+            }
+            ghostty_key_event_new(std::ptr::null(), &mut key_event);
+        }
+
         Self {
             terminal,
-            input_mapper: InputMapper::new(),
+            key_encoder,
+            key_event,
             config,
             output_rx,
             input_tx: Some(input_tx),
             resize_tx: Some(resize_tx),
+            io_wake,
             focus_handle: cx.focus_handle(),
             cursor_blink_phase: true,
             cursor_pos: (0, 0),
             size,
-            cell_size: (px(10.0), px(20.0)), // Monospace cell size (width, height)
+            cell_size: (px(8.0), px(14.0)), // Monospace cell size (width, height)
             theme: TerminalTheme::default(),
         }
     }
@@ -236,6 +285,14 @@ impl TerminalWidget {
     /// Create a terminal widget with default configuration
     pub fn default(cx: &mut Context<Self>) -> Self {
         Self::new(TerminalConfig::default(), cx)
+    }
+
+    fn wake_io_thread(&self) {
+        let (lock, cvar) = &*self.io_wake;
+        if let Ok(mut pending) = lock.lock() {
+            *pending = true;
+            cvar.notify_one();
+        }
     }
 
     /// Process any pending output from the shell
@@ -277,6 +334,7 @@ impl TerminalWidget {
                 // Also resize the shell
                 if let Some(ref resize_tx) = self.resize_tx {
                     let _ = resize_tx.send((rows, cols));
+                    self.wake_io_thread();
                 }
 
                 cx.notify();
@@ -291,25 +349,318 @@ impl TerminalWidget {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Don't process key if we don't have shell input connection
+        let action = if event.is_held {
+            GhosttyKeyAction::Repeat
+        } else {
+            GhosttyKeyAction::Press
+        };
+
+        self.send_encoded_key(action, &event.keystroke, cx);
+    }
+
+    fn handle_key_up(&mut self, event: &KeyUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        self.send_encoded_key(GhosttyKeyAction::Release, &event.keystroke, cx);
+    }
+
+    fn send_encoded_key(
+        &mut self,
+        action: GhosttyKeyAction,
+        keystroke: &gpui::Keystroke,
+        cx: &mut Context<Self>,
+    ) {
         let input_tx = match &self.input_tx {
-            Some(tx) => tx,
+            Some(tx) => tx.clone(),
             None => return,
         };
 
-        // Convert GPUI key event to our Key type
-        let key = self.convert_key_event(event);
-        let modifiers = self.convert_modifiers(event);
+        if let Some(vt_bytes) = self.encode_key_event(action, keystroke) {
+            if let Err(e) = input_tx.send(vt_bytes) {
+                eprintln!("Failed to send input to shell: {:?}", e);
+                return;
+            }
 
-        // Map to VT sequence
-        let vt_bytes = self.input_mapper.map_key_with_modifiers(&key, modifiers);
-
-        // Send VT sequence to shell via ConPTY
-        if let Err(e) = input_tx.send(vt_bytes) {
-            eprintln!("Failed to send input to shell: {:?}", e);
+            self.wake_io_thread();
         }
 
+        self.process_output(cx);
         cx.notify();
+    }
+
+    fn encode_key_event(
+        &mut self,
+        action: GhosttyKeyAction,
+        keystroke: &gpui::Keystroke,
+    ) -> Option<Vec<u8>> {
+        unsafe {
+            ghostty_key_encoder_setopt_from_terminal(self.key_encoder, self.terminal.as_ptr());
+        }
+
+        let ghostty_key = self.convert_to_ghostty_key(keystroke);
+        let ghostty_mods = self.convert_to_ghostty_mods(keystroke);
+        let printable_text = self.printable_text(keystroke, action);
+        let unshifted_codepoint = self.unshifted_codepoint(keystroke);
+        let consumed_mods = self.consumed_mods(
+            &keystroke.key,
+            ghostty_mods,
+            printable_text,
+            unshifted_codepoint,
+        );
+
+        unsafe {
+            ghostty_key_event_set_action(self.key_event, action);
+            ghostty_key_event_set_key(self.key_event, ghostty_key);
+            ghostty_key_event_set_mods(self.key_event, ghostty_mods);
+            ghostty_key_event_set_consumed_mods(self.key_event, consumed_mods);
+            ghostty_key_event_set_unshifted_codepoint(self.key_event, unshifted_codepoint);
+            ghostty_key_event_set_composing(self.key_event, false);
+
+            if let Some(text) = printable_text {
+                ghostty_key_event_set_utf8(self.key_event, text.as_ptr() as *const i8, text.len());
+            } else {
+                ghostty_key_event_set_utf8(self.key_event, std::ptr::null(), 0);
+            }
+        }
+
+        let mut out_buf = [0i8; 256];
+        let mut out_len: usize = 0;
+
+        unsafe {
+            let result = ghostty_key_encoder_encode(
+                self.key_encoder,
+                self.key_event,
+                out_buf.as_mut_ptr(),
+                out_buf.len(),
+                &mut out_len,
+            );
+
+            if result == GhosttyResult::Success && out_len > 0 {
+                Some(out_buf[0..out_len].iter().map(|&b| b as u8).collect())
+            } else {
+                None
+            }
+        }
+    }
+
+    fn printable_text<'a>(
+        &self,
+        keystroke: &'a gpui::Keystroke,
+        action: GhosttyKeyAction,
+    ) -> Option<&'a str> {
+        if action == GhosttyKeyAction::Release {
+            return None;
+        }
+
+        keystroke
+            .key_char
+            .as_deref()
+            .filter(|text| !text.is_empty())
+            .or_else(|| {
+                if keystroke.key == "space" {
+                    Some(" ")
+                } else if keystroke.key.chars().count() == 1 {
+                    Some(keystroke.key.as_str())
+                } else {
+                    None
+                }
+            })
+    }
+
+    fn unshifted_codepoint(&self, keystroke: &gpui::Keystroke) -> u32 {
+        if keystroke.key == "space" {
+            return ' ' as u32;
+        }
+
+        let mut chars = keystroke.key.chars();
+        let Some(c) = chars.next() else {
+            return 0;
+        };
+
+        if chars.next().is_some() {
+            return 0;
+        }
+
+        match c {
+            'A'..='Z' => c.to_ascii_lowercase() as u32,
+            '!' => '1' as u32,
+            '@' => '2' as u32,
+            '#' => '3' as u32,
+            '$' => '4' as u32,
+            '%' => '5' as u32,
+            '^' => '6' as u32,
+            '&' => '7' as u32,
+            '*' => '8' as u32,
+            '(' => '9' as u32,
+            ')' => '0' as u32,
+            '_' => '-' as u32,
+            '+' => '=' as u32,
+            '{' => '[' as u32,
+            '}' => ']' as u32,
+            '|' => '\\' as u32,
+            ':' => ';' as u32,
+            '"' => '\'' as u32,
+            '<' => ',' as u32,
+            '>' => '.' as u32,
+            '?' => '/' as u32,
+            '~' => '`' as u32,
+            _ => c as u32,
+        }
+    }
+
+    fn consumed_mods(
+        &self,
+        key: &str,
+        ghostty_mods: GhosttyMods,
+        printable_text: Option<&str>,
+        unshifted_codepoint: u32,
+    ) -> GhosttyMods {
+        let Some(text) = printable_text else {
+            return GhosttyMods::default();
+        };
+
+        let mut chars = text.chars();
+        let Some(text_char) = chars.next() else {
+            return GhosttyMods::default();
+        };
+
+        if chars.next().is_some() {
+            return GhosttyMods::default();
+        }
+
+        if ghostty_mods.contains(GhosttyMods::SHIFT) && text_char as u32 != unshifted_codepoint {
+            GhosttyMods::SHIFT
+        } else if self.key_implies_shift(key, unshifted_codepoint) {
+            GhosttyMods::SHIFT
+        } else {
+            GhosttyMods::default()
+        }
+    }
+
+    fn key_implies_shift(&self, key: &str, unshifted_codepoint: u32) -> bool {
+        let mut chars = key.chars();
+        let Some(key_char) = chars.next() else {
+            return false;
+        };
+
+        if chars.next().is_some() {
+            return false;
+        }
+
+        unshifted_codepoint > 0 && key_char as u32 != unshifted_codepoint
+    }
+
+    /// Convert GPUI keystroke to GhosttyKey
+    fn convert_to_ghostty_key(&self, keystroke: &gpui::Keystroke) -> GhosttyKey {
+        let key_str = keystroke.key.as_str();
+
+        match key_str {
+            // Arrows
+            "up" => GhosttyKey::ArrowUp,
+            "down" => GhosttyKey::ArrowDown,
+            "left" => GhosttyKey::ArrowLeft,
+            "right" => GhosttyKey::ArrowRight,
+            // Control Pad
+            "home" => GhosttyKey::Home,
+            "end" => GhosttyKey::End,
+            "insert" => GhosttyKey::Insert,
+            "delete" => GhosttyKey::Delete,
+            "pageup" => GhosttyKey::PageUp,
+            "pagedown" => GhosttyKey::PageDown,
+            // Function Keys
+            "escape" => GhosttyKey::Escape,
+            "enter" => GhosttyKey::Enter,
+            "backspace" => GhosttyKey::Backspace,
+            "tab" => GhosttyKey::Tab,
+            "space" => GhosttyKey::Space,
+            "f1" => GhosttyKey::F1,
+            "f2" => GhosttyKey::F2,
+            "f3" => GhosttyKey::F3,
+            "f4" => GhosttyKey::F4,
+            "f5" => GhosttyKey::F5,
+            "f6" => GhosttyKey::F6,
+            "f7" => GhosttyKey::F7,
+            "f8" => GhosttyKey::F8,
+            "f9" => GhosttyKey::F9,
+            "f10" => GhosttyKey::F10,
+            "f11" => GhosttyKey::F11,
+            "f12" => GhosttyKey::F12,
+            // Single character keys
+            _ if keystroke.key.len() == 1 => {
+                let c = keystroke.key.chars().next().unwrap_or('?');
+                match c {
+                    'a' => GhosttyKey::KeyA,
+                    'b' => GhosttyKey::KeyB,
+                    'c' => GhosttyKey::KeyC,
+                    'd' => GhosttyKey::KeyD,
+                    'e' => GhosttyKey::KeyE,
+                    'f' => GhosttyKey::KeyF,
+                    'g' => GhosttyKey::KeyG,
+                    'h' => GhosttyKey::KeyH,
+                    'i' => GhosttyKey::KeyI,
+                    'j' => GhosttyKey::KeyJ,
+                    'k' => GhosttyKey::KeyK,
+                    'l' => GhosttyKey::KeyL,
+                    'm' => GhosttyKey::KeyM,
+                    'n' => GhosttyKey::KeyN,
+                    'o' => GhosttyKey::KeyO,
+                    'p' => GhosttyKey::KeyP,
+                    'q' => GhosttyKey::KeyQ,
+                    'r' => GhosttyKey::KeyR,
+                    's' => GhosttyKey::KeyS,
+                    't' => GhosttyKey::KeyT,
+                    'u' => GhosttyKey::KeyU,
+                    'v' => GhosttyKey::KeyV,
+                    'w' => GhosttyKey::KeyW,
+                    'x' => GhosttyKey::KeyX,
+                    'y' => GhosttyKey::KeyY,
+                    'z' => GhosttyKey::KeyZ,
+                    '0' => GhosttyKey::Digit0,
+                    '1' => GhosttyKey::Digit1,
+                    '2' => GhosttyKey::Digit2,
+                    '3' => GhosttyKey::Digit3,
+                    '4' => GhosttyKey::Digit4,
+                    '5' => GhosttyKey::Digit5,
+                    '6' => GhosttyKey::Digit6,
+                    '7' => GhosttyKey::Digit7,
+                    '8' => GhosttyKey::Digit8,
+                    '9' => GhosttyKey::Digit9,
+                    ' ' => GhosttyKey::Space,
+                    '-' => GhosttyKey::Minus,
+                    '=' => GhosttyKey::Equal,
+                    '[' => GhosttyKey::BracketLeft,
+                    ']' => GhosttyKey::BracketRight,
+                    ';' => GhosttyKey::Semicolon,
+                    '\'' => GhosttyKey::Quote,
+                    ',' => GhosttyKey::Comma,
+                    '.' => GhosttyKey::Period,
+                    '/' => GhosttyKey::Slash,
+                    '\\' => GhosttyKey::Backslash,
+                    '`' => GhosttyKey::Backquote,
+                    _ => GhosttyKey::Unidentified,
+                }
+            }
+            _ => GhosttyKey::Unidentified,
+        }
+    }
+
+    /// Convert GPUI modifiers to GhosttyMods
+    fn convert_to_ghostty_mods(&self, keystroke: &gpui::Keystroke) -> GhosttyMods {
+        let mut mods = GhosttyMods::default();
+        let keystroke_mods = &keystroke.modifiers;
+
+        if keystroke_mods.shift {
+            mods = mods | GhosttyMods::SHIFT;
+        }
+        if keystroke_mods.alt {
+            mods = mods | GhosttyMods::ALT;
+        }
+        if keystroke_mods.control {
+            mods = mods | GhosttyMods::CTRL;
+        }
+        if keystroke_mods.platform {
+            mods = mods | GhosttyMods::SUPER;
+        }
+
+        mods
     }
 
     /// Handle mouse down events to focus
@@ -320,76 +671,6 @@ impl TerminalWidget {
         _cx: &mut Context<Self>,
     ) {
         self.focus_handle.focus(window);
-    }
-
-    /// Convert GPUI KeyDownEvent to our Key type
-    fn convert_key_event(&self, event: &KeyDownEvent) -> Key {
-        let keystroke = &event.keystroke;
-
-        // For character keys, use the first character of the key string
-        let code = if keystroke.key.len() == 1 {
-            // Single character key
-            if let Some(c) = keystroke.key.chars().next() {
-                KeyCode::Char(c)
-            } else {
-                KeyCode::Char('?')
-            }
-        } else {
-            // Handle named keys by matching against the string
-            let key_str = keystroke.key.as_str();
-            match key_str {
-                "up" => KeyCode::Arrow(Arrow::Up),
-                "down" => KeyCode::Arrow(Arrow::Down),
-                "left" => KeyCode::Arrow(Arrow::Left),
-                "right" => KeyCode::Arrow(Arrow::Right),
-                "home" => KeyCode::Home,
-                "end" => KeyCode::End,
-                "insert" => KeyCode::Insert,
-                "delete" => KeyCode::Delete,
-                "pageup" => KeyCode::PageUp,
-                "pagedown" => KeyCode::PageDown,
-                "escape" => KeyCode::Escape,
-                "enter" => KeyCode::Enter,
-                "backspace" => KeyCode::Backspace,
-                "tab" => KeyCode::Tab,
-                "f1" => KeyCode::Function(1),
-                "f2" => KeyCode::Function(2),
-                "f3" => KeyCode::Function(3),
-                "f4" => KeyCode::Function(4),
-                "f5" => KeyCode::Function(5),
-                "f6" => KeyCode::Function(6),
-                "f7" => KeyCode::Function(7),
-                "f8" => KeyCode::Function(8),
-                "f9" => KeyCode::Function(9),
-                "f10" => KeyCode::Function(10),
-                "f11" => KeyCode::Function(11),
-                "f12" => KeyCode::Function(12),
-                _ => KeyCode::Char('?'), // Unknown key
-            }
-        };
-
-        Key::new(code)
-    }
-
-    /// Convert GPUI modifiers to our Modifiers type
-    fn convert_modifiers(&self, event: &KeyDownEvent) -> Modifiers {
-        let mut modifiers = Modifiers::NONE;
-        let keystroke_mods = &event.keystroke.modifiers;
-
-        if keystroke_mods.shift {
-            modifiers.insert(Modifiers::SHIFT);
-        }
-        if keystroke_mods.alt {
-            modifiers.insert(Modifiers::ALT);
-        }
-        if keystroke_mods.control {
-            modifiers.insert(Modifiers::CONTROL);
-        }
-        if keystroke_mods.platform {
-            modifiers.insert(Modifiers::SUPER);
-        }
-
-        modifiers
     }
 
     /// Convert Color to GPUI Rgba
@@ -495,6 +776,8 @@ impl TerminalWidget {
 
 impl Render for TerminalWidget {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        window.request_animation_frame();
+
         // Process any new output
         self.process_output(cx);
 
@@ -557,6 +840,9 @@ impl Render for TerminalWidget {
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 this.handle_key_down(event, window, cx);
+            }))
+            .on_key_up(cx.listener(|this, event: &KeyUpEvent, window, cx| {
+                this.handle_key_up(event, window, cx);
             }))
             .on_mouse_down(
                 MouseButton::Left,

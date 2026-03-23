@@ -20,6 +20,16 @@ pub use types::*;
 pub struct Terminal {
     ptr: NonNull<GhosttyTerminalInner>,
     cached_buffer: Option<ScreenBuffer>,
+    render_state: GhosttyRenderState,
+    row_iterator: GhosttyRenderStateRowIterator,
+    row_cells: GhosttyRenderStateRowCells,
+}
+
+impl Terminal {
+    /// Get the raw terminal pointer for FFI operations
+    pub(crate) fn as_ptr(&self) -> *mut GhosttyTerminalInner {
+        self.ptr.as_ptr()
+    }
 }
 
 /// Opaque inner type for the terminal handle
@@ -251,6 +261,126 @@ pub type GhosttyCell = u64;
 /// Opaque row type (just a handle)
 pub type GhosttyRow = u64;
 
+// ============================================================================
+// Render State Types
+// ============================================================================
+
+/// Opaque handle to a render state instance
+pub type GhosttyRenderState = *mut std::ffi::c_void;
+
+/// Opaque handle to a render-state row iterator
+pub type GhosttyRenderStateRowIterator = *mut std::ffi::c_void;
+
+/// Opaque handle to render-state row cells
+pub type GhosttyRenderStateRowCells = *mut std::ffi::c_void;
+
+/// Dirty state of a render state after update
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GhosttyRenderStateDirty {
+    /// Not dirty at all; rendering can be skipped
+    False = 0,
+    /// Some rows changed; renderer can redraw incrementally
+    Partial = 1,
+    /// Global state changed; renderer should redraw everything
+    Full = 2,
+}
+
+/// Visual style of the cursor
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub enum GhosttyRenderStateCursorVisualStyle {
+    /// Bar cursor (DECSCUSR 5, 6)
+    Bar = 0,
+    /// Block cursor (DECSCUSR 1, 2)
+    Block = 1,
+    /// Underline cursor (DECSCUSR 3, 4)
+    Underline = 2,
+    /// Hollow block cursor
+    BlockHollow = 3,
+}
+
+/// Queryable data kinds for ghostty_render_state_get
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub enum GhosttyRenderStateData {
+    Invalid = 0,
+    Cols = 1,
+    Rows = 2,
+    Dirty = 3,
+    RowIterator = 4,
+    ColorBackground = 5,
+    ColorForeground = 6,
+    ColorCursor = 7,
+    ColorCursorHasValue = 8,
+    ColorPalette = 9,
+    CursorVisualStyle = 10,
+    CursorVisible = 11,
+    CursorBlinking = 12,
+    CursorPasswordInput = 13,
+    CursorViewportHasValue = 14,
+    CursorViewportX = 15,
+    CursorViewportY = 16,
+    CursorViewportWideTail = 17,
+}
+
+/// Settable options for ghostty_render_state_set
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub enum GhosttyRenderStateOption {
+    Dirty = 0,
+}
+
+/// Queryable data kinds for ghostty_render_state_row_get
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub enum GhosttyRenderStateRowData {
+    Invalid = 0,
+    Dirty = 1,
+    Raw = 2,
+    Cells = 3,
+}
+
+/// Settable options for ghostty_render_state_row_set
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub enum GhosttyRenderStateRowOption {
+    Dirty = 0,
+}
+
+/// Queryable data kinds for ghostty_render_state_row_cells_get
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub enum GhosttyRenderStateRowCellsData {
+    Invalid = 0,
+    Raw = 1,
+    Style = 2,
+    GraphemesLen = 3,
+    GraphemesBuf = 4,
+    BgColor = 5,
+    FgColor = 6,
+}
+
+/// Render-state color information
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct GhosttyRenderStateColors {
+    /// Size of this struct in bytes
+    pub size: usize,
+    /// Default/current background color
+    pub background: GhosttyColorRgb,
+    /// Default/current foreground color
+    pub foreground: GhosttyColorRgb,
+    /// Cursor color when explicitly set
+    pub cursor: GhosttyColorRgb,
+    /// True when cursor contains a valid explicit cursor color value
+    pub cursor_has_value: bool,
+    /// Padding for alignment
+    _padding: [u8; 7],
+    /// The active 256-color palette
+    pub palette: [GhosttyColorRgb; 256],
+}
+
 #[cfg_attr(windows, link(name = "ghostty-vt", kind = "raw-dylib"))]
 #[cfg_attr(not(windows), link(name = "ghostty-vt", kind = "dylib"))]
 unsafe extern "C" {
@@ -332,6 +462,165 @@ unsafe extern "C" {
         data: GhosttyRowData,
         out: *mut c_void,
     ) -> GhosttyResult;
+
+    // ========================================================================
+    // Render State API
+    // ========================================================================
+
+    /// Create a new render state instance
+    pub fn ghostty_render_state_new(
+        allocator: *const c_void,
+        state: *mut GhosttyRenderState,
+    ) -> GhosttyResult;
+
+    /// Free a render state instance
+    pub fn ghostty_render_state_free(state: GhosttyRenderState);
+
+    /// Update a render state instance from a terminal
+    pub fn ghostty_render_state_update(
+        state: GhosttyRenderState,
+        terminal: *mut GhosttyTerminalInner,
+    ) -> GhosttyResult;
+
+    /// Get a value from a render state
+    pub fn ghostty_render_state_get(
+        state: GhosttyRenderState,
+        data: GhosttyRenderStateData,
+        out: *mut c_void,
+    ) -> GhosttyResult;
+
+    /// Set an option on a render state
+    pub fn ghostty_render_state_set(
+        state: GhosttyRenderState,
+        option: GhosttyRenderStateOption,
+        value: *const c_void,
+    ) -> GhosttyResult;
+
+    /// Get the current color information from a render state
+    pub fn ghostty_render_state_colors_get(
+        state: GhosttyRenderState,
+        out_colors: *mut GhosttyRenderStateColors,
+    ) -> GhosttyResult;
+
+    /// Create a new row iterator instance
+    pub fn ghostty_render_state_row_iterator_new(
+        allocator: *const c_void,
+        out_iterator: *mut GhosttyRenderStateRowIterator,
+    ) -> GhosttyResult;
+
+    /// Free a render-state row iterator
+    pub fn ghostty_render_state_row_iterator_free(iterator: GhosttyRenderStateRowIterator);
+
+    /// Move a render-state row iterator to the next row
+    pub fn ghostty_render_state_row_iterator_next(iterator: GhosttyRenderStateRowIterator) -> bool;
+
+    /// Get a value from the current row in a render-state row iterator
+    pub fn ghostty_render_state_row_get(
+        iterator: GhosttyRenderStateRowIterator,
+        data: GhosttyRenderStateRowData,
+        out: *mut c_void,
+    ) -> GhosttyResult;
+
+    /// Set an option on the current row in a render-state row iterator
+    pub fn ghostty_render_state_row_set(
+        iterator: GhosttyRenderStateRowIterator,
+        option: GhosttyRenderStateRowOption,
+        value: *const c_void,
+    ) -> GhosttyResult;
+
+    /// Create a new row cells instance
+    pub fn ghostty_render_state_row_cells_new(
+        allocator: *const c_void,
+        out_cells: *mut GhosttyRenderStateRowCells,
+    ) -> GhosttyResult;
+
+    /// Free a row cells instance
+    pub fn ghostty_render_state_row_cells_free(cells: GhosttyRenderStateRowCells);
+
+    /// Move a render-state row cells iterator to the next cell
+    pub fn ghostty_render_state_row_cells_next(cells: GhosttyRenderStateRowCells) -> bool;
+
+    /// Move a render-state row cells iterator to a specific column
+    pub fn ghostty_render_state_row_cells_select(
+        cells: GhosttyRenderStateRowCells,
+        x: u16,
+    ) -> GhosttyResult;
+
+    /// Get a value from the current cell in a render-state row cells iterator
+    pub fn ghostty_render_state_row_cells_get(
+        cells: GhosttyRenderStateRowCells,
+        data: GhosttyRenderStateRowCellsData,
+        out: *mut c_void,
+    ) -> GhosttyResult;
+
+    // ========================================================================
+    // Key Encoder API
+    // ========================================================================
+
+    /// Create a new key encoder instance
+    pub fn ghostty_key_encoder_new(
+        allocator: *const c_void,
+        encoder: *mut GhosttyKeyEncoder,
+    ) -> GhosttyResult;
+
+    /// Free a key encoder instance
+    pub fn ghostty_key_encoder_free(encoder: GhosttyKeyEncoder);
+
+    /// Set an option on the key encoder
+    pub fn ghostty_key_encoder_setopt(
+        encoder: GhosttyKeyEncoder,
+        option: GhosttyKeyEncoderOption,
+        value: *const c_void,
+    );
+
+    /// Set encoder options from a terminal's current state
+    pub fn ghostty_key_encoder_setopt_from_terminal(
+        encoder: GhosttyKeyEncoder,
+        terminal: *mut GhosttyTerminalInner,
+    );
+
+    /// Encode a key event into a terminal escape sequence
+    pub fn ghostty_key_encoder_encode(
+        encoder: GhosttyKeyEncoder,
+        event: GhosttyKeyEvent,
+        out_buf: *mut std::os::raw::c_char,
+        out_buf_size: usize,
+        out_len: *mut usize,
+    ) -> GhosttyResult;
+
+    /// Create a new key event instance
+    pub fn ghostty_key_event_new(
+        allocator: *const c_void,
+        event: *mut GhosttyKeyEvent,
+    ) -> GhosttyResult;
+
+    /// Free a key event instance
+    pub fn ghostty_key_event_free(event: GhosttyKeyEvent);
+
+    /// Set the key action
+    pub fn ghostty_key_event_set_action(event: GhosttyKeyEvent, action: GhosttyKeyAction);
+
+    /// Set the physical key code
+    pub fn ghostty_key_event_set_key(event: GhosttyKeyEvent, key: GhosttyKey);
+
+    /// Set the modifier keys bitmask
+    pub fn ghostty_key_event_set_mods(event: GhosttyKeyEvent, mods: GhosttyMods);
+
+    /// Set the consumed modifiers bitmask
+    pub fn ghostty_key_event_set_consumed_mods(event: GhosttyKeyEvent, mods: GhosttyMods);
+
+    /// Set whether the key event is part of a composition sequence
+    pub fn ghostty_key_event_set_composing(event: GhosttyKeyEvent, composing: bool);
+
+    /// Set the UTF-8 text generated by the key event
+    pub fn ghostty_key_event_set_utf8(
+        event: GhosttyKeyEvent,
+        utf8: *const std::os::raw::c_char,
+        len: usize,
+    );
+
+    /// Set the unshifted Unicode codepoint
+    pub fn ghostty_key_event_set_unshifted_codepoint(event: GhosttyKeyEvent, codepoint: u32);
 }
 
 impl Terminal {
@@ -340,15 +629,46 @@ impl Terminal {
         let mut ptr: *mut GhosttyTerminalInner = std::ptr::null_mut();
         let result = unsafe { ghostty_terminal_new(std::ptr::null(), &mut ptr, options) };
 
-        if result == GhosttyResult::Success {
-            Ok(Terminal {
-                ptr: NonNull::new(ptr)
-                    .expect("Terminal pointer was null after successful creation"),
-                cached_buffer: None,
-            })
-        } else {
-            Err(result)
+        if result != GhosttyResult::Success {
+            return Err(result);
         }
+
+        // Create render state
+        let mut render_state: GhosttyRenderState = std::ptr::null_mut();
+        let rs_result = unsafe { ghostty_render_state_new(std::ptr::null(), &mut render_state) };
+        if rs_result != GhosttyResult::Success {
+            unsafe { ghostty_terminal_free(ptr) };
+            return Err(rs_result);
+        }
+
+        // Create row iterator
+        let mut row_iterator: GhosttyRenderStateRowIterator = std::ptr::null_mut();
+        let ri_result =
+            unsafe { ghostty_render_state_row_iterator_new(std::ptr::null(), &mut row_iterator) };
+        if ri_result != GhosttyResult::Success {
+            unsafe { ghostty_render_state_free(render_state) };
+            unsafe { ghostty_terminal_free(ptr) };
+            return Err(ri_result);
+        }
+
+        // Create row cells
+        let mut row_cells: GhosttyRenderStateRowCells = std::ptr::null_mut();
+        let rc_result =
+            unsafe { ghostty_render_state_row_cells_new(std::ptr::null(), &mut row_cells) };
+        if rc_result != GhosttyResult::Success {
+            unsafe { ghostty_render_state_row_iterator_free(row_iterator) };
+            unsafe { ghostty_render_state_free(render_state) };
+            unsafe { ghostty_terminal_free(ptr) };
+            return Err(rc_result);
+        }
+
+        Ok(Terminal {
+            ptr: NonNull::new(ptr).expect("Terminal pointer was null after successful creation"),
+            cached_buffer: None,
+            render_state,
+            row_iterator,
+            row_cells,
+        })
     }
 
     /// Create a new terminal with default options (80x24, 1000 scrollback)
@@ -441,28 +761,174 @@ impl Terminal {
     }
 
     // ============================================================================
-    // Screen Buffer Methods
+    // Screen Buffer Methods (using Render State API)
     // ============================================================================
 
-    /// Read the entire screen buffer from libghostty
+    /// Read the entire screen buffer from libghostty using the Render State API
     pub fn read_screen(&mut self) -> &ScreenBuffer {
+        // Update render state from terminal
+        unsafe {
+            ghostty_render_state_update(self.render_state, self.ptr.as_ptr());
+        }
+
         let (cols, rows) = self.size();
         let cursor = self.cursor_pos();
 
+        // Get colors from render state
+        let mut colors = GhosttyRenderStateColors {
+            size: std::mem::size_of::<GhosttyRenderStateColors>(),
+            background: GhosttyColorRgb { r: 0, g: 0, b: 0 },
+            foreground: GhosttyColorRgb { r: 0, g: 0, b: 0 },
+            cursor: GhosttyColorRgb { r: 0, g: 0, b: 0 },
+            cursor_has_value: false,
+            _padding: [0; 7],
+            palette: [GhosttyColorRgb { r: 0, g: 0, b: 0 }; 256],
+        };
+        unsafe {
+            ghostty_render_state_colors_get(self.render_state, &mut colors);
+        }
+
         let mut cells: Vec<Vec<Cell>> = Vec::with_capacity(rows as usize);
 
-        for row in 0..rows {
-            let mut row_cells: Vec<Cell> = Vec::with_capacity(cols as usize);
+        // Populate row iterator from render state
+        unsafe {
+            ghostty_render_state_get(
+                self.render_state,
+                GhosttyRenderStateData::RowIterator,
+                &mut self.row_iterator as *mut _ as *mut c_void,
+            );
+        }
 
-            for col in 0..cols {
-                if let Some(cell) = self.cell_at(row, col) {
-                    row_cells.push(cell);
-                } else {
-                    row_cells.push(Cell::default());
+        let mut row_idx: u16 = 0;
+        while row_idx < rows {
+            // Move to next row
+            let has_next = unsafe { ghostty_render_state_row_iterator_next(self.row_iterator) };
+            if !has_next {
+                break;
+            }
+
+            // Get cells for this row
+            unsafe {
+                ghostty_render_state_row_get(
+                    self.row_iterator,
+                    GhosttyRenderStateRowData::Cells,
+                    &mut self.row_cells as *mut _ as *mut c_void,
+                );
+            }
+
+            let mut row_cells: Vec<Cell> = Vec::with_capacity(cols as usize);
+            let mut col_idx: u16 = 0;
+
+            while col_idx < cols {
+                // Move to next cell
+                let has_next_cell = unsafe { ghostty_render_state_row_cells_next(self.row_cells) };
+                if !has_next_cell {
+                    // No more cells in this row, fill rest with defaults
+                    while col_idx < cols {
+                        row_cells.push(Cell::default());
+                        col_idx += 1;
+                    }
+                    break;
                 }
+
+                // Get grapheme length
+                let mut grapheme_len: u32 = 0;
+                unsafe {
+                    ghostty_render_state_row_cells_get(
+                        self.row_cells,
+                        GhosttyRenderStateRowCellsData::GraphemesLen,
+                        &mut grapheme_len as *mut _ as *mut c_void,
+                    );
+                }
+
+                // Get foreground color
+                let mut fg_rgb = GhosttyColorRgb { r: 0, g: 0, b: 0 };
+                let fg_result = unsafe {
+                    ghostty_render_state_row_cells_get(
+                        self.row_cells,
+                        GhosttyRenderStateRowCellsData::FgColor,
+                        &mut fg_rgb as *mut _ as *mut c_void,
+                    )
+                };
+                let fg = if fg_result == GhosttyResult::Success {
+                    Color::Rgb(fg_rgb.r, fg_rgb.g, fg_rgb.b)
+                } else {
+                    Color::Default
+                };
+
+                // Get background color
+                let mut bg_rgb = GhosttyColorRgb { r: 0, g: 0, b: 0 };
+                let bg_result = unsafe {
+                    ghostty_render_state_row_cells_get(
+                        self.row_cells,
+                        GhosttyRenderStateRowCellsData::BgColor,
+                        &mut bg_rgb as *mut _ as *mut c_void,
+                    )
+                };
+                let bg = if bg_result == GhosttyResult::Success {
+                    Color::Rgb(bg_rgb.r, bg_rgb.g, bg_rgb.b)
+                } else {
+                    Color::Default
+                };
+
+                // Get style
+                let mut style = GhosttyStyle {
+                    size: 0,
+                    bold: false,
+                    italic: false,
+                    underline: 0,
+                    blink: false,
+                    inverse: false,
+                    invisible: false,
+                    strikethrough: false,
+                    overline: false,
+                    fg_color: GhosttyColorRgb { r: 0, g: 0, b: 0 },
+                    bg_color: GhosttyColorRgb { r: 0, g: 0, b: 0 },
+                    fg_color_type: 0,
+                    bg_color_type: 0,
+                };
+                unsafe {
+                    ghostty_render_state_row_cells_get(
+                        self.row_cells,
+                        GhosttyRenderStateRowCellsData::Style,
+                        &mut style as *mut _ as *mut c_void,
+                    );
+                }
+
+                // Get character (first codepoint from grapheme buffer)
+                let ch = if grapheme_len > 0 {
+                    let mut codepoints = [0u32; 16];
+                    unsafe {
+                        ghostty_render_state_row_cells_get(
+                            self.row_cells,
+                            GhosttyRenderStateRowCellsData::GraphemesBuf,
+                            &mut codepoints as *mut _ as *mut c_void,
+                        );
+                    }
+                    std::char::from_u32(codepoints[0]).unwrap_or('\0')
+                } else {
+                    '\0'
+                };
+
+                row_cells.push(Cell {
+                    char: ch,
+                    fg,
+                    bg,
+                    attrs: Attributes {
+                        bold: style.bold,
+                        italic: style.italic,
+                        underline: style.underline,
+                        strikethrough: style.strikethrough,
+                        inverse: style.inverse,
+                        blink: style.blink,
+                    },
+                });
+
+                col_idx += 1;
             }
 
             cells.push(row_cells);
+            row_idx += 1;
         }
 
         self.cached_buffer = Some(ScreenBuffer {
@@ -620,6 +1086,9 @@ impl Terminal {
 impl Drop for Terminal {
     fn drop(&mut self) {
         unsafe {
+            ghostty_render_state_row_cells_free(self.row_cells);
+            ghostty_render_state_row_iterator_free(self.row_iterator);
+            ghostty_render_state_free(self.render_state);
             ghostty_terminal_free(self.ptr.as_ptr());
         }
     }
