@@ -8,6 +8,11 @@ use gpui_component::{button::*, Root, StyledExt};
 mod ghostty;
 use ghostty::Terminal;
 
+#[cfg(windows)]
+mod shell;
+#[cfg(windows)]
+use shell::ConPtyShell;
+
 struct HelloWorld;
 
 impl Render for HelloWorld {
@@ -81,9 +86,109 @@ fn test_ghostty_terminal() {
     println!("\n=== libghostty-vt test complete ===\n");
 }
 
+#[cfg(windows)]
+fn test_conpty_shell() {
+    println!("\n=== Testing ConPTY Shell Bridge ===\n");
+
+    // Spawn cmd.exe
+    let mut shell = match ConPtyShell::spawn("cmd.exe", 24, 80) {
+        Ok(s) => {
+            println!("✓ Spawned cmd.exe successfully");
+            s
+        }
+        Err(e) => {
+            println!("✗ Failed to spawn shell: {}", e);
+            return;
+        }
+    };
+
+    // Read initial prompt (give it time to start)
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
+    let mut buf = [0u8; 4096];
+    match shell.read(&mut buf) {
+        Ok(n) if n > 0 => {
+            let output = String::from_utf8_lossy(&buf[..n]);
+            println!("✓ Read {} bytes from shell", n);
+            println!(
+                "  Initial output: {:?}",
+                output.chars().take(100).collect::<String>()
+            );
+        }
+        Ok(_) => println!("  (No initial output)"),
+        Err(e) => println!("✗ Read error: {}", e),
+    }
+
+    // Write a command
+    println!("\n  Writing command: echo Hello from ConPTY");
+    if let Err(e) = shell.write(b"echo Hello from ConPTY\r\n") {
+        println!("✗ Write error: {}", e);
+        return;
+    }
+
+    // Read the command output
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
+    match shell.read(&mut buf) {
+        Ok(n) if n > 0 => {
+            let output = String::from_utf8_lossy(&buf[..n]);
+            println!("✓ Read {} bytes response", n);
+
+            // Check if our expected text is in the output
+            if output.contains("Hello from ConPTY") {
+                println!("✓ Command executed successfully!");
+            } else {
+                println!(
+                    "  Response: {:?}",
+                    output.chars().take(200).collect::<String>()
+                );
+            }
+        }
+        Ok(_) => println!("  (No response)"),
+        Err(e) => println!("✗ Read error: {}", e),
+    }
+
+    // Test resize
+    println!("\n  Testing resize to 30x100...");
+    match shell.resize(30, 100) {
+        Ok(_) => println!("✓ Resized successfully"),
+        Err(e) => println!("✗ Resize failed: {}", e),
+    }
+
+    // Write another command after resize
+    println!("\n  Writing command: echo Resized terminal");
+    if shell.write(b"echo Resized terminal\r\n").is_ok() {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        match shell.read(&mut buf) {
+            Ok(n) if n > 0 => {
+                let output = String::from_utf8_lossy(&buf[..n]);
+                if output.contains("Resized terminal") {
+                    println!("✓ Resize + command working!");
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Shutdown
+    println!("\n  Shutting down shell...");
+    if let Err(e) = shell.shutdown() {
+        println!("✗ Shutdown error: {}", e);
+    } else {
+        println!("✓ Shell shutdown successfully");
+    }
+
+    println!("\n=== ConPTY Shell Bridge test complete ===\n");
+}
+
 fn main() {
     // Test the ghostty terminal first
     test_ghostty_terminal();
+
+    // Test ConPTY shell bridge (Windows only)
+    #[cfg(windows)]
+    test_conpty_shell();
 
     // Then run the GPUI application
     Application::new().run(|cx: &mut App| {
