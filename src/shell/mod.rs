@@ -27,12 +27,20 @@ unsafe extern "system" {
         lpNumberOfBytesWritten: *mut c_uint,
         lpOverlapped: *mut c_void,
     ) -> i32;
+
+    fn PeekNamedPipe(
+        hNamedPipe: HANDLE,
+        lpBuffer: *mut c_void,
+        nBufferSize: c_uint,
+        lpBytesRead: *mut c_uint,
+        lpTotalBytesAvail: *mut c_uint,
+        lpBytesLeftThisMessage: *mut c_uint,
+    ) -> i32;
 }
 
 use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 use windows_sys::Win32::System::Console::{
-    ClosePseudoConsole, CreatePseudoConsole, GetConsoleMode, ResizePseudoConsole, CONSOLE_MODE,
-    COORD, HPCON,
+    ClosePseudoConsole, CreatePseudoConsole, ResizePseudoConsole, COORD, HPCON,
 };
 use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::Threading::{
@@ -188,6 +196,31 @@ impl ConPtyShell {
         }
     }
 
+    /// Check if there's data available to read (non-blocking)
+    pub fn peek(&mut self) -> Result<bool, ConPtyError> {
+        unsafe {
+            let mut bytes_available: u32 = 0;
+            let result = PeekNamedPipe(
+                self.output_pipe,
+                null_mut(),
+                0,
+                null_mut(),
+                &mut bytes_available,
+                null_mut(),
+            );
+
+            if result == 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::BrokenPipe {
+                    return Ok(false);
+                }
+                return Err(ConPtyError::Io(error));
+            }
+
+            Ok(bytes_available > 0)
+        }
+    }
+
     /// Resize the terminal dimensions
     pub fn resize(&mut self, rows: u16, cols: u16) -> Result<(), ConPtyError> {
         if rows == 0 || cols == 0 {
@@ -240,18 +273,46 @@ impl ConPtyShell {
     /// Check if ConPTY is available on this system
     fn is_conpty_available() -> bool {
         unsafe {
-            // Try to get console mode - if this works, ConPTY should be available
             // ConPTY was introduced in Windows 10 1809 (build 17763)
-            let mut mode: CONSOLE_MODE = 0;
-            let console_handle = windows_sys::Win32::System::Console::GetStdHandle(
-                windows_sys::Win32::System::Console::STD_OUTPUT_HANDLE,
+            // We check availability by trying to create a minimal ConPTY
+            // If this succeeds, ConPTY is available
+            let size = COORD { X: 2, Y: 2 };
+            let mut test_handle: HPCON = 0;
+
+            // Create minimal pipes for test
+            let (test_input_write, test_input_read) = match Self::create_pipe() {
+                Ok(p) => p,
+                Err(_) => return false,
+            };
+            let (test_output_write, test_output_read) = match Self::create_pipe() {
+                Ok(p) => p,
+                Err(_) => {
+                    CloseHandle(test_input_write);
+                    CloseHandle(test_input_read);
+                    return false;
+                }
+            };
+
+            let result = CreatePseudoConsole(
+                size,
+                test_input_read,
+                test_output_write,
+                0,
+                &mut test_handle,
             );
 
-            if console_handle == INVALID_HANDLE_VALUE || console_handle.is_null() {
-                return false;
+            // Cleanup test resources
+            CloseHandle(test_input_read);
+            CloseHandle(test_input_write);
+            CloseHandle(test_output_read);
+            CloseHandle(test_output_write);
+
+            if result == S_OK && test_handle != 0 {
+                ClosePseudoConsole(test_handle);
+                return true;
             }
 
-            GetConsoleMode(console_handle, &mut mode) != 0
+            false
         }
     }
 

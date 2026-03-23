@@ -1,37 +1,19 @@
-use gpui::{
-    div, prelude::*, px, size, App, Application, Bounds, Context, Render, Window, WindowBounds,
-    WindowOptions,
-};
-use gpui_component::{button::*, Root, StyledExt};
+use gpui::{prelude::*, px, size, App, Application, Bounds, WindowBounds, WindowOptions};
+use gpui_component::Root;
 
 // Ghostty terminal module
 mod ghostty;
-use ghostty::Terminal;
+mod input;
+mod widget;
 
 #[cfg(windows)]
 mod shell;
+
+use ghostty::Terminal;
 #[cfg(windows)]
 use shell::ConPtyShell;
-
-struct HelloWorld;
-
-impl Render for HelloWorld {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .v_flex()
-            .gap_2()
-            .size_full()
-            .items_center()
-            .justify_center()
-            .child("Hello, World!")
-            .child(
-                Button::new("ok")
-                    .primary()
-                    .label("Let's Go!")
-                    .on_click(|_, _, _| println!("Clicked!")),
-            )
-    }
-}
+use std::time::Duration;
+use widget::{TerminalConfig, TerminalWidget};
 
 fn test_ghostty_terminal() {
     println!("\n=== Testing libghostty-vt ===\n");
@@ -183,26 +165,28 @@ fn test_conpty_shell() {
 }
 
 fn main() {
-    // Test the ghostty terminal first
-    test_ghostty_terminal();
-
-    // Test ConPTY shell bridge (Windows only)
-    #[cfg(windows)]
-    test_conpty_shell();
-
-    // Then run the GPUI application
+    // Run the GPUI application with TerminalWidget
     Application::new().run(|cx: &mut App| {
         // Initialize gpui-component
         gpui_component::init(cx);
 
-        let bounds = Bounds::centered(None, size(px(500.), px(500.0)), cx);
+        let bounds = Bounds::centered(None, size(px(800.), px(600.0)), cx);
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 ..Default::default()
             },
             |window, cx| {
-                let view = cx.new(|_| HelloWorld);
+                let config = TerminalConfig {
+                    shell: "pwsh.exe".to_string(),
+                    initial_rows: 30,
+                    initial_cols: 100,
+                    scrollback: 10000,
+                    cursor_blink: true,
+                    blink_interval: Duration::from_millis(500),
+                    ..Default::default()
+                };
+                let view = cx.new(|cx| TerminalWidget::new(config, cx));
                 cx.new(|cx| Root::new(view, window, cx))
             },
         )

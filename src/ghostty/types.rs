@@ -12,22 +12,6 @@ pub struct GhosttyAllocator {
     pub free: Option<unsafe extern "C" fn(*mut c_void, *mut c_void, usize)>,
 }
 
-/// Point in the terminal grid
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct GhosttyPoint {
-    pub x: u16,
-    pub y: i64,
-}
-
-/// Grid reference for accessing cell data
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct GhosttyGridRef {
-    pub row: *mut c_void,
-    pub cell: *mut c_void,
-}
-
 /// RGB color
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
@@ -92,4 +76,54 @@ pub enum GhosttyMode {
     MouseUrxvt = 1015,
     /// Mouse format - SGR pixels
     MouseSgrPixels = 1016,
+}
+
+// ============================================================================
+// Screen Buffer Types
+// ============================================================================
+
+/// Cell attributes (SGR styles)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Attributes {
+    pub bold: bool,
+    pub italic: bool,
+    pub underline: u8,
+    pub strikethrough: bool,
+    pub inverse: bool,
+    pub blink: bool,
+}
+
+/// Cell color
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Color {
+    /// Default terminal color
+    Default,
+    /// Palette color (0-255)
+    Palette(u8),
+    /// True color RGB
+    Rgb(u8, u8, u8),
+}
+
+impl Default for Color {
+    fn default() -> Self {
+        Color::Default
+    }
+}
+
+/// Terminal cell with character and styling
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Cell {
+    pub char: char,
+    pub fg: Color,
+    pub bg: Color,
+    pub attrs: Attributes,
+}
+
+/// Screen buffer containing terminal cell data
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScreenBuffer {
+    pub rows: u16,
+    pub cols: u16,
+    pub cells: Vec<Vec<Cell>>,
+    pub cursor: (u16, u16),
 }
