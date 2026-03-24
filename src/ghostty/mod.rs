@@ -23,6 +23,8 @@ pub struct Terminal {
     render_state: GhosttyRenderState,
     row_iterator: GhosttyRenderStateRowIterator,
     row_cells: GhosttyRenderStateRowCells,
+    key_encoder: GhosttyKeyEncoder,
+    key_event: GhosttyKeyEvent,
 }
 
 impl Terminal {
@@ -36,6 +38,16 @@ impl Terminal {
 #[repr(C)]
 pub struct GhosttyTerminalInner {
     _private: [u8; 0],
+}
+
+/// Terminal data indices for ghostty_terminal_get (magic numbers from libghostty)
+mod TerminalData {
+    pub const COLS: i32 = 1;
+    pub const ROWS: i32 = 2;
+    pub const CURSOR_X: i32 = 3;
+    pub const CURSOR_Y: i32 = 4;
+    pub const CURSOR_VISIBLE: i32 = 7;
+    pub const SCROLLBAR: i32 = 9;
 }
 
 /// Result codes for libghostty-vt operations
@@ -662,12 +674,37 @@ impl Terminal {
             return Err(rc_result);
         }
 
+        // Create key encoder
+        let mut key_encoder: GhosttyKeyEncoder = std::ptr::null_mut();
+        let ke_result = unsafe { ghostty_key_encoder_new(std::ptr::null(), &mut key_encoder) };
+        if ke_result != GhosttyResult::Success {
+            unsafe { ghostty_render_state_row_cells_free(row_cells) };
+            unsafe { ghostty_render_state_row_iterator_free(row_iterator) };
+            unsafe { ghostty_render_state_free(render_state) };
+            unsafe { ghostty_terminal_free(ptr) };
+            return Err(ke_result);
+        }
+
+        // Create key event
+        let mut key_event: GhosttyKeyEvent = std::ptr::null_mut();
+        let kev_result = unsafe { ghostty_key_event_new(std::ptr::null(), &mut key_event) };
+        if kev_result != GhosttyResult::Success {
+            unsafe { ghostty_key_encoder_free(key_encoder) };
+            unsafe { ghostty_render_state_row_cells_free(row_cells) };
+            unsafe { ghostty_render_state_row_iterator_free(row_iterator) };
+            unsafe { ghostty_render_state_free(render_state) };
+            unsafe { ghostty_terminal_free(ptr) };
+            return Err(kev_result);
+        }
+
         Ok(Terminal {
             ptr: NonNull::new(ptr).expect("Terminal pointer was null after successful creation"),
             cached_buffer: None,
             render_state,
             row_iterator,
             row_cells,
+            key_encoder,
+            key_event,
         })
     }
 
@@ -713,8 +750,16 @@ impl Terminal {
         let mut cols: u16 = 0;
         let mut rows: u16 = 0;
         unsafe {
-            ghostty_terminal_get(self.ptr.as_ptr(), 1, &mut cols as *mut _ as *mut c_void);
-            ghostty_terminal_get(self.ptr.as_ptr(), 2, &mut rows as *mut _ as *mut c_void);
+            ghostty_terminal_get(
+                self.ptr.as_ptr(),
+                TerminalData::COLS,
+                &mut cols as *mut _ as *mut c_void,
+            );
+            ghostty_terminal_get(
+                self.ptr.as_ptr(),
+                TerminalData::ROWS,
+                &mut rows as *mut _ as *mut c_void,
+            );
         }
         (cols, rows)
     }
@@ -724,8 +769,16 @@ impl Terminal {
         let mut x: u16 = 0;
         let mut y: u16 = 0;
         unsafe {
-            ghostty_terminal_get(self.ptr.as_ptr(), 3, &mut x as *mut _ as *mut c_void);
-            ghostty_terminal_get(self.ptr.as_ptr(), 4, &mut y as *mut _ as *mut c_void);
+            ghostty_terminal_get(
+                self.ptr.as_ptr(),
+                TerminalData::CURSOR_X,
+                &mut x as *mut _ as *mut c_void,
+            );
+            ghostty_terminal_get(
+                self.ptr.as_ptr(),
+                TerminalData::CURSOR_Y,
+                &mut y as *mut _ as *mut c_void,
+            );
         }
         (x, y)
     }
@@ -734,7 +787,11 @@ impl Terminal {
     pub fn cursor_visible(&self) -> bool {
         let mut visible: bool = false;
         unsafe {
-            ghostty_terminal_get(self.ptr.as_ptr(), 7, &mut visible as *mut _ as *mut c_void);
+            ghostty_terminal_get(
+                self.ptr.as_ptr(),
+                TerminalData::CURSOR_VISIBLE,
+                &mut visible as *mut _ as *mut c_void,
+            );
         }
         visible
     }
@@ -749,7 +806,7 @@ impl Terminal {
         let result = unsafe {
             ghostty_terminal_get(
                 self.ptr.as_ptr(),
-                9,
+                TerminalData::SCROLLBAR,
                 &mut scrollbar as *mut _ as *mut c_void,
             )
         };
@@ -771,23 +828,27 @@ impl Terminal {
             ghostty_render_state_update(self.render_state, self.ptr.as_ptr());
         }
 
+        // Check dirty flag to see if we need to re-read
+        let mut dirty: GhosttyRenderStateDirty = GhosttyRenderStateDirty::False;
+        unsafe {
+            ghostty_render_state_get(
+                self.render_state,
+                GhosttyRenderStateData::Dirty,
+                &mut dirty as *mut _ as *mut c_void,
+            );
+        }
+
+        // If not dirty, return cached buffer
+        if dirty == GhosttyRenderStateDirty::False {
+            if let Some(ref cached) = self.cached_buffer {
+                return cached;
+            }
+        }
+
         let (cols, rows) = self.size();
         let cursor = self.cursor_pos();
 
-        // Get colors from render state
-        let mut colors = GhosttyRenderStateColors {
-            size: std::mem::size_of::<GhosttyRenderStateColors>(),
-            background: GhosttyColorRgb { r: 0, g: 0, b: 0 },
-            foreground: GhosttyColorRgb { r: 0, g: 0, b: 0 },
-            cursor: GhosttyColorRgb { r: 0, g: 0, b: 0 },
-            cursor_has_value: false,
-            _padding: [0; 7],
-            palette: [GhosttyColorRgb { r: 0, g: 0, b: 0 }; 256],
-        };
-        unsafe {
-            ghostty_render_state_colors_get(self.render_state, &mut colors);
-        }
-
+        // Pre-allocate with exact capacity - rows first, then each row with cols
         let mut cells: Vec<Vec<Cell>> = Vec::with_capacity(rows as usize);
 
         // Populate row iterator from render state
@@ -816,6 +877,7 @@ impl Terminal {
                 );
             }
 
+            // Pre-allocate row with exact column count
             let mut row_cells: Vec<Cell> = Vec::with_capacity(cols as usize);
             let mut col_idx: u16 = 0;
 
@@ -1086,6 +1148,12 @@ impl Terminal {
 impl Drop for Terminal {
     fn drop(&mut self) {
         unsafe {
+            if !self.key_event.is_null() {
+                ghostty_key_event_free(self.key_event);
+            }
+            if !self.key_encoder.is_null() {
+                ghostty_key_encoder_free(self.key_encoder);
+            }
             ghostty_render_state_row_cells_free(self.row_cells);
             ghostty_render_state_row_iterator_free(self.row_iterator);
             ghostty_render_state_free(self.render_state);

@@ -9,10 +9,12 @@ use gpui::{
     KeyDownEvent, KeyUpEvent, MouseButton, MouseDownEvent, Pixels, Render, Styled, Window,
 };
 use std::sync::{
+    atomic::{AtomicBool, Ordering},
     mpsc::{channel, Receiver, Sender},
     Arc, Condvar, Mutex,
 };
-use std::time::Duration;
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use crate::ghostty::{
     ghostty_key_encoder_encode, ghostty_key_encoder_new, ghostty_key_encoder_setopt_from_terminal,
@@ -62,7 +64,7 @@ impl Default for TerminalConfig {
             initial_rows: 24,
             initial_cols: 80,
             scrollback: 1000,
-            cursor_style: CursorStyle::default(),
+            cursor_style: CursorStyle::Line,
             cursor_blink: true,
             blink_interval: Duration::from_millis(500),
         }
@@ -93,10 +95,18 @@ pub struct TerminalWidget {
     resize_tx: Option<Sender<(u16, u16)>>,
     /// Wake signal for the shell I/O thread
     io_wake: IoWakeSignal,
+    /// Shutdown flag for the I/O thread
+    shutdown_flag: Arc<AtomicBool>,
+    /// Handle to the I/O thread
+    io_thread: Option<JoinHandle<()>>,
     /// Focus handle for tracking focus
     focus_handle: FocusHandle,
     /// Cursor blink state (visible/hidden)
     cursor_blink_phase: bool,
+    /// Accumulated time for cursor blink
+    blink_accumulator: Duration,
+    /// Time of last frame for blink calculation
+    last_frame_time: Option<Instant>,
     /// Current cursor position (col, row)
     cursor_pos: (u16, u16),
     /// Terminal dimensions in cells
@@ -162,16 +172,20 @@ impl TerminalWidget {
         let (input_tx, input_rx) = channel::<Vec<u8>>();
         let (resize_tx, resize_rx) = channel::<(u16, u16)>();
         let io_wake: IoWakeSignal = Arc::new((Mutex::new(false), Condvar::new()));
+        let shutdown_flag = Arc::new(AtomicBool::new(false));
 
         // Clone config for the thread
         let shell_cmd = config.shell.clone();
         let rows = config.initial_rows;
         let cols = config.initial_cols;
-        let io_wake_thread = Arc::clone(&io_wake);
+        let shutdown_thread = Arc::clone(&shutdown_flag);
+
+        // I/O thread wake signal (kept for potential future use with event-based I/O)
+        let _io_wake_thread = Arc::clone(&io_wake);
 
         // Start I/O thread that handles both reading and writing (Windows only)
         #[cfg(windows)]
-        std::thread::spawn(move || {
+        let io_thread = Some(std::thread::spawn(move || {
             let mut shell = match ConPtyShell::spawn(&shell_cmd, rows, cols) {
                 Ok(s) => s,
                 Err(e) => {
@@ -180,8 +194,21 @@ impl TerminalWidget {
                 }
             };
 
-            let mut buf = [0u8; 4096];
+            let mut buf = [0u8; 32768]; // 32KB buffer for efficient burst reading
+            let mut output_buffer: Vec<u8> = Vec::with_capacity(65536); // 64KB output buffer
+            let output_batch_threshold = 16384; // Send when buffer reaches 16KB
+
             loop {
+                // Check shutdown flag
+                if shutdown_thread.load(Ordering::Relaxed) {
+                    // Flush remaining output before shutdown
+                    if !output_buffer.is_empty() {
+                        let _ = output_tx.send(std::mem::take(&mut output_buffer));
+                    }
+                    let _ = shell.shutdown();
+                    return;
+                }
+
                 let mut did_work = false;
 
                 // Drain all pending input immediately so interactive input doesn't wait
@@ -218,14 +245,19 @@ impl TerminalWidget {
                     }
                 }
 
-                // Drain all available output before sleeping again.
+                // Drain all available output into buffer
                 loop {
                     match shell.peek() {
                         Ok(true) => match shell.read(&mut buf) {
                             Ok(n) if n > 0 => {
                                 did_work = true;
-                                if output_tx.send(buf[0..n].to_vec()).is_err() {
-                                    return;
+                                output_buffer.extend_from_slice(&buf[0..n]);
+                                // Send batch if buffer is large enough
+                                if output_buffer.len() >= output_batch_threshold {
+                                    if output_tx.send(std::mem::take(&mut output_buffer)).is_err() {
+                                        return;
+                                    }
+                                    output_buffer = Vec::with_capacity(65536);
                                 }
                             }
                             Ok(_) => break,
@@ -236,19 +268,24 @@ impl TerminalWidget {
                     }
                 }
 
+                // Flush output buffer if we have data
+                if !output_buffer.is_empty() {
+                    did_work = true;
+                    if output_tx.send(std::mem::take(&mut output_buffer)).is_err() {
+                        return;
+                    }
+                    output_buffer = Vec::with_capacity(65536);
+                }
+
                 if !did_work {
-                    let (lock, cvar) = &*io_wake_thread;
-                    let pending = lock.lock().unwrap();
-                    let (mut pending, _) = cvar
-                        .wait_timeout(pending, Duration::from_millis(16))
-                        .unwrap();
-                    *pending = false;
+                    // Use brief sleep instead of polling - reduces CPU usage
+                    std::thread::sleep(Duration::from_millis(8));
                 }
             }
-        });
+        }));
 
-        // Start cursor blink timer if enabled
-        // TODO: Implement cursor blink timer with correct GPUI types
+        #[cfg(not(windows))]
+        let io_thread: Option<JoinHandle<()>> = None;
 
         let size = (config.initial_cols, config.initial_rows);
 
@@ -264,7 +301,7 @@ impl TerminalWidget {
             ghostty_key_event_new(std::ptr::null(), &mut key_event);
         }
 
-        Self {
+        let this = Self {
             terminal,
             key_encoder,
             key_event,
@@ -273,12 +310,33 @@ impl TerminalWidget {
             input_tx: Some(input_tx),
             resize_tx: Some(resize_tx),
             io_wake,
+            shutdown_flag,
+            io_thread,
             focus_handle: cx.focus_handle(),
             cursor_blink_phase: true,
+            blink_accumulator: Duration::ZERO,
+            last_frame_time: None,
             cursor_pos: (0, 0),
             size,
-            cell_size: (px(8.0), px(14.0)), // Monospace cell size (width, height)
+            cell_size: (px(8.4), px(16.8)), // Monospace cell size (width, height) - 14px font with 0.6 width and 1.2 line height
             theme: TerminalTheme::default(),
+        };
+
+        this
+    }
+
+    /// Update cursor blink state based on elapsed time
+    fn update_cursor_blink(&mut self, elapsed: Duration) {
+        if !self.config.cursor_blink {
+            self.cursor_blink_phase = true;
+            self.blink_accumulator = Duration::ZERO;
+            return;
+        }
+
+        self.blink_accumulator += elapsed;
+        if self.blink_accumulator >= self.config.blink_interval {
+            self.blink_accumulator = Duration::ZERO;
+            self.cursor_blink_phase = !self.cursor_blink_phase;
         }
     }
 
@@ -703,6 +761,11 @@ impl TerminalWidget {
         let bg = self.color_to_rgba(&cell.bg, true);
         let fg = self.color_to_rgba(&cell.fg, false);
 
+        let font_family = if cell.attrs.bold {
+            "JetBrains Mono"
+        } else {
+            "JetBrainsMono NF"
+        };
         let font_weight = if cell.attrs.bold {
             FontWeight::BOLD
         } else {
@@ -716,21 +779,14 @@ impl TerminalWidget {
             .w(self.cell_size.0)
             .h(self.cell_size.1)
             .bg(bg)
-            .child(
-                div()
-                    .size_full()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_size(px(14.0))
-                    .font_family("JetBrainsMono NF")
-                    .font_weight(font_weight)
-                    .when(cell.attrs.italic, |this| this.italic())
-                    .when(cell.attrs.underline > 0, |this| this.underline())
-                    .when(cell.attrs.strikethrough, |this| this.line_through())
-                    .text_color(fg)
-                    .child(cell.char.to_string()),
-            )
+            .text_size(px(14.0))
+            .font_family(font_family)
+            .font_weight(font_weight)
+            .text_color(fg)
+            .when(cell.attrs.italic, |this| this.italic())
+            .when(cell.attrs.underline > 0, |this| this.underline())
+            .when(cell.attrs.strikethrough, |this| this.line_through())
+            .child(cell.char.to_string())
     }
 
     /// Build the cursor element
@@ -754,13 +810,19 @@ impl TerminalWidget {
                 .w(self.cell_size.0)
                 .h(self.cell_size.1)
                 .bg(self.theme.cursor),
-            CursorStyle::Line => div()
-                .absolute()
-                .left(x)
-                .top(y)
-                .w(px(2.0))
-                .h(self.cell_size.1)
-                .bg(self.theme.cursor),
+            CursorStyle::Line => {
+                let cursor_width = px(2.0);
+                let cursor_height = px(14.0);
+                let baseline_in_cell = px(11.0);
+                let cursor_top_in_cell = baseline_in_cell - (cursor_height / 2.0);
+                div()
+                    .absolute()
+                    .left(x + px(1.0))
+                    .top(y + cursor_top_in_cell)
+                    .w(cursor_width)
+                    .h(cursor_height)
+                    .bg(self.theme.cursor)
+            }
             CursorStyle::Underline => div()
                 .absolute()
                 .left(x)
@@ -778,7 +840,20 @@ impl Render for TerminalWidget {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         window.request_animation_frame();
 
-        // Process any new output
+        // Update cursor blink timing
+        let now = Instant::now();
+        if let Some(last_time) = self.last_frame_time {
+            let elapsed = now.duration_since(last_time);
+            let old_blink_phase = self.cursor_blink_phase;
+            self.update_cursor_blink(elapsed);
+            // Only force re-render if blink state changed (for smooth cursor blink)
+            if old_blink_phase != self.cursor_blink_phase {
+                cx.notify(); // Trigger re-render for cursor blink
+            }
+        }
+        self.last_frame_time = Some(now);
+
+        // Process any new output from shell
         self.process_output(cx);
 
         // Calculate container bounds for resize
@@ -856,7 +931,18 @@ impl Render for TerminalWidget {
 
 impl Drop for TerminalWidget {
     fn drop(&mut self) {
-        // Cleanup will happen automatically via shell shutdown in reader thread
+        // Signal shutdown and wake the I/O thread
+        self.shutdown_flag.store(true, Ordering::Relaxed);
+        self.wake_io_thread();
+
+        // Drop the senders to signal disconnection
+        self.input_tx = None;
+        self.resize_tx = None;
+
+        // Join the I/O thread
+        if let Some(handle) = self.io_thread.take() {
+            let _ = handle.join();
+        }
     }
 }
 
