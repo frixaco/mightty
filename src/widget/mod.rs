@@ -318,7 +318,7 @@ impl TerminalWidget {
             last_frame_time: None,
             cursor_pos: (0, 0),
             size,
-            cell_size: (px(8.4), px(16.8)), // Monospace cell size (width, height) - 14px font with 0.6 width and 1.2 line height
+            cell_size: (px(9.6), px(19.2)), // Monospace cell size (width, height) - 16px font with 0.6 width and 1.2 line height
             theme: TerminalTheme::default(),
         };
 
@@ -758,14 +758,15 @@ impl TerminalWidget {
     /// Render a single cell
     fn render_cell(&self, cell: &Cell, row: u16, col: u16) -> impl IntoElement {
         let (x, y) = self.cell_position(row, col);
-        let bg = self.color_to_rgba(&cell.bg, true);
         let fg = self.color_to_rgba(&cell.fg, false);
-
-        let font_family = if cell.attrs.bold {
-            "JetBrains Mono"
+        let has_custom_bg = !matches!(cell.bg, Color::Default);
+        let bg = if has_custom_bg {
+            Some(self.color_to_rgba(&cell.bg, true))
         } else {
-            "JetBrainsMono NF"
+            None
         };
+
+        let font_family = "JetBrainsMono Nerd Font";
         let font_weight = if cell.attrs.bold {
             FontWeight::BOLD
         } else {
@@ -778,8 +779,8 @@ impl TerminalWidget {
             .top(y)
             .w(self.cell_size.0)
             .h(self.cell_size.1)
-            .bg(bg)
-            .text_size(px(14.0))
+            .when_some(bg, |this, bg| this.bg(bg))
+            .text_size(px(16.0))
             .font_family(font_family)
             .font_weight(font_weight)
             .text_color(fg)
@@ -812,8 +813,8 @@ impl TerminalWidget {
                 .bg(self.theme.cursor),
             CursorStyle::Line => {
                 let cursor_width = px(2.0);
-                let cursor_height = px(14.0);
-                let baseline_in_cell = px(11.0);
+                let cursor_height = px(16.0);
+                let baseline_in_cell = px(13.5);
                 let cursor_top_in_cell = baseline_in_cell - (cursor_height / 2.0);
                 div()
                     .absolute()

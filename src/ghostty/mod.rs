@@ -40,6 +40,21 @@ pub struct GhosttyTerminalInner {
     _private: [u8; 0],
 }
 
+/// String type returned by libghostty-vt
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct GhosttyString {
+    pub ptr: *const u8,
+    pub len: usize,
+}
+
+/// 256-color palette type
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct GhosttyColorPalette {
+    pub colors: [GhosttyColorRgb; 256],
+}
+
 /// Terminal data indices for ghostty_terminal_get (magic numbers from libghostty)
 mod TerminalData {
     pub const COLS: i32 = 1;
@@ -48,6 +63,41 @@ mod TerminalData {
     pub const CURSOR_Y: i32 = 4;
     pub const CURSOR_VISIBLE: i32 = 7;
     pub const SCROLLBAR: i32 = 9;
+    pub const TITLE: i32 = 12;
+    pub const PWD: i32 = 13;
+    pub const TOTAL_ROWS: i32 = 14;
+    pub const SCROLLBACK_ROWS: i32 = 15;
+    pub const WIDTH_PX: i32 = 16;
+    pub const HEIGHT_PX: i32 = 17;
+    pub const COLOR_FOREGROUND: i32 = 18;
+    pub const COLOR_BACKGROUND: i32 = 19;
+    pub const COLOR_CURSOR: i32 = 20;
+    pub const COLOR_PALETTE: i32 = 21;
+    pub const COLOR_FOREGROUND_DEFAULT: i32 = 22;
+    pub const COLOR_BACKGROUND_DEFAULT: i32 = 23;
+    pub const COLOR_CURSOR_DEFAULT: i32 = 24;
+    pub const COLOR_PALETTE_DEFAULT: i32 = 25;
+}
+
+/// Terminal option indices for ghostty_terminal_set (magic numbers from libghostty)
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub enum GhosttyTerminalOption {
+    Userdata = 0,
+    WritePty = 1,
+    Bell = 2,
+    Enquiry = 3,
+    Xtversion = 4,
+    TitleChanged = 5,
+    SizeCb = 6,
+    ColorScheme = 7,
+    DeviceAttributes = 8,
+    Title = 9,
+    Pwd = 10,
+    ColorForeground = 11,
+    ColorBackground = 12,
+    ColorCursor = 13,
+    ColorPalette = 14,
 }
 
 /// Result codes for libghostty-vt operations
@@ -62,6 +112,8 @@ pub enum GhosttyResult {
     InvalidValue = -2,
     /// Operation failed because the provided buffer was too small
     OutOfSpace = -3,
+    /// Operation failed because the requested value doesn't exist
+    NoValue = -4,
 }
 
 impl GhosttyResult {
@@ -396,6 +448,20 @@ pub struct GhosttyRenderStateColors {
 #[cfg_attr(windows, link(name = "ghostty-vt", kind = "raw-dylib"))]
 #[cfg_attr(not(windows), link(name = "ghostty-vt", kind = "dylib"))]
 unsafe extern "C" {
+    // ========================================================================
+    // Memory Management
+    // ========================================================================
+
+    /// Allocate memory using libghostty's allocator
+    pub fn ghostty_alloc(allocator: *const c_void, len: usize) -> *mut u8;
+
+    /// Free memory allocated by ghostty_alloc
+    pub fn ghostty_free(allocator: *const c_void, ptr: *mut u8, len: usize);
+
+    // ========================================================================
+    // Terminal API
+    // ========================================================================
+
     /// Create a new terminal instance
     pub fn ghostty_terminal_new(
         allocator: *const c_void,
@@ -409,11 +475,13 @@ unsafe extern "C" {
     /// Perform a full reset of the terminal (RIS)
     pub fn ghostty_terminal_reset(terminal: *mut GhosttyTerminalInner);
 
-    /// Resize the terminal to the given dimensions
+    /// Resize the terminal to the given dimensions (cells and pixels)
     pub fn ghostty_terminal_resize(
         terminal: *mut GhosttyTerminalInner,
         cols: u16,
         rows: u16,
+        cell_width_px: u32,
+        cell_height_px: u32,
     ) -> GhosttyResult;
 
     /// Write VT-encoded data to the terminal for processing
@@ -422,6 +490,13 @@ unsafe extern "C" {
         data: *const u8,
         len: usize,
     );
+
+    /// Set an option on the terminal
+    pub fn ghostty_terminal_set(
+        terminal: *mut GhosttyTerminalInner,
+        option: GhosttyTerminalOption,
+        value: *const c_void,
+    ) -> GhosttyResult;
 
     /// Scroll the terminal viewport
     pub fn ghostty_terminal_scroll_viewport(
@@ -473,6 +548,23 @@ unsafe extern "C" {
         row: GhosttyRow,
         data: GhosttyRowData,
         out: *mut c_void,
+    ) -> GhosttyResult;
+
+    // ========================================================================
+    // Paste API
+    // ========================================================================
+
+    /// Check if paste data is safe to send without bracketed paste
+    pub fn ghostty_paste_is_safe(data: *const u8, len: usize) -> bool;
+
+    /// Encode paste data with optional bracketed paste mode
+    pub fn ghostty_paste_encode(
+        data: *mut u8,
+        data_len: usize,
+        bracketed: bool,
+        out: *mut u8,
+        out_len: usize,
+        out_written: *mut usize,
     ) -> GhosttyResult;
 
     // ========================================================================
@@ -726,9 +818,23 @@ impl Terminal {
         self.write(s.as_bytes());
     }
 
-    /// Resize the terminal
+    /// Resize the terminal (cells only, pixel dimensions tracked internally)
     pub fn resize(&mut self, cols: u16, rows: u16) -> Result<(), GhosttyResult> {
-        let result = unsafe { ghostty_terminal_resize(self.ptr.as_ptr(), cols, rows) };
+        // Use default cell size of9x18 pixels
+        self.resize_with_pixels(cols, rows, 9, 18)
+    }
+
+    /// Resize the terminal with explicit pixel dimensions
+    pub fn resize_with_pixels(
+        &mut self,
+        cols: u16,
+        rows: u16,
+        cell_width_px: u32,
+        cell_height_px: u32,
+    ) -> Result<(), GhosttyResult> {
+        let result = unsafe {
+            ghostty_terminal_resize(self.ptr.as_ptr(), cols, rows, cell_width_px, cell_height_px)
+        };
         if result == GhosttyResult::Success {
             self.cached_buffer = None;
             Ok(())
@@ -815,6 +921,188 @@ impl Terminal {
         } else {
             None
         }
+    }
+
+    /// Get the terminal title (OSC 2)
+    pub fn title(&self) -> Option<&str> {
+        let mut s = GhosttyString {
+            ptr: std::ptr::null(),
+            len: 0,
+        };
+        let result = unsafe {
+            ghostty_terminal_get(
+                self.ptr.as_ptr(),
+                TerminalData::TITLE,
+                &mut s as *mut _ as *mut c_void,
+            )
+        };
+        if result == GhosttyResult::Success && !s.ptr.is_null() {
+            unsafe {
+                Some(std::str::from_utf8_unchecked(std::slice::from_raw_parts(
+                    s.ptr, s.len,
+                )))
+            }
+        } else {
+            None
+        }
+    }
+
+    /// Get the terminal working directory (OSC 7)
+    pub fn pwd(&self) -> Option<&str> {
+        let mut s = GhosttyString {
+            ptr: std::ptr::null(),
+            len: 0,
+        };
+        let result = unsafe {
+            ghostty_terminal_get(
+                self.ptr.as_ptr(),
+                TerminalData::PWD,
+                &mut s as *mut _ as *mut c_void,
+            )
+        };
+        if result == GhosttyResult::Success && !s.ptr.is_null() {
+            unsafe {
+                Some(std::str::from_utf8_unchecked(std::slice::from_raw_parts(
+                    s.ptr, s.len,
+                )))
+            }
+        } else {
+            None
+        }
+    }
+
+    /// Get total rows including scrollback
+    pub fn total_rows(&self) -> usize {
+        let mut rows: usize = 0;
+        unsafe {
+            ghostty_terminal_get(
+                self.ptr.as_ptr(),
+                TerminalData::TOTAL_ROWS,
+                &mut rows as *mut _ as *mut c_void,
+            );
+        }
+        rows
+    }
+
+    /// Get scrollback rows (total_rows - visible rows)
+    pub fn scrollback_rows(&self) -> usize {
+        let mut rows: usize = 0;
+        unsafe {
+            ghostty_terminal_get(
+                self.ptr.as_ptr(),
+                TerminalData::SCROLLBACK_ROWS,
+                &mut rows as *mut _ as *mut c_void,
+            );
+        }
+        rows
+    }
+
+    /// Get terminal width in pixels
+    pub fn width_px(&self) -> u32 {
+        let mut width: u32 = 0;
+        unsafe {
+            ghostty_terminal_get(
+                self.ptr.as_ptr(),
+                TerminalData::WIDTH_PX,
+                &mut width as *mut _ as *mut c_void,
+            );
+        }
+        width
+    }
+
+    /// Get terminal height in pixels
+    pub fn height_px(&self) -> u32 {
+        let mut height: u32 = 0;
+        unsafe {
+            ghostty_terminal_get(
+                self.ptr.as_ptr(),
+                TerminalData::HEIGHT_PX,
+                &mut height as *mut _ as *mut c_void,
+            );
+        }
+        height
+    }
+
+    /// Get current foreground color
+    pub fn foreground_color(&self) -> Option<GhosttyColorRgb> {
+        let mut color = GhosttyColorRgb { r: 0, g: 0, b: 0 };
+        let result = unsafe {
+            ghostty_terminal_get(
+                self.ptr.as_ptr(),
+                TerminalData::COLOR_FOREGROUND,
+                &mut color as *mut _ as *mut c_void,
+            )
+        };
+        if result == GhosttyResult::Success {
+            Some(color)
+        } else {
+            None
+        }
+    }
+
+    /// Get current background color
+    pub fn background_color(&self) -> Option<GhosttyColorRgb> {
+        let mut color = GhosttyColorRgb { r: 0, g: 0, b: 0 };
+        let result = unsafe {
+            ghostty_terminal_get(
+                self.ptr.as_ptr(),
+                TerminalData::COLOR_BACKGROUND,
+                &mut color as *mut _ as *mut c_void,
+            )
+        };
+        if result == GhosttyResult::Success {
+            Some(color)
+        } else {
+            None
+        }
+    }
+
+    /// Get current cursor color
+    pub fn cursor_color(&self) -> Option<GhosttyColorRgb> {
+        let mut color = GhosttyColorRgb { r: 0, g: 0, b: 0 };
+        let result = unsafe {
+            ghostty_terminal_get(
+                self.ptr.as_ptr(),
+                TerminalData::COLOR_CURSOR,
+                &mut color as *mut _ as *mut c_void,
+            )
+        };
+        if result == GhosttyResult::Success {
+            Some(color)
+        } else {
+            None
+        }
+    }
+
+    /// Encode paste data for bracketed paste mode
+    pub fn encode_paste(data: &[u8], bracketed: bool) -> Result<Vec<u8>, GhosttyResult> {
+        // Calculate required buffer size (worst case:6 bytes overhead + data + CR/LF expansion)
+        let max_len = data.len() + data.len() / 2 + 64; // conservative estimate
+        let mut out = vec![0u8; max_len];
+        let mut written: usize = 0;
+
+        let result = unsafe {
+            ghostty_paste_encode(
+                data.as_ptr() as *mut u8,
+                data.len(),
+                bracketed,
+                out.as_mut_ptr(),
+                out.len(),
+                &mut written,
+            )
+        };
+
+        if result == GhosttyResult::Success {
+            out.truncate(written);
+            Ok(out)
+        } else {
+            Err(result)
+        }
+    }
+
+    /// Check if paste data is safe to send without bracketed paste
+    pub fn is_paste_safe(data: &[u8]) -> bool {
+        unsafe { ghostty_paste_is_safe(data.as_ptr(), data.len()) }
     }
 
     // ============================================================================
