@@ -1,12 +1,18 @@
 //! Terminal Widget
 //!
 //! GPUI component that renders terminal content and handles user interaction.
-//! Combines ConPtyShell, libghostty Terminal, and GhosttyKeyEncoder into a complete
+//! Combines ConPtyShell, libghostty Terminal, and key encoding into a complete
 //! terminal widget.
 
 use gpui::{
     div, prelude::*, px, Bounds, Context, FocusHandle, FontWeight, InteractiveElement, IntoElement,
     KeyDownEvent, KeyUpEvent, MouseButton, MouseDownEvent, Pixels, Render, Styled, Window,
+};
+use libghostty_vt::{
+    key::{Action, Encoder, Event, Key, Mods},
+    render::{CellIterator, RowIterator},
+    style::{RgbColor, Underline},
+    RenderState, Terminal, TerminalOptions,
 };
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -16,44 +22,27 @@ use std::sync::{
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use crate::ghostty::{
-    ghostty_key_encoder_encode, ghostty_key_encoder_new, ghostty_key_encoder_setopt_from_terminal,
-    ghostty_key_event_new, ghostty_key_event_set_action, ghostty_key_event_set_composing,
-    ghostty_key_event_set_consumed_mods, ghostty_key_event_set_key, ghostty_key_event_set_mods,
-    ghostty_key_event_set_unshifted_codepoint, ghostty_key_event_set_utf8, Cell, Color, GhosttyKey,
-    GhosttyKeyAction, GhosttyKeyEncoder, GhosttyKeyEvent, GhosttyMods, GhosttyResult,
-    GhosttyTerminalOptions, Terminal,
-};
 #[cfg(windows)]
 use crate::shell::ConPtyShell;
 
 /// Cursor style options
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CursorStyle {
-    /// Solid block cursor (default)
     #[default]
     Block,
-    /// Vertical line cursor
     Line,
-    /// Underline cursor
     Underline,
 }
 
 /// Terminal widget configuration
 #[derive(Debug, Clone)]
 pub struct TerminalConfig {
-    /// Shell command to spawn (e.g., "cmd.exe", "pwsh.exe")
     pub shell: String,
-    /// Initial terminal dimensions in cells
     pub initial_rows: u16,
     pub initial_cols: u16,
-    /// Scrollback buffer size
     pub scrollback: usize,
-    /// Cursor style
     pub cursor_style: CursorStyle,
-    /// Enable cursor blinking
     pub cursor_blink: bool,
-    /// Cursor blink interval
     pub blink_interval: Duration,
 }
 
@@ -71,53 +60,34 @@ impl Default for TerminalConfig {
     }
 }
 
-/// Output message from shell reader thread
 type OutputData = Vec<u8>;
-
-/// Wake signal for the shell I/O thread
 type IoWakeSignal = Arc<(Mutex<bool>, Condvar)>;
 
-/// Terminal widget state and rendering
 pub struct TerminalWidget {
-    /// libghostty terminal emulator
-    terminal: Terminal,
-    /// Key encoder for VT sequence generation
-    key_encoder: GhosttyKeyEncoder,
-    /// Key event for encoding
-    key_event: GhosttyKeyEvent,
-    /// Configuration
+    terminal: Terminal<'static, 'static>,
+    key_encoder: Encoder<'static>,
+    key_event: Event<'static>,
+    render_state: RenderState<'static>,
+    row_iterator: RowIterator<'static>,
+    cell_iterator: CellIterator<'static>,
     config: TerminalConfig,
-    /// Output data receiver from reader thread
     output_rx: Receiver<OutputData>,
-    /// Input data sender to shell (for sending keypresses to shell)
     input_tx: Option<std::sync::mpsc::Sender<Vec<u8>>>,
-    /// Resize event sender to shell I/O thread
     resize_tx: Option<Sender<(u16, u16)>>,
-    /// Wake signal for the shell I/O thread
     io_wake: IoWakeSignal,
-    /// Shutdown flag for the I/O thread
     shutdown_flag: Arc<AtomicBool>,
-    /// Handle to the I/O thread
+    exit_flag: Arc<AtomicBool>,
     io_thread: Option<JoinHandle<()>>,
-    /// Focus handle for tracking focus
     focus_handle: FocusHandle,
-    /// Cursor blink state (visible/hidden)
     cursor_blink_phase: bool,
-    /// Accumulated time for cursor blink
     blink_accumulator: Duration,
-    /// Time of last frame for blink calculation
     last_frame_time: Option<Instant>,
-    /// Current cursor position (col, row)
-    cursor_pos: (u16, u16),
-    /// Terminal dimensions in cells
     size: (u16, u16),
-    /// Cell dimensions in pixels (width, height)
     cell_size: (Pixels, Pixels),
-    /// Theme colors
     theme: TerminalTheme,
+    has_exited: bool,
 }
 
-/// Terminal color theme
 #[derive(Debug, Clone)]
 pub struct TerminalTheme {
     pub foreground: gpui::Rgba,
@@ -135,73 +105,81 @@ impl Default for TerminalTheme {
             cursor: gpui::rgba(0xffffff),
             selection: gpui::rgba(0x3d3d3d),
             palette: [
-                gpui::rgba(0x000000), // Black
-                gpui::rgba(0xcd0000), // Red
-                gpui::rgba(0x00cd00), // Green
-                gpui::rgba(0xcdcd00), // Yellow
-                gpui::rgba(0x0000ee), // Blue
-                gpui::rgba(0xcd00cd), // Magenta
-                gpui::rgba(0x00cdcd), // Cyan
-                gpui::rgba(0xe5e5e5), // White
-                gpui::rgba(0x7f7f7f), // Bright Black
-                gpui::rgba(0xff0000), // Bright Red
-                gpui::rgba(0x00ff00), // Bright Green
-                gpui::rgba(0xffff00), // Bright Yellow
-                gpui::rgba(0x5c5cff), // Bright Blue
-                gpui::rgba(0xff00ff), // Bright Magenta
-                gpui::rgba(0x00ffff), // Bright Cyan
-                gpui::rgba(0xffffff), // Bright White
+                gpui::rgba(0x000000),
+                gpui::rgba(0xcd0000),
+                gpui::rgba(0x00cd00),
+                gpui::rgba(0xcdcd00),
+                gpui::rgba(0x0000ee),
+                gpui::rgba(0xcd00cd),
+                gpui::rgba(0x00cdcd),
+                gpui::rgba(0xe5e5e5),
+                gpui::rgba(0x7f7f7f),
+                gpui::rgba(0xff0000),
+                gpui::rgba(0x00ff00),
+                gpui::rgba(0xffff00),
+                gpui::rgba(0x5c5cff),
+                gpui::rgba(0xff00ff),
+                gpui::rgba(0x00ffff),
+                gpui::rgba(0xffffff),
             ],
         }
     }
 }
 
+fn rgb_to_rgba(rgb: RgbColor) -> gpui::Rgba {
+    gpui::rgba((rgb.r as u32) << 16 | (rgb.g as u32) << 8 | rgb.b as u32)
+}
+
+fn cell_position(row: u16, col: u16, cell_size: (Pixels, Pixels)) -> (Pixels, Pixels) {
+    (cell_size.0 * col as f32, cell_size.1 * row as f32)
+}
+
 impl TerminalWidget {
-    /// Create a new terminal widget with the given configuration
     pub fn new(config: TerminalConfig, cx: &mut Context<Self>) -> Self {
-        // Initialize libghostty terminal
-        let terminal = Terminal::new(GhosttyTerminalOptions {
+        let terminal = Terminal::new(TerminalOptions {
             cols: config.initial_cols,
             rows: config.initial_rows,
             max_scrollback: config.scrollback,
         })
         .expect("Failed to create terminal");
 
-        // Spawn shell and create channels
+        let render_state = RenderState::new().expect("Failed to create render state");
+        let row_iterator = RowIterator::new().expect("Failed to create row iterator");
+        let cell_iterator = CellIterator::new().expect("Failed to create cell iterator");
+        let key_encoder = Encoder::new().expect("Failed to create key encoder");
+        let key_event = Event::new().expect("Failed to create key event");
+
         let (output_tx, output_rx) = channel::<OutputData>();
         let (input_tx, input_rx) = channel::<Vec<u8>>();
         let (resize_tx, resize_rx) = channel::<(u16, u16)>();
-        let io_wake: IoWakeSignal = Arc::new((Mutex::new(false), Condvar::new()));
+        let io_wake = Arc::new((Mutex::new(false), Condvar::new()));
         let shutdown_flag = Arc::new(AtomicBool::new(false));
+        let exit_flag = Arc::new(AtomicBool::new(false));
+        let exit_flag_thread = Arc::clone(&exit_flag);
 
-        // Clone config for the thread
         let shell_cmd = config.shell.clone();
         let rows = config.initial_rows;
         let cols = config.initial_cols;
         let shutdown_thread = Arc::clone(&shutdown_flag);
-
-        // I/O thread wake signal (kept for potential future use with event-based I/O)
         let _io_wake_thread = Arc::clone(&io_wake);
 
-        // Start I/O thread that handles both reading and writing (Windows only)
         #[cfg(windows)]
         let io_thread = Some(std::thread::spawn(move || {
             let mut shell = match ConPtyShell::spawn(&shell_cmd, rows, cols) {
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!("Failed to spawn shell: {}", e);
+                    exit_flag_thread.store(true, Ordering::Relaxed);
                     return;
                 }
             };
 
-            let mut buf = [0u8; 32768]; // 32KB buffer for efficient burst reading
-            let mut output_buffer: Vec<u8> = Vec::with_capacity(65536); // 64KB output buffer
-            let output_batch_threshold = 16384; // Send when buffer reaches 16KB
+            let mut buf = [0u8; 32768];
+            let mut output_buffer: Vec<u8> = Vec::with_capacity(65536);
+            let output_batch_threshold = 16384;
 
             loop {
-                // Check shutdown flag
                 if shutdown_thread.load(Ordering::Relaxed) {
-                    // Flush remaining output before shutdown
                     if !output_buffer.is_empty() {
                         let _ = output_tx.send(std::mem::take(&mut output_buffer));
                     }
@@ -211,138 +189,156 @@ impl TerminalWidget {
 
                 let mut did_work = false;
 
-                // Drain all pending input immediately so interactive input doesn't wait
-                // for the next polling tick.
                 loop {
                     match input_rx.try_recv() {
                         Ok(data) => {
                             did_work = true;
                             if shell.write(&data).is_err() {
+                                exit_flag_thread.store(true, Ordering::Relaxed);
                                 return;
                             }
                         }
                         Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                        Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            exit_flag_thread.store(true, Ordering::Relaxed);
+                            return;
+                        }
                     }
                 }
 
-                // Keep only the latest resize and apply it before reading output.
                 let mut pending_resize = None;
                 loop {
                     match resize_rx.try_recv() {
-                        Ok(size) => {
-                            pending_resize = Some(size);
-                        }
+                        Ok(size) => pending_resize = Some(size),
                         Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                        Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            exit_flag_thread.store(true, Ordering::Relaxed);
+                            return;
+                        }
                     }
                 }
 
                 if let Some((rows, cols)) = pending_resize {
                     did_work = true;
                     if shell.resize(rows, cols).is_err() {
+                        exit_flag_thread.store(true, Ordering::Relaxed);
                         return;
                     }
                 }
 
-                // Drain all available output into buffer
                 loop {
                     match shell.peek() {
                         Ok(true) => match shell.read(&mut buf) {
                             Ok(n) if n > 0 => {
                                 did_work = true;
                                 output_buffer.extend_from_slice(&buf[0..n]);
-                                // Send batch if buffer is large enough
                                 if output_buffer.len() >= output_batch_threshold {
                                     if output_tx.send(std::mem::take(&mut output_buffer)).is_err() {
+                                        exit_flag_thread.store(true, Ordering::Relaxed);
                                         return;
                                     }
                                     output_buffer = Vec::with_capacity(65536);
                                 }
                             }
                             Ok(_) => break,
-                            Err(_) => return,
+                            Err(_) => {
+                                exit_flag_thread.store(true, Ordering::Relaxed);
+                                return;
+                            }
                         },
                         Ok(false) => break,
-                        Err(_) => return,
+                        Err(_) => {
+                            exit_flag_thread.store(true, Ordering::Relaxed);
+                            return;
+                        }
                     }
                 }
 
-                // Flush output buffer if we have data
                 if !output_buffer.is_empty() {
                     did_work = true;
                     if output_tx.send(std::mem::take(&mut output_buffer)).is_err() {
+                        exit_flag_thread.store(true, Ordering::Relaxed);
                         return;
                     }
                     output_buffer = Vec::with_capacity(65536);
                 }
 
                 if !did_work {
-                    // Use brief sleep instead of polling - reduces CPU usage
                     std::thread::sleep(Duration::from_millis(8));
                 }
             }
         }));
 
         #[cfg(not(windows))]
-        let io_thread: Option<JoinHandle<()>> = None;
+        let io_thread: Option<JoinHandle<()>> = {
+            exit_flag.store(true, Ordering::Relaxed);
+            None
+        };
 
         let size = (config.initial_cols, config.initial_rows);
 
-        // Create key encoder and event
-        let mut key_encoder: GhosttyKeyEncoder = std::ptr::null_mut();
-        let mut key_event: GhosttyKeyEvent = std::ptr::null_mut();
-
-        unsafe {
-            if GhosttyResult::Success == ghostty_key_encoder_new(std::ptr::null(), &mut key_encoder)
-            {
-                ghostty_key_encoder_setopt_from_terminal(key_encoder, terminal.as_ptr());
-            }
-            ghostty_key_event_new(std::ptr::null(), &mut key_event);
-        }
-
-        let this = Self {
+        Self {
             terminal,
             key_encoder,
             key_event,
+            render_state,
+            row_iterator,
+            cell_iterator,
             config,
             output_rx,
             input_tx: Some(input_tx),
             resize_tx: Some(resize_tx),
             io_wake,
             shutdown_flag,
+            exit_flag,
             io_thread,
             focus_handle: cx.focus_handle(),
             cursor_blink_phase: true,
             blink_accumulator: Duration::ZERO,
             last_frame_time: None,
-            cursor_pos: (0, 0),
             size,
-            cell_size: (px(9.6), px(19.2)), // Monospace cell size (width, height) - 16px font with 0.6 width and 1.2 line height
+            cell_size: (px(9.6), px(19.2)),
             theme: TerminalTheme::default(),
-        };
-
-        this
+            has_exited: false,
+        }
     }
 
-    /// Update cursor blink state based on elapsed time
+    pub fn set_exit_flag(&mut self, flag: Arc<AtomicBool>) {
+        self.exit_flag = flag;
+    }
+
+    pub fn has_exited(&self) -> bool {
+        self.has_exited
+    }
+
+    pub fn check_exit(&mut self) -> bool {
+        if !self.has_exited && self.exit_flag.load(Ordering::Relaxed) {
+            self.has_exited = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn request_focus(&self, window: &mut Window) {
+        self.focus_handle.focus(window);
+    }
+
+    pub fn focus_handle(&self) -> &FocusHandle {
+        &self.focus_handle
+    }
+
     fn update_cursor_blink(&mut self, elapsed: Duration) {
         if !self.config.cursor_blink {
             self.cursor_blink_phase = true;
             self.blink_accumulator = Duration::ZERO;
             return;
         }
-
         self.blink_accumulator += elapsed;
         if self.blink_accumulator >= self.config.blink_interval {
             self.blink_accumulator = Duration::ZERO;
             self.cursor_blink_phase = !self.cursor_blink_phase;
         }
-    }
-
-    /// Create a terminal widget with default configuration
-    pub fn default(cx: &mut Context<Self>) -> Self {
-        Self::new(TerminalConfig::default(), cx)
     }
 
     fn wake_io_thread(&self) {
@@ -353,54 +349,43 @@ impl TerminalWidget {
         }
     }
 
-    /// Process any pending output from the shell
     fn process_output(&mut self, cx: &mut Context<Self>) {
         let mut has_new_data = false;
-
-        // Drain all available output
         while let Ok(data) = self.output_rx.try_recv() {
-            self.terminal.write(&data);
+            self.terminal.vt_write(&data);
             has_new_data = true;
         }
-
-        // Update cursor position from terminal
-        self.cursor_pos = self.terminal.cursor_pos();
-
-        // Notify GPUI to re-render if we got new data
         if has_new_data {
             cx.notify();
         }
     }
 
-    /// Calculate terminal dimensions from bounds
     fn calculate_dimensions(&self, bounds: &Bounds<Pixels>) -> (u16, u16) {
         let cols = (bounds.size.width / self.cell_size.0).floor() as u16;
         let rows = (bounds.size.height / self.cell_size.1).floor() as u16;
         (cols.max(1), rows.max(1))
     }
 
-    /// Resize the terminal to match the given bounds
     fn resize_to_bounds(&mut self, bounds: &Bounds<Pixels>, cx: &mut Context<Self>) {
         let (cols, rows) = self.calculate_dimensions(bounds);
-
-        // Only resize if dimensions changed
         if cols != self.size.0 || rows != self.size.1 {
-            // Resize ghostty terminal
-            if self.terminal.resize(cols, rows).is_ok() {
+            let cell_width: f32 = self.cell_size.0.into();
+            let cell_height: f32 = self.cell_size.1.into();
+            if self
+                .terminal
+                .resize(cols, rows, cell_width as u32, cell_height as u32)
+                .is_ok()
+            {
                 self.size = (cols, rows);
-
-                // Also resize the shell
                 if let Some(ref resize_tx) = self.resize_tx {
                     let _ = resize_tx.send((rows, cols));
                     self.wake_io_thread();
                 }
-
                 cx.notify();
             }
         }
     }
 
-    /// Handle key down events
     fn handle_key_down(
         &mut self,
         event: &KeyDownEvent,
@@ -408,21 +393,20 @@ impl TerminalWidget {
         cx: &mut Context<Self>,
     ) {
         let action = if event.is_held {
-            GhosttyKeyAction::Repeat
+            Action::Repeat
         } else {
-            GhosttyKeyAction::Press
+            Action::Press
         };
-
         self.send_encoded_key(action, &event.keystroke, cx);
     }
 
     fn handle_key_up(&mut self, event: &KeyUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
-        self.send_encoded_key(GhosttyKeyAction::Release, &event.keystroke, cx);
+        self.send_encoded_key(Action::Release, &event.keystroke, cx);
     }
 
     fn send_encoded_key(
         &mut self,
-        action: GhosttyKeyAction,
+        action: Action,
         keystroke: &gpui::Keystroke,
         cx: &mut Context<Self>,
     ) {
@@ -436,23 +420,13 @@ impl TerminalWidget {
                 eprintln!("Failed to send input to shell: {:?}", e);
                 return;
             }
-
             self.wake_io_thread();
         }
-
         self.process_output(cx);
         cx.notify();
     }
 
-    fn encode_key_event(
-        &mut self,
-        action: GhosttyKeyAction,
-        keystroke: &gpui::Keystroke,
-    ) -> Option<Vec<u8>> {
-        unsafe {
-            ghostty_key_encoder_setopt_from_terminal(self.key_encoder, self.terminal.as_ptr());
-        }
-
+    fn encode_key_event(&mut self, action: Action, keystroke: &gpui::Keystroke) -> Option<Vec<u8>> {
         let ghostty_key = self.convert_to_ghostty_key(keystroke);
         let ghostty_mods = self.convert_to_ghostty_mods(keystroke);
         let printable_text = self.printable_text(keystroke, action);
@@ -460,58 +434,43 @@ impl TerminalWidget {
         let consumed_mods = self.consumed_mods(
             &keystroke.key,
             ghostty_mods,
-            printable_text,
+            printable_text.as_deref(),
             unshifted_codepoint,
         );
 
-        unsafe {
-            ghostty_key_event_set_action(self.key_event, action);
-            ghostty_key_event_set_key(self.key_event, ghostty_key);
-            ghostty_key_event_set_mods(self.key_event, ghostty_mods);
-            ghostty_key_event_set_consumed_mods(self.key_event, consumed_mods);
-            ghostty_key_event_set_unshifted_codepoint(self.key_event, unshifted_codepoint);
-            ghostty_key_event_set_composing(self.key_event, false);
+        self.key_event
+            .set_action(action)
+            .set_key(ghostty_key)
+            .set_mods(ghostty_mods)
+            .set_consumed_mods(consumed_mods)
+            .set_unshifted_codepoint(unshifted_codepoint)
+            .set_utf8(printable_text.as_deref());
 
-            if let Some(text) = printable_text {
-                ghostty_key_event_set_utf8(self.key_event, text.as_ptr() as *const i8, text.len());
-            } else {
-                ghostty_key_event_set_utf8(self.key_event, std::ptr::null(), 0);
-            }
-        }
+        self.key_encoder.set_options_from_terminal(&self.terminal);
 
-        let mut out_buf = [0i8; 256];
-        let mut out_len: usize = 0;
-
-        unsafe {
-            let result = ghostty_key_encoder_encode(
-                self.key_encoder,
-                self.key_event,
-                out_buf.as_mut_ptr(),
-                out_buf.len(),
-                &mut out_len,
-            );
-
-            if result == GhosttyResult::Success && out_len > 0 {
-                Some(out_buf[0..out_len].iter().map(|&b| b as u8).collect())
-            } else {
-                None
-            }
+        let mut response = Vec::with_capacity(64);
+        self.key_encoder
+            .encode_to_vec(&self.key_event, &mut response)
+            .ok()?;
+        if response.is_empty() {
+            None
+        } else {
+            Some(response)
         }
     }
 
     fn printable_text<'a>(
         &self,
         keystroke: &'a gpui::Keystroke,
-        action: GhosttyKeyAction,
+        action: Action,
     ) -> Option<&'a str> {
-        if action == GhosttyKeyAction::Release {
+        if action == Action::Release {
             return None;
         }
-
         keystroke
             .key_char
             .as_deref()
-            .filter(|text| !text.is_empty())
+            .filter(|t| !t.is_empty())
             .or_else(|| {
                 if keystroke.key == "space" {
                     Some(" ")
@@ -523,205 +482,166 @@ impl TerminalWidget {
             })
     }
 
-    fn unshifted_codepoint(&self, keystroke: &gpui::Keystroke) -> u32 {
+    fn unshifted_codepoint(&self, keystroke: &gpui::Keystroke) -> char {
         if keystroke.key == "space" {
-            return ' ' as u32;
+            return ' ';
         }
-
         let mut chars = keystroke.key.chars();
-        let Some(c) = chars.next() else {
-            return 0;
-        };
-
+        let Some(c) = chars.next() else { return '\0' };
         if chars.next().is_some() {
-            return 0;
+            return '\0';
         }
-
         match c {
-            'A'..='Z' => c.to_ascii_lowercase() as u32,
-            '!' => '1' as u32,
-            '@' => '2' as u32,
-            '#' => '3' as u32,
-            '$' => '4' as u32,
-            '%' => '5' as u32,
-            '^' => '6' as u32,
-            '&' => '7' as u32,
-            '*' => '8' as u32,
-            '(' => '9' as u32,
-            ')' => '0' as u32,
-            '_' => '-' as u32,
-            '+' => '=' as u32,
-            '{' => '[' as u32,
-            '}' => ']' as u32,
-            '|' => '\\' as u32,
-            ':' => ';' as u32,
-            '"' => '\'' as u32,
-            '<' => ',' as u32,
-            '>' => '.' as u32,
-            '?' => '/' as u32,
-            '~' => '`' as u32,
-            _ => c as u32,
+            'A'..='Z' => c.to_ascii_lowercase(),
+            '!' => '1',
+            '@' => '2',
+            '#' => '3',
+            '$' => '4',
+            '%' => '5',
+            '^' => '6',
+            '&' => '7',
+            '*' => '8',
+            '(' => '9',
+            ')' => '0',
+            '_' => '-',
+            '+' => '=',
+            '{' => '[',
+            '}' => ']',
+            '|' => '\\',
+            ':' => ';',
+            '"' => '\'',
+            '<' => ',',
+            '>' => '.',
+            '?' => '/',
+            '~' => '`',
+            _ => c,
         }
     }
 
-    fn consumed_mods(
-        &self,
-        key: &str,
-        ghostty_mods: GhosttyMods,
-        printable_text: Option<&str>,
-        unshifted_codepoint: u32,
-    ) -> GhosttyMods {
-        let Some(text) = printable_text else {
-            return GhosttyMods::default();
+    fn consumed_mods(&self, key: &str, mods: Mods, text: Option<&str>, ucp: char) -> Mods {
+        let Some(t) = text else { return Mods::empty() };
+        let mut chars = t.chars();
+        let Some(tc) = chars.next() else {
+            return Mods::empty();
         };
-
-        let mut chars = text.chars();
-        let Some(text_char) = chars.next() else {
-            return GhosttyMods::default();
-        };
-
         if chars.next().is_some() {
-            return GhosttyMods::default();
+            return Mods::empty();
         }
-
-        if ghostty_mods.contains(GhosttyMods::SHIFT) && text_char as u32 != unshifted_codepoint {
-            GhosttyMods::SHIFT
-        } else if self.key_implies_shift(key, unshifted_codepoint) {
-            GhosttyMods::SHIFT
+        if mods.contains(Mods::SHIFT) && tc != ucp {
+            Mods::SHIFT
+        } else if self.key_implies_shift(key, ucp) {
+            Mods::SHIFT
         } else {
-            GhosttyMods::default()
+            Mods::empty()
         }
     }
 
-    fn key_implies_shift(&self, key: &str, unshifted_codepoint: u32) -> bool {
+    fn key_implies_shift(&self, key: &str, ucp: char) -> bool {
         let mut chars = key.chars();
-        let Some(key_char) = chars.next() else {
-            return false;
-        };
-
+        let Some(kc) = chars.next() else { return false };
         if chars.next().is_some() {
             return false;
         }
-
-        unshifted_codepoint > 0 && key_char as u32 != unshifted_codepoint
+        ucp != '\0' && kc != ucp
     }
 
-    /// Convert GPUI keystroke to GhosttyKey
-    fn convert_to_ghostty_key(&self, keystroke: &gpui::Keystroke) -> GhosttyKey {
-        let key_str = keystroke.key.as_str();
-
-        match key_str {
-            // Arrows
-            "up" => GhosttyKey::ArrowUp,
-            "down" => GhosttyKey::ArrowDown,
-            "left" => GhosttyKey::ArrowLeft,
-            "right" => GhosttyKey::ArrowRight,
-            // Control Pad
-            "home" => GhosttyKey::Home,
-            "end" => GhosttyKey::End,
-            "insert" => GhosttyKey::Insert,
-            "delete" => GhosttyKey::Delete,
-            "pageup" => GhosttyKey::PageUp,
-            "pagedown" => GhosttyKey::PageDown,
-            // Function Keys
-            "escape" => GhosttyKey::Escape,
-            "enter" => GhosttyKey::Enter,
-            "backspace" => GhosttyKey::Backspace,
-            "tab" => GhosttyKey::Tab,
-            "space" => GhosttyKey::Space,
-            "f1" => GhosttyKey::F1,
-            "f2" => GhosttyKey::F2,
-            "f3" => GhosttyKey::F3,
-            "f4" => GhosttyKey::F4,
-            "f5" => GhosttyKey::F5,
-            "f6" => GhosttyKey::F6,
-            "f7" => GhosttyKey::F7,
-            "f8" => GhosttyKey::F8,
-            "f9" => GhosttyKey::F9,
-            "f10" => GhosttyKey::F10,
-            "f11" => GhosttyKey::F11,
-            "f12" => GhosttyKey::F12,
-            // Single character keys
+    fn convert_to_ghostty_key(&self, keystroke: &gpui::Keystroke) -> Key {
+        match keystroke.key.as_str() {
+            "up" => Key::ArrowUp,
+            "down" => Key::ArrowDown,
+            "left" => Key::ArrowLeft,
+            "right" => Key::ArrowRight,
+            "home" => Key::Home,
+            "end" => Key::End,
+            "insert" => Key::Insert,
+            "delete" => Key::Delete,
+            "pageup" => Key::PageUp,
+            "pagedown" => Key::PageDown,
+            "escape" => Key::Escape,
+            "enter" => Key::Enter,
+            "backspace" => Key::Backspace,
+            "tab" => Key::Tab,
+            "space" => Key::Space,
+            "f1" => Key::F1,
+            "f2" => Key::F2,
+            "f3" => Key::F3,
+            "f4" => Key::F4,
+            "f5" => Key::F5,
+            "f6" => Key::F6,
+            "f7" => Key::F7,
+            "f8" => Key::F8,
+            "f9" => Key::F9,
+            "f10" => Key::F10,
+            "f11" => Key::F11,
+            "f12" => Key::F12,
             _ if keystroke.key.len() == 1 => {
                 let c = keystroke.key.chars().next().unwrap_or('?');
-                match c {
-                    'a' => GhosttyKey::KeyA,
-                    'b' => GhosttyKey::KeyB,
-                    'c' => GhosttyKey::KeyC,
-                    'd' => GhosttyKey::KeyD,
-                    'e' => GhosttyKey::KeyE,
-                    'f' => GhosttyKey::KeyF,
-                    'g' => GhosttyKey::KeyG,
-                    'h' => GhosttyKey::KeyH,
-                    'i' => GhosttyKey::KeyI,
-                    'j' => GhosttyKey::KeyJ,
-                    'k' => GhosttyKey::KeyK,
-                    'l' => GhosttyKey::KeyL,
-                    'm' => GhosttyKey::KeyM,
-                    'n' => GhosttyKey::KeyN,
-                    'o' => GhosttyKey::KeyO,
-                    'p' => GhosttyKey::KeyP,
-                    'q' => GhosttyKey::KeyQ,
-                    'r' => GhosttyKey::KeyR,
-                    's' => GhosttyKey::KeyS,
-                    't' => GhosttyKey::KeyT,
-                    'u' => GhosttyKey::KeyU,
-                    'v' => GhosttyKey::KeyV,
-                    'w' => GhosttyKey::KeyW,
-                    'x' => GhosttyKey::KeyX,
-                    'y' => GhosttyKey::KeyY,
-                    'z' => GhosttyKey::KeyZ,
-                    '0' => GhosttyKey::Digit0,
-                    '1' => GhosttyKey::Digit1,
-                    '2' => GhosttyKey::Digit2,
-                    '3' => GhosttyKey::Digit3,
-                    '4' => GhosttyKey::Digit4,
-                    '5' => GhosttyKey::Digit5,
-                    '6' => GhosttyKey::Digit6,
-                    '7' => GhosttyKey::Digit7,
-                    '8' => GhosttyKey::Digit8,
-                    '9' => GhosttyKey::Digit9,
-                    ' ' => GhosttyKey::Space,
-                    '-' => GhosttyKey::Minus,
-                    '=' => GhosttyKey::Equal,
-                    '[' => GhosttyKey::BracketLeft,
-                    ']' => GhosttyKey::BracketRight,
-                    ';' => GhosttyKey::Semicolon,
-                    '\'' => GhosttyKey::Quote,
-                    ',' => GhosttyKey::Comma,
-                    '.' => GhosttyKey::Period,
-                    '/' => GhosttyKey::Slash,
-                    '\\' => GhosttyKey::Backslash,
-                    '`' => GhosttyKey::Backquote,
-                    _ => GhosttyKey::Unidentified,
+                match c.to_ascii_lowercase() {
+                    'a'..='z' => match c {
+                        'a' => Key::A,
+                        'b' => Key::B,
+                        'c' => Key::C,
+                        'd' => Key::D,
+                        'e' => Key::E,
+                        'f' => Key::F,
+                        'g' => Key::G,
+                        'h' => Key::H,
+                        'i' => Key::I,
+                        'j' => Key::J,
+                        'k' => Key::K,
+                        'l' => Key::L,
+                        'm' => Key::M,
+                        'n' => Key::N,
+                        'o' => Key::O,
+                        'p' => Key::P,
+                        'q' => Key::Q,
+                        'r' => Key::R,
+                        's' => Key::S,
+                        't' => Key::T,
+                        'u' => Key::U,
+                        'v' => Key::V,
+                        'w' => Key::W,
+                        'x' => Key::X,
+                        'y' => Key::Y,
+                        'z' => Key::Z,
+                        _ => Key::Unidentified,
+                    },
+                    '0'..='9' => Key::Digit0,
+                    '-' => Key::Minus,
+                    '=' => Key::Equal,
+                    '[' => Key::BracketLeft,
+                    ']' => Key::BracketRight,
+                    ';' => Key::Semicolon,
+                    '\'' => Key::Quote,
+                    ',' => Key::Comma,
+                    '.' => Key::Period,
+                    '/' => Key::Slash,
+                    '\\' => Key::Backslash,
+                    '`' => Key::Backquote,
+                    _ => Key::Unidentified,
                 }
             }
-            _ => GhosttyKey::Unidentified,
+            _ => Key::Unidentified,
         }
     }
 
-    /// Convert GPUI modifiers to GhosttyMods
-    fn convert_to_ghostty_mods(&self, keystroke: &gpui::Keystroke) -> GhosttyMods {
-        let mut mods = GhosttyMods::default();
-        let keystroke_mods = &keystroke.modifiers;
-
-        if keystroke_mods.shift {
-            mods = mods | GhosttyMods::SHIFT;
+    fn convert_to_ghostty_mods(&self, keystroke: &gpui::Keystroke) -> Mods {
+        let mut mods = Mods::empty();
+        if keystroke.modifiers.shift {
+            mods |= Mods::SHIFT;
         }
-        if keystroke_mods.alt {
-            mods = mods | GhosttyMods::ALT;
+        if keystroke.modifiers.alt {
+            mods |= Mods::ALT;
         }
-        if keystroke_mods.control {
-            mods = mods | GhosttyMods::CTRL;
+        if keystroke.modifiers.control {
+            mods |= Mods::CTRL;
         }
-        if keystroke_mods.platform {
-            mods = mods | GhosttyMods::SUPER;
+        if keystroke.modifiers.platform {
+            mods |= Mods::SUPER;
         }
-
         mods
     }
 
-    /// Handle mouse down events to focus
     fn handle_mouse_down(
         &mut self,
         _event: &MouseDownEvent,
@@ -730,200 +650,178 @@ impl TerminalWidget {
     ) {
         self.focus_handle.focus(window);
     }
-
-    /// Convert Color to GPUI Rgba
-    fn color_to_rgba(&self, color: &Color, is_background: bool) -> gpui::Rgba {
-        match color {
-            Color::Default => {
-                if is_background {
-                    self.theme.background
-                } else {
-                    self.theme.foreground
-                }
-            }
-            Color::Palette(idx) => self.theme.palette[*idx as usize % 16],
-            Color::Rgb(r, g, b) => {
-                gpui::rgba(((*r as u32) << 16) | ((*g as u32) << 8) | (*b as u32))
-            }
-        }
-    }
-
-    /// Calculate cell position in pixels
-    fn cell_position(&self, row: u16, col: u16) -> (Pixels, Pixels) {
-        let x = self.cell_size.0 * col as f32;
-        let y = self.cell_size.1 * row as f32;
-        (x, y)
-    }
-
-    /// Render a single cell
-    fn render_cell(&self, cell: &Cell, row: u16, col: u16) -> impl IntoElement {
-        let (x, y) = self.cell_position(row, col);
-        let fg = self.color_to_rgba(&cell.fg, false);
-        let has_custom_bg = !matches!(cell.bg, Color::Default);
-        let bg = if has_custom_bg {
-            Some(self.color_to_rgba(&cell.bg, true))
-        } else {
-            None
-        };
-
-        let font_family = "JetBrainsMono Nerd Font";
-        let font_weight = if cell.attrs.bold {
-            FontWeight::BOLD
-        } else {
-            FontWeight::NORMAL
-        };
-
-        div()
-            .absolute()
-            .left(x)
-            .top(y)
-            .w(self.cell_size.0)
-            .h(self.cell_size.1)
-            .when_some(bg, |this, bg| this.bg(bg))
-            .text_size(px(16.0))
-            .font_family(font_family)
-            .font_weight(font_weight)
-            .text_color(fg)
-            .when(cell.attrs.italic, |this| this.italic())
-            .when(cell.attrs.underline > 0, |this| this.underline())
-            .when(cell.attrs.strikethrough, |this| this.line_through())
-            .child(cell.char.to_string())
-    }
-
-    /// Build the cursor element
-    fn build_cursor_element(&self, is_focused: bool) -> gpui::AnyElement {
-        // Get cursor position from terminal
-        let (cursor_col, cursor_row) = self.terminal.cursor_pos();
-        let (x, y) = self.cell_position(cursor_row, cursor_col);
-
-        // Determine cursor visibility - show if focused and (blinking phase or blink disabled)
-        let cursor_visible = is_focused && (self.cursor_blink_phase || !self.config.cursor_blink);
-
-        if !cursor_visible {
-            return div().into_any_element();
-        }
-
-        let cursor_div = match self.config.cursor_style {
-            CursorStyle::Block => div()
-                .absolute()
-                .left(x)
-                .top(y)
-                .w(self.cell_size.0)
-                .h(self.cell_size.1)
-                .bg(self.theme.cursor),
-            CursorStyle::Line => {
-                let cursor_width = px(2.0);
-                let cursor_height = px(16.0);
-                let baseline_in_cell = px(13.5);
-                let cursor_top_in_cell = baseline_in_cell - (cursor_height / 2.0);
-                div()
-                    .absolute()
-                    .left(x + px(1.0))
-                    .top(y + cursor_top_in_cell)
-                    .w(cursor_width)
-                    .h(cursor_height)
-                    .bg(self.theme.cursor)
-            }
-            CursorStyle::Underline => div()
-                .absolute()
-                .left(x)
-                .top(y + self.cell_size.1 - px(2.0))
-                .w(self.cell_size.0)
-                .h(px(2.0))
-                .bg(self.theme.cursor),
-        };
-
-        cursor_div.into_any_element()
-    }
 }
 
 impl Render for TerminalWidget {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         window.request_animation_frame();
 
-        // Update cursor blink timing
         let now = Instant::now();
         if let Some(last_time) = self.last_frame_time {
             let elapsed = now.duration_since(last_time);
             let old_blink_phase = self.cursor_blink_phase;
             self.update_cursor_blink(elapsed);
-            // Only force re-render if blink state changed (for smooth cursor blink)
             if old_blink_phase != self.cursor_blink_phase {
-                cx.notify(); // Trigger re-render for cursor blink
+                cx.notify();
             }
         }
         self.last_frame_time = Some(now);
 
-        // Process any new output from shell
         self.process_output(cx);
 
-        // Calculate container bounds for resize
         let bounds = window.bounds();
         self.resize_to_bounds(&bounds, cx);
 
-        // Read screen buffer and clone cells for rendering
-        let (cursor_col, cursor_row) = self.terminal.cursor_pos();
-        let buffer = self.terminal.read_screen();
-        self.size = (buffer.cols, buffer.rows);
+        let snapshot = match self.render_state.update(&self.terminal) {
+            Ok(s) => s,
+            Err(_) => {
+                return div()
+                    .size_full()
+                    .bg(self.theme.background)
+                    .child("Failed to update render state")
+            }
+        };
 
-        // Exclude cursor cell from rendering if using block cursor
-        let exclude_cursor = self.config.cursor_style == CursorStyle::Block;
+        let colors = match snapshot.colors() {
+            Ok(c) => c,
+            Err(_) => return div().size_full().bg(self.theme.background),
+        };
 
-        let cells_to_render: Vec<(u16, u16, Cell)> = buffer
-            .cells
-            .iter()
-            .enumerate()
-            .flat_map(|(row_idx, row_cells)| {
-                row_cells
-                    .iter()
-                    .enumerate()
-                    .filter_map(move |(col_idx, cell)| {
-                        // Skip the cell under the cursor if using block cursor
-                        if exclude_cursor
-                            && row_idx as u16 == cursor_row
-                            && col_idx as u16 == cursor_col
-                        {
-                            return None;
-                        }
-
-                        let has_content = cell.char != '\0' && cell.char != ' ';
-                        let has_custom_bg = !matches!(cell.bg, Color::Default);
-                        if has_content || has_custom_bg {
-                            Some((row_idx as u16, col_idx as u16, *cell))
-                        } else {
-                            None
-                        }
-                    })
-            })
-            .collect();
-
-        // Build the terminal content
+        let cell_size = self.cell_size;
         let mut elements: Vec<gpui::AnyElement> = Vec::new();
-        for (row, col, cell) in cells_to_render {
-            elements.push(self.render_cell(&cell, row, col).into_any_element());
+
+        let mut row_it = match self.row_iterator.update(&snapshot) {
+            Ok(it) => it,
+            Err(_) => return div().size_full().bg(self.theme.background),
+        };
+
+        let mut row_idx: u16 = 0;
+        while let Some(row) = row_it.next() {
+            let mut cell_it = match self.cell_iterator.update(row) {
+                Ok(it) => it,
+                Err(_) => continue,
+            };
+
+            let mut col_idx: u16 = 0;
+            while let Some(cell) = cell_it.next() {
+                let graphemes_len = match cell.graphemes_len() {
+                    Ok(n) => n,
+                    Err(_) => continue,
+                };
+
+                if graphemes_len == 0 {
+                    col_idx += 1;
+                    continue;
+                }
+
+                let text: String = match cell.graphemes() {
+                    Ok(g) => g.into_iter().collect(),
+                    Err(_) => continue,
+                };
+
+                let fg = cell.fg_color().ok().flatten().unwrap_or(colors.foreground);
+                let bg = cell.bg_color().ok().flatten();
+                let style = match cell.style() {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+
+                let (fg_color, bg_color, has_bg) = if style.inverse {
+                    (fg, bg.unwrap_or(colors.background), true)
+                } else {
+                    (fg, bg.unwrap_or(colors.background), bg.is_some())
+                };
+
+                let (x, y) = cell_position(row_idx, col_idx, cell_size);
+                let fg_rgba = rgb_to_rgba(fg_color);
+                let font_family = "JetBrainsMono Nerd Font";
+                let font_weight = if style.bold {
+                    FontWeight::BOLD
+                } else {
+                    FontWeight::NORMAL
+                };
+
+                let cell_div = div()
+                    .absolute()
+                    .left(x)
+                    .top(y)
+                    .w(cell_size.0)
+                    .h(cell_size.1)
+                    .when(has_bg || style.inverse, |this| {
+                        this.bg(rgb_to_rgba(bg_color))
+                    })
+                    .text_size(px(16.0))
+                    .font_family(font_family)
+                    .font_weight(font_weight)
+                    .text_color(fg_rgba)
+                    .when(style.italic, |this| this.italic())
+                    .when(style.underline != Underline::None, |this| this.underline())
+                    .when(style.strikethrough, |this| this.line_through())
+                    .child(text);
+
+                elements.push(cell_div.into_any_element());
+                col_idx += 1;
+            }
+            let _ = row.set_dirty(false);
+            row_idx += 1;
         }
 
-        // Build cursor element
         let is_focused = self.focus_handle.is_focused(window);
-        let cursor_element = self.build_cursor_element(is_focused);
-        elements.push(cursor_element);
+        let cursor_visible = is_focused && (self.cursor_blink_phase || !self.config.cursor_blink);
+
+        if cursor_visible {
+            if let Ok(Some(cursor_pos)) = snapshot.cursor_viewport() {
+                let cursor_color = colors.cursor.unwrap_or(colors.foreground);
+                let (x, y) = cell_position(cursor_pos.y, cursor_pos.x, cell_size);
+                let cursor_rgba = rgb_to_rgba(cursor_color);
+
+                let cursor_div = match self.config.cursor_style {
+                    CursorStyle::Block => div()
+                        .absolute()
+                        .left(x)
+                        .top(y)
+                        .w(cell_size.0)
+                        .h(cell_size.1)
+                        .bg(cursor_rgba),
+                    CursorStyle::Line => {
+                        let (cw, ch) = (px(2.0), px(16.0));
+                        let baseline = px(13.5);
+                        div()
+                            .absolute()
+                            .left(x + px(1.0))
+                            .top(y + baseline - ch / 2.0)
+                            .w(cw)
+                            .h(ch)
+                            .bg(cursor_rgba)
+                    }
+                    CursorStyle::Underline => div()
+                        .absolute()
+                        .left(x)
+                        .top(y + cell_size.1 - px(2.0))
+                        .w(cell_size.0)
+                        .h(px(2.0))
+                        .bg(cursor_rgba),
+                };
+                elements.push(cursor_div.into_any_element());
+            }
+        }
 
         div()
             .size_full()
-            .bg(self.theme.background)
+            .bg(rgb_to_rgba(colors.background))
             .relative()
             .overflow_hidden()
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-                this.handle_key_down(event, window, cx);
+                this.handle_key_down(event, window, cx)
             }))
             .on_key_up(cx.listener(|this, event: &KeyUpEvent, window, cx| {
-                this.handle_key_up(event, window, cx);
+                this.handle_key_up(event, window, cx)
             }))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, event: &MouseDownEvent, window, cx| {
-                    this.handle_mouse_down(event, window, cx);
+                    this.handle_mouse_down(event, window, cx)
                 }),
             )
             .children(elements)
@@ -932,43 +830,12 @@ impl Render for TerminalWidget {
 
 impl Drop for TerminalWidget {
     fn drop(&mut self) {
-        // Signal shutdown and wake the I/O thread
         self.shutdown_flag.store(true, Ordering::Relaxed);
         self.wake_io_thread();
-
-        // Drop the senders to signal disconnection
         self.input_tx = None;
         self.resize_tx = None;
-
-        // Join the I/O thread
         if let Some(handle) = self.io_thread.take() {
             let _ = handle.join();
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_config_default() {
-        let config = TerminalConfig::default();
-        assert_eq!(config.shell, "pwsh.exe");
-        assert_eq!(config.initial_rows, 24);
-        assert_eq!(config.initial_cols, 80);
-        assert!(config.cursor_blink);
-    }
-
-    #[test]
-    fn test_theme_default() {
-        let theme = TerminalTheme::default();
-        assert_eq!(theme.palette.len(), 16);
-    }
-
-    #[test]
-    fn test_cursor_style_default() {
-        let style: CursorStyle = Default::default();
-        assert_eq!(style, CursorStyle::Block);
     }
 }
