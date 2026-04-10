@@ -8,7 +8,7 @@ use gpui::{
     div, prelude::*, px, Bounds, Context, FocusHandle, FontWeight, InteractiveElement, IntoElement,
     KeyDownEvent, KeyUpEvent, MouseButton, MouseDownEvent, Pixels, Render, Styled, Window,
 };
-use libghostty_vt::{
+use crate::ghostty::{
     key::{Action, Encoder, Event, Key, Mods},
     render::{CellIterator, RowIterator},
     style::{RgbColor, Underline},
@@ -444,7 +444,8 @@ impl TerminalWidget {
             .set_mods(ghostty_mods)
             .set_consumed_mods(consumed_mods)
             .set_unshifted_codepoint(unshifted_codepoint)
-            .set_utf8(printable_text.as_deref());
+            .set_utf8(printable_text.as_deref())
+            .set_composing(false);
 
         self.key_encoder.set_options_from_terminal(&self.terminal);
 
@@ -606,7 +607,16 @@ impl TerminalWidget {
                         'z' => Key::Z,
                         _ => Key::Unidentified,
                     },
-                    '0'..='9' => Key::Digit0,
+                    '0' => Key::Digit0,
+                    '1' => Key::Digit1,
+                    '2' => Key::Digit2,
+                    '3' => Key::Digit3,
+                    '4' => Key::Digit4,
+                    '5' => Key::Digit5,
+                    '6' => Key::Digit6,
+                    '7' => Key::Digit7,
+                    '8' => Key::Digit8,
+                    '9' => Key::Digit9,
                     '-' => Key::Minus,
                     '=' => Key::Equal,
                     '[' => Key::BracketLeft,

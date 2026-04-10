@@ -14,7 +14,6 @@ path = "src/main.rs"
 [dependencies]
 gpui = "0.2"
 gpui-component = "0.5"
-libghostty-vt = { path = "libghostty-rs/crates/libghostty-vt" }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [

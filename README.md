@@ -25,7 +25,7 @@ A GPU-powered terminal emulator built for productivity.
 cargo build --release
 ```
 
-The build script automatically clones and builds libghostty-vt from source.
+The build script builds and embeds `libghostty-vt` from the local `ghostty/` checkout.
 
 ## Run
 
