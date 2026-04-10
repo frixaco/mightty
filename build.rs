@@ -70,13 +70,20 @@ fn copy_windows_dll(bin_dir: &Path, out_dir: &Path) {
         .and_then(Path::parent)
         .and_then(Path::parent)
         .expect("failed to determine target output directory");
-    let dll_dst = target_dir.join("ghostty-vt.dll");
+    copy_dll(&dll_src, &target_dir.join("ghostty-vt.dll"));
 
-    fs::copy(&dll_src, &dll_dst).unwrap_or_else(|err| {
+    let deps_dir = target_dir.join("deps");
+    if deps_dir.exists() {
+        copy_dll(&dll_src, &deps_dir.join("ghostty-vt.dll"));
+    }
+}
+
+fn copy_dll(src: &Path, dst: &Path) {
+    fs::copy(src, dst).unwrap_or_else(|err| {
         panic!(
             "failed to copy {} to {}: {}",
-            dll_src.display(),
-            dll_dst.display(),
+            src.display(),
+            dst.display(),
             err
         )
     });

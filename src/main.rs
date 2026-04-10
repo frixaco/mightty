@@ -1,7 +1,9 @@
 use gpui::{prelude::*, px, size, App, Application, Bounds, WindowBounds, WindowOptions};
 use gpui_component::Root;
+use std::borrow::Cow;
 
 mod ghostty;
+mod feedback;
 mod widget;
 mod pane;
 mod split;
@@ -14,8 +16,34 @@ use std::time::Duration;
 use widget::TerminalConfig;
 use pane_container::PaneContainer;
 
+fn load_embedded_fonts(cx: &mut App) {
+    let fonts = vec![
+        Cow::Borrowed(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/JetBrainsMono/JetBrainsMonoNerdFontMono-Regular.ttf"
+        )) as &'static [u8]),
+        Cow::Borrowed(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/JetBrainsMono/JetBrainsMonoNerdFontMono-Bold.ttf"
+        )) as &'static [u8]),
+        Cow::Borrowed(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/JetBrainsMono/JetBrainsMonoNerdFontMono-Italic.ttf"
+        )) as &'static [u8]),
+        Cow::Borrowed(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/JetBrainsMono/JetBrainsMonoNerdFontMono-BoldItalic.ttf"
+        )) as &'static [u8]),
+    ];
+
+    cx.text_system()
+        .add_fonts(fonts)
+        .expect("failed to load embedded JetBrainsMono Nerd Font Mono fonts");
+}
+
 fn main() {
     Application::new().run(|cx: &mut App| {
+        load_embedded_fonts(cx);
         gpui_component::init(cx);
 
         PaneContainer::bind_keys(cx);

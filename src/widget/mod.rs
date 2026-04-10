@@ -5,12 +5,18 @@
 //! terminal widget.
 
 use gpui::{
-    div, prelude::*, px, Bounds, Context, FocusHandle, FontWeight, InteractiveElement, IntoElement,
-    KeyDownEvent, KeyUpEvent, MouseButton, MouseDownEvent, Pixels, Render, Styled, Window,
+    div, prelude::*, px, Bounds, Context, FocusHandle, FontStyle, FontWeight,
+    InteractiveElement, IntoElement, KeyDownEvent, KeyUpEvent, MouseButton, MouseDownEvent,
+    Pixels, Render, StrikethroughStyle, Styled, StyledText, TextRun, TextStyle, UnderlineStyle,
+    WhiteSpace, Window,
+};
+use crate::feedback::{
+    self, CaptureCell, CaptureColors, CaptureCursor, CaptureRow, FontCapture, GridSize, RgbHex,
+    SizePx, TerminalCapture,
 };
 use crate::ghostty::{
     key::{Action, Encoder, Event, Key, Mods},
-    render::{CellIterator, RowIterator},
+    render::{CellIterator, CellWidth, RowIterator},
     style::{RgbColor, Underline},
     RenderState, Terminal, TerminalOptions,
 };
@@ -62,6 +68,10 @@ impl Default for TerminalConfig {
 
 type OutputData = Vec<u8>;
 type IoWakeSignal = Arc<(Mutex<bool>, Condvar)>;
+
+const TERMINAL_FONT_FAMILY: &str = "JetBrainsMono Nerd Font Mono";
+const TERMINAL_FONT_SIZE_PX: f32 = 16.0;
+const FEEDBACK_CAPTURE_KEY: &str = "f12";
 
 pub struct TerminalWidget {
     terminal: Terminal<'static, 'static>,
@@ -128,6 +138,244 @@ impl Default for TerminalTheme {
 
 fn rgb_to_rgba(rgb: RgbColor) -> gpui::Rgba {
     gpui::rgba((rgb.r as u32) << 16 | (rgb.g as u32) << 8 | rgb.b as u32)
+}
+
+fn rgb_hex(rgb: RgbColor) -> RgbHex {
+    RgbHex::new(rgb.r, rgb.g, rgb.b)
+}
+
+fn underline_name(underline: Underline) -> &'static str {
+    match underline {
+        Underline::None => "none",
+        Underline::Single => "single",
+        Underline::Double => "double",
+        Underline::Curly => "curly",
+        Underline::Dotted => "dotted",
+        Underline::Dashed => "dashed",
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct RowTextStyle {
+    fg: RgbColor,
+    bg: Option<RgbColor>,
+    default_bg: RgbColor,
+    bold: bool,
+    italic: bool,
+    underline: Underline,
+    strikethrough: bool,
+}
+
+struct RowSegment {
+    start_col: u16,
+    columns: u16,
+    text: String,
+    style: RowTextStyle,
+}
+
+impl RowSegment {
+    fn new(start_col: u16, columns: u16, text: String, style: RowTextStyle) -> Self {
+        Self {
+            start_col,
+            columns,
+            text,
+            style,
+        }
+    }
+}
+
+fn mix_rgb(a: RgbColor, b: RgbColor, ratio: f32) -> RgbColor {
+    let t = ratio.clamp(0.0, 1.0);
+    let blend = |lhs: u8, rhs: u8| -> u8 {
+        ((lhs as f32 * (1.0 - t)) + (rhs as f32 * t))
+            .round()
+            .clamp(0.0, 255.0) as u8
+    };
+
+    RgbColor {
+        r: blend(a.r, b.r),
+        g: blend(a.g, b.g),
+        b: blend(a.b, b.b),
+    }
+}
+
+fn rgb_to_hsv(rgb: RgbColor) -> (f32, f32, f32) {
+    let r = rgb.r as f32 / 255.0;
+    let g = rgb.g as f32 / 255.0;
+    let b = rgb.b as f32 / 255.0;
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let delta = max - min;
+
+    let hue = if delta == 0.0 {
+        0.0
+    } else if max == r {
+        60.0 * (((g - b) / delta).rem_euclid(6.0))
+    } else if max == g {
+        60.0 * (((b - r) / delta) + 2.0)
+    } else {
+        60.0 * (((r - g) / delta) + 4.0)
+    };
+
+    let saturation = if max == 0.0 { 0.0 } else { delta / max };
+    (hue, saturation, max)
+}
+
+fn bold_display_palette_color(rgb: RgbColor, base_bg: RgbColor) -> RgbColor {
+    let (hue, saturation, value) = rgb_to_hsv(rgb);
+
+    if saturation < 0.16 || value < 0.2 {
+        return if relative_luminance(base_bg) < 0.35 {
+            RgbColor {
+                r: 230,
+                g: 237,
+                b: 243,
+            }
+        } else {
+            RgbColor {
+                r: 30,
+                g: 41,
+                b: 59,
+            }
+        };
+    }
+
+    match hue {
+        h if !(15.0..345.0).contains(&h) => RgbColor { r: 255, g: 123, b: 114 },
+        h if h < 45.0 => RgbColor { r: 255, g: 184, b: 108 },
+        h if h < 70.0 => RgbColor { r: 229, g: 192, b: 123 },
+        h if h < 150.0 => RgbColor { r: 152, g: 195, b: 121 },
+        h if h < 210.0 => RgbColor { r: 86, g: 212, b: 221 },
+        h if h < 270.0 => RgbColor { r: 97, g: 175, b: 239 },
+        _ => RgbColor { r: 198, g: 120, b: 221 },
+    }
+}
+
+fn relative_luminance(rgb: RgbColor) -> f32 {
+    fn channel(value: u8) -> f32 {
+        let normalized = value as f32 / 255.0;
+        if normalized <= 0.03928 {
+            normalized / 12.92
+        } else {
+            ((normalized + 0.055) / 1.055).powf(2.4)
+        }
+    }
+
+    0.2126 * channel(rgb.r) + 0.7152 * channel(rgb.g) + 0.0722 * channel(rgb.b)
+}
+
+fn contrast_ratio(a: RgbColor, b: RgbColor) -> f32 {
+    let a_lum = relative_luminance(a);
+    let b_lum = relative_luminance(b);
+    let lighter = a_lum.max(b_lum);
+    let darker = a_lum.min(b_lum);
+    (lighter + 0.05) / (darker + 0.05)
+}
+
+fn emphasized_bold_colors(style: RowTextStyle) -> (RgbColor, Option<RgbColor>) {
+    let base_bg = style.bg.unwrap_or(style.default_bg);
+    let mut fg = bold_display_palette_color(style.fg, base_bg);
+    let target = if relative_luminance(base_bg) < 0.35 {
+        RgbColor {
+            r: 255,
+            g: 255,
+            b: 255,
+        }
+    } else {
+        RgbColor { r: 0, g: 0, b: 0 }
+    };
+
+    if contrast_ratio(fg, base_bg) < 7.0 {
+        for ratio in [0.55_f32, 0.7, 0.82, 0.9] {
+            let candidate = mix_rgb(fg, target, ratio);
+            fg = candidate;
+            if contrast_ratio(fg, base_bg) >= 7.0 {
+                break;
+            }
+        }
+    }
+
+    (fg, style.bg)
+}
+
+fn resolved_render_style(style: RowTextStyle) -> (RgbColor, Option<RgbColor>, FontWeight) {
+    if style.bold {
+        let (fg, bg) = emphasized_bold_colors(style);
+        (fg, bg, FontWeight::EXTRA_BOLD)
+    } else {
+        (style.fg, style.bg, FontWeight::NORMAL)
+    }
+}
+
+fn text_run_for_style(base_style: &TextStyle, style: RowTextStyle, len: usize) -> TextRun {
+    let mut run_style = base_style.clone();
+    let (fg, _bg, font_weight) = resolved_render_style(style);
+    run_style.color = rgb_to_rgba(fg).into();
+    run_style.background_color = None;
+    run_style.font_weight = font_weight;
+    run_style.font_style = if style.italic {
+        FontStyle::Italic
+    } else {
+        FontStyle::Normal
+    };
+    run_style.underline = match style.underline {
+        Underline::None => None,
+        Underline::Curly => Some(UnderlineStyle {
+            thickness: px(1.0),
+            color: Some(rgb_to_rgba(fg).into()),
+            wavy: true,
+        }),
+        _ => Some(UnderlineStyle {
+            thickness: px(1.0),
+            color: Some(rgb_to_rgba(fg).into()),
+            wavy: false,
+        }),
+    };
+    run_style.strikethrough = style.strikethrough.then_some(StrikethroughStyle {
+        thickness: px(1.0),
+        color: Some(rgb_to_rgba(fg).into()),
+    });
+    run_style.to_run(len)
+}
+
+fn segment_needs_own_layout(segment: &str, columns: u16) -> bool {
+    columns != 1 || !segment.is_ascii()
+}
+
+fn push_row_segment(
+    segments: &mut Vec<RowSegment>,
+    pending: &mut Option<RowSegment>,
+    start_col: u16,
+    columns: u16,
+    style: RowTextStyle,
+    text: String,
+) {
+    if text.is_empty() {
+        return;
+    }
+
+    let isolate = segment_needs_own_layout(&text, columns);
+    if isolate {
+        if let Some(segment) = pending.take() {
+            segments.push(segment);
+        }
+        segments.push(RowSegment::new(start_col, columns, text, style));
+        return;
+    }
+
+    if let Some(segment) = pending.as_mut()
+        && segment.style == style
+        && segment.start_col + segment.columns == start_col
+    {
+        segment.columns += columns;
+        segment.text.push_str(&text);
+        return;
+    }
+
+    if let Some(segment) = pending.take() {
+        segments.push(segment);
+    }
+    *pending = Some(RowSegment::new(start_col, columns, text, style));
 }
 
 fn cell_position(row: u16, col: u16, cell_size: (Pixels, Pixels)) -> (Pixels, Pixels) {
@@ -389,9 +637,14 @@ impl TerminalWidget {
     fn handle_key_down(
         &mut self,
         event: &KeyDownEvent,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.is_feedback_capture_shortcut(event) {
+            self.capture_feedback(window, cx);
+            return;
+        }
+
         let action = if event.is_held {
             Action::Repeat
         } else {
@@ -458,6 +711,122 @@ impl TerminalWidget {
         } else {
             Some(response)
         }
+    }
+
+    fn is_feedback_capture_shortcut(&self, event: &KeyDownEvent) -> bool {
+        let modifiers = &event.keystroke.modifiers;
+        modifiers.control
+            && modifiers.shift
+            && event.keystroke.key.eq_ignore_ascii_case(FEEDBACK_CAPTURE_KEY)
+    }
+
+    fn capture_feedback(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.process_output(cx);
+
+        let capture = match self.build_feedback_capture() {
+            Ok(capture) => capture,
+            Err(err) => {
+                eprintln!("Feedback capture failed while snapshotting terminal state: {err:?}");
+                return;
+            }
+        };
+
+        match feedback::write_capture(&capture, window) {
+            Ok(paths) => {
+                if let Some(png_path) = &paths.png_path {
+                    eprintln!(
+                        "Feedback capture saved to {} (json: {}, png: {})",
+                        paths.directory.display(),
+                        paths.json_path.display(),
+                        png_path.display()
+                    );
+                } else if let Some(err) = &paths.pixel_capture_error {
+                    eprintln!(
+                        "Feedback capture saved JSON to {} but pixel capture failed: {}",
+                        paths.json_path.display(),
+                        err
+                    );
+                } else {
+                    eprintln!("Feedback capture saved to {}", paths.json_path.display());
+                }
+            }
+            Err(err) => eprintln!("Feedback capture write failed: {err}"),
+        }
+    }
+
+    fn build_feedback_capture(&mut self) -> crate::ghostty::Result<TerminalCapture> {
+        let snapshot = self.render_state.update(&self.terminal)?;
+        let colors = snapshot.colors()?;
+
+        let mut rows = Vec::new();
+        let mut row_it = self.row_iterator.update(&snapshot)?;
+        let mut row_idx = 0u16;
+        while let Some(row) = row_it.next() {
+            let mut row_text = String::new();
+            let mut cells = Vec::new();
+            let mut cell_it = self.cell_iterator.update(row)?;
+            let mut col_idx = 0u16;
+            while let Some(cell) = cell_it.next() {
+                let width = cell.width()?;
+                let advance = width.column_advance();
+                let graphemes_len = cell.graphemes_len()?;
+                if graphemes_len == 0 || matches!(width, CellWidth::SpacerTail | CellWidth::SpacerHead) {
+                    col_idx += advance;
+                    continue;
+                }
+
+                let text: String = cell.graphemes()?.into_iter().collect();
+                row_text.push_str(&text);
+
+                let fg = cell.fg_color()?.unwrap_or(colors.foreground);
+                let bg = cell.bg_color()?;
+                let style = cell.style()?;
+                cells.push(CaptureCell {
+                    col: col_idx,
+                    text,
+                    fg: rgb_hex(fg),
+                    bg: bg.map(rgb_hex),
+                    bold: style.bold,
+                    italic: style.italic,
+                    underline: underline_name(style.underline).to_string(),
+                    inverse: style.inverse,
+                    strikethrough: style.strikethrough,
+                });
+                col_idx += advance;
+            }
+
+            rows.push(CaptureRow {
+                index: row_idx,
+                text: row_text,
+                cells,
+            });
+            row_idx += 1;
+        }
+
+        Ok(TerminalCapture {
+            captured_unix_ms: feedback::unix_timestamp_ms(),
+            terminal_size: GridSize {
+                cols: self.size.0,
+                rows: self.size.1,
+            },
+            cell_size_px: SizePx {
+                width: self.cell_size.0.into(),
+                height: self.cell_size.1.into(),
+            },
+            font: FontCapture {
+                family: TERMINAL_FONT_FAMILY.to_string(),
+                size_px: TERMINAL_FONT_SIZE_PX,
+            },
+            colors: CaptureColors {
+                foreground: rgb_hex(colors.foreground),
+                background: rgb_hex(colors.background),
+                cursor: colors.cursor.map(rgb_hex),
+            },
+            cursor: snapshot
+                .cursor_viewport()?
+                .map(|cursor| CaptureCursor { x: cursor.x, y: cursor.y }),
+            rows,
+        })
     }
 
     fn printable_text<'a>(
@@ -699,6 +1068,11 @@ impl Render for TerminalWidget {
 
         let cell_size = self.cell_size;
         let mut elements: Vec<gpui::AnyElement> = Vec::new();
+        let mut base_text_style = window.text_style();
+        base_text_style.font_family = TERMINAL_FONT_FAMILY.into();
+        base_text_style.font_size = px(TERMINAL_FONT_SIZE_PX).into();
+        base_text_style.line_height = cell_size.1.into();
+        base_text_style.white_space = WhiteSpace::Nowrap;
 
         let mut row_it = match self.row_iterator.update(&snapshot) {
             Ok(it) => it,
@@ -712,28 +1086,69 @@ impl Render for TerminalWidget {
                 Err(_) => continue,
             };
 
-            let mut col_idx: u16 = 0;
+            let mut row_segments = Vec::new();
+            let mut pending_segment = None;
+            let mut col_idx = 0u16;
             while let Some(cell) = cell_it.next() {
+                let width = match cell.width() {
+                    Ok(width) => width,
+                    Err(_) => continue,
+                };
+                let advance = width.column_advance();
+                let start_col = col_idx;
+                col_idx += advance;
                 let graphemes_len = match cell.graphemes_len() {
                     Ok(n) => n,
-                    Err(_) => continue,
+                    Err(_) => {
+                        if advance > 0 {
+                            push_row_segment(
+                                &mut row_segments,
+                                &mut pending_segment,
+                                start_col,
+                                advance,
+                                RowTextStyle {
+                                    fg: colors.foreground,
+                                    bg: None,
+                                    default_bg: colors.background,
+                                    bold: false,
+                                    italic: false,
+                                    underline: Underline::None,
+                                    strikethrough: false,
+                                },
+                                " ".repeat(advance as usize),
+                            );
+                        }
+                        continue;
+                    }
                 };
 
-                if graphemes_len == 0 {
-                    col_idx += 1;
+                if matches!(width, CellWidth::SpacerTail | CellWidth::SpacerHead) {
                     continue;
                 }
-
-                let text: String = match cell.graphemes() {
-                    Ok(g) => g.into_iter().collect(),
-                    Err(_) => continue,
-                };
 
                 let fg = cell.fg_color().ok().flatten().unwrap_or(colors.foreground);
                 let bg = cell.bg_color().ok().flatten();
                 let style = match cell.style() {
                     Ok(s) => s,
-                    Err(_) => continue,
+                    Err(_) => {
+                        push_row_segment(
+                            &mut row_segments,
+                            &mut pending_segment,
+                            start_col,
+                            advance.max(1),
+                            RowTextStyle {
+                                fg,
+                                bg,
+                                default_bg: colors.background,
+                                bold: false,
+                                italic: false,
+                                underline: Underline::None,
+                                strikethrough: false,
+                            },
+                            " ".repeat(advance.max(1) as usize),
+                        );
+                        continue;
+                    }
                 };
 
                 let (fg_color, bg_color, has_bg) = if style.inverse {
@@ -742,35 +1157,59 @@ impl Render for TerminalWidget {
                     (fg, bg.unwrap_or(colors.background), bg.is_some())
                 };
 
-                let (x, y) = cell_position(row_idx, col_idx, cell_size);
-                let fg_rgba = rgb_to_rgba(fg_color);
-                let font_family = "JetBrainsMono Nerd Font";
-                let font_weight = if style.bold {
-                    FontWeight::BOLD
+                let segment = if graphemes_len == 0 {
+                    " ".repeat(advance.max(1) as usize)
                 } else {
-                    FontWeight::NORMAL
+                    match cell.graphemes() {
+                        Ok(g) => g.into_iter().collect(),
+                        Err(_) => " ".repeat(advance.max(1) as usize),
+                    }
                 };
+                push_row_segment(
+                    &mut row_segments,
+                    &mut pending_segment,
+                    start_col,
+                    advance.max(1),
+                    RowTextStyle {
+                        fg: fg_color,
+                        bg: (has_bg || style.inverse).then_some(bg_color),
+                        default_bg: colors.background,
+                        bold: style.bold,
+                        italic: style.italic,
+                        underline: style.underline,
+                        strikethrough: style.strikethrough,
+                    },
+                    segment,
+                );
+            }
 
-                let cell_div = div()
+            if let Some(segment) = pending_segment.take() {
+                row_segments.push(segment);
+            }
+
+            for segment in row_segments {
+                let (x, y) = cell_position(row_idx, segment.start_col, cell_size);
+                let segment_width = cell_size.0 * segment.columns as f32;
+                let segment_len = segment.text.len();
+                let (_, segment_bg, _) = resolved_render_style(segment.style);
+                let segment_div = div()
                     .absolute()
                     .left(x)
                     .top(y)
-                    .w(cell_size.0)
+                    .w(segment_width)
                     .h(cell_size.1)
-                    .when(has_bg || style.inverse, |this| {
-                        this.bg(rgb_to_rgba(bg_color))
-                    })
-                    .text_size(px(16.0))
-                    .font_family(font_family)
-                    .font_weight(font_weight)
-                    .text_color(fg_rgba)
-                    .when(style.italic, |this| this.italic())
-                    .when(style.underline != Underline::None, |this| this.underline())
-                    .when(style.strikethrough, |this| this.line_through())
-                    .child(text);
-
-                elements.push(cell_div.into_any_element());
-                col_idx += 1;
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_size(px(TERMINAL_FONT_SIZE_PX))
+                    .font_family(TERMINAL_FONT_FAMILY)
+                    .line_height(cell_size.1)
+                    .when_some(segment_bg, |div, bg| div.bg(rgb_to_rgba(bg)))
+                    .child(StyledText::new(segment.text).with_runs(vec![text_run_for_style(
+                        &base_text_style,
+                        segment.style,
+                        segment_len,
+                    )]));
+                elements.push(segment_div.into_any_element());
             }
             let _ = row.set_dirty(false);
             row_idx += 1;
@@ -847,5 +1286,97 @@ impl Drop for TerminalWidget {
         if let Some(handle) = self.io_thread.take() {
             let _ = handle.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bold_style_survives_box_emoji_prompt_segment() {
+        let mut terminal = Terminal::new(TerminalOptions {
+            cols: 32,
+            rows: 4,
+            max_scrollback: 100,
+        })
+        .expect("terminal");
+        terminal.resize(32, 4, 10, 20).expect("resize");
+        terminal.vt_write("📦 \u{1b}[1mrepo\u{1b}[0m".as_bytes());
+
+        let mut render_state = RenderState::new().expect("render state");
+        let snapshot = render_state.update(&terminal).expect("snapshot");
+        let mut row_iterator = RowIterator::new().expect("row iterator");
+        let mut cell_iterator = CellIterator::new().expect("cell iterator");
+
+        let mut rows = row_iterator.update(&snapshot).expect("rows");
+        let row = rows.next().expect("first row");
+        let mut cells = cell_iterator.update(row).expect("cells");
+
+        let mut letters = Vec::new();
+        while let Some(cell) = cells.next() {
+            let text: String = cell.graphemes().expect("graphemes").into_iter().collect();
+            if text.is_empty() {
+                continue;
+            }
+
+            if matches!(text.as_str(), "r" | "e" | "p" | "o") {
+                letters.push((text, cell.style().expect("style").bold));
+            }
+        }
+
+        assert_eq!(
+            letters,
+            vec![
+                ("r".to_string(), true),
+                ("e".to_string(), true),
+                ("p".to_string(), true),
+                ("o".to_string(), true),
+            ]
+        );
+    }
+
+    #[test]
+    fn box_emoji_advances_two_columns() {
+        let mut terminal = Terminal::new(TerminalOptions {
+            cols: 32,
+            rows: 4,
+            max_scrollback: 100,
+        })
+        .expect("terminal");
+        terminal.resize(32, 4, 10, 20).expect("resize");
+        terminal.vt_write("x📦y".as_bytes());
+
+        let mut render_state = RenderState::new().expect("render state");
+        let snapshot = render_state.update(&terminal).expect("snapshot");
+        let mut row_iterator = RowIterator::new().expect("row iterator");
+        let mut cell_iterator = CellIterator::new().expect("cell iterator");
+
+        let mut rows = row_iterator.update(&snapshot).expect("rows");
+        let row = rows.next().expect("first row");
+        let mut cells = cell_iterator.update(row).expect("cells");
+
+        let mut positions = Vec::new();
+        let mut col_idx = 0u16;
+        while let Some(cell) = cells.next() {
+            let width = cell.width().expect("width");
+            let advance = width.column_advance();
+            let text: String = cell.graphemes().expect("graphemes").into_iter().collect();
+
+            if !text.is_empty() && !matches!(width, CellWidth::SpacerTail | CellWidth::SpacerHead) {
+                positions.push((text, col_idx, width));
+            }
+
+            col_idx += advance;
+        }
+
+        assert_eq!(
+            positions,
+            vec![
+                ("x".to_string(), 0, CellWidth::Narrow),
+                ("📦".to_string(), 1, CellWidth::Wide),
+                ("y".to_string(), 3, CellWidth::Narrow),
+            ]
+        );
     }
 }
