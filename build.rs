@@ -28,7 +28,7 @@ fn main() {
     }
     fs::create_dir_all(&install_dir).expect("failed to create ghostty install dir");
 
-    let zig = zig_command(&ghostty_src);
+    let zig = zig_command(&manifest_dir);
     validate_zig_version(&zig);
     let status = Command::new(&zig)
         .args([

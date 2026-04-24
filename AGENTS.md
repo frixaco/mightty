@@ -39,7 +39,7 @@ Important non-source paths:
 
 ## Build System
 
-`build.rs` expects a local Ghostty checkout at `ghostty/`; it does not clone Ghostty.
+`build.rs` expects the Ghostty submodule checkout at `ghostty/`.
 
 The build script:
 1. Validates Zig `0.15.2`.

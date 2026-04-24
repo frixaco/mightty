@@ -24,7 +24,7 @@ It is currently Windows-first. Unix shell support is represented by a placeholde
 
 - Rust with edition 2024 support.
 - Zig `0.15.2`.
-- A local Ghostty checkout at `ghostty/`.
+- The Ghostty submodule initialized at `ghostty/`.
 - Windows for the runnable shell bridge.
 
 This repo includes a `.mise.toml` pin for Zig:
