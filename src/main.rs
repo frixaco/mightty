@@ -20,19 +20,19 @@ fn load_embedded_fonts(cx: &mut App) {
     let fonts = vec![
         Cow::Borrowed(include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/JetBrainsMono/JetBrainsMonoNerdFontMono-Regular.ttf"
+            "/fonts/JetBrainsMono/JetBrainsMonoNerdFontMono-Regular.ttf"
         )) as &'static [u8]),
         Cow::Borrowed(include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/JetBrainsMono/JetBrainsMonoNerdFontMono-Bold.ttf"
+            "/fonts/JetBrainsMono/JetBrainsMonoNerdFontMono-Bold.ttf"
         )) as &'static [u8]),
         Cow::Borrowed(include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/JetBrainsMono/JetBrainsMonoNerdFontMono-Italic.ttf"
+            "/fonts/JetBrainsMono/JetBrainsMonoNerdFontMono-Italic.ttf"
         )) as &'static [u8]),
         Cow::Borrowed(include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/JetBrainsMono/JetBrainsMonoNerdFontMono-BoldItalic.ttf"
+            "/fonts/JetBrainsMono/JetBrainsMonoNerdFontMono-BoldItalic.ttf"
         )) as &'static [u8]),
     ];
 

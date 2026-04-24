@@ -4,26 +4,26 @@
 //! Combines ConPtyShell, libghostty Terminal, and key encoding into a complete
 //! terminal widget.
 
-use gpui::{
-    div, prelude::*, px, Bounds, Context, FocusHandle, FontStyle, FontWeight,
-    InteractiveElement, IntoElement, KeyDownEvent, KeyUpEvent, MouseButton, MouseDownEvent,
-    Pixels, Render, StrikethroughStyle, Styled, StyledText, TextRun, TextStyle, UnderlineStyle,
-    WhiteSpace, Window,
-};
 use crate::feedback::{
     self, CaptureCell, CaptureColors, CaptureCursor, CaptureRow, FontCapture, GridSize, RgbHex,
     SizePx, TerminalCapture,
 };
 use crate::ghostty::{
+    RenderState, Terminal, TerminalOptions,
     key::{Action, Encoder, Event, Key, Mods},
     render::{CellIterator, CellWidth, RowIterator},
     style::{RgbColor, Underline},
-    RenderState, Terminal, TerminalOptions,
+};
+use gpui::{
+    Bounds, Context, FocusHandle, FontFallbacks, FontFeatures, FontStyle, FontWeight,
+    InteractiveElement, IntoElement, KeyDownEvent, KeyUpEvent, MouseButton, MouseDownEvent, Pixels,
+    Render, StrikethroughStyle, Styled, StyledText, TextRun, TextStyle, UnderlineStyle, WhiteSpace,
+    Window, div, prelude::*, px,
 };
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    mpsc::{channel, Receiver, Sender},
     Arc, Condvar, Mutex,
+    atomic::{AtomicBool, Ordering},
+    mpsc::{Receiver, Sender, channel},
 };
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -72,6 +72,36 @@ type IoWakeSignal = Arc<(Mutex<bool>, Condvar)>;
 const TERMINAL_FONT_FAMILY: &str = "JetBrainsMono Nerd Font Mono";
 const TERMINAL_FONT_SIZE_PX: f32 = 16.0;
 const FEEDBACK_CAPTURE_KEY: &str = "f12";
+
+fn terminal_font_features() -> FontFeatures {
+    FontFeatures(Arc::new(vec![
+        ("calt".to_string(), 0),
+        ("liga".to_string(), 0),
+        ("kern".to_string(), 0),
+    ]))
+}
+
+fn terminal_font_fallbacks() -> FontFallbacks {
+    FontFallbacks::from_fonts(vec![
+        TERMINAL_FONT_FAMILY.to_string(),
+        "Consolas".to_string(),
+        "Cascadia Mono".to_string(),
+        "DejaVu Sans Mono".to_string(),
+        "Noto Sans Mono".to_string(),
+        "JetBrains Mono".to_string(),
+        "Fira Mono".to_string(),
+        "Sarasa Mono SC".to_string(),
+        "Sarasa Term SC".to_string(),
+        "Sarasa Mono J".to_string(),
+        "Noto Sans Mono CJK SC".to_string(),
+        "Noto Sans Mono CJK JP".to_string(),
+        "Source Han Mono SC".to_string(),
+        "WenQuanYi Zen Hei Mono".to_string(),
+        "Apple Color Emoji".to_string(),
+        "Noto Color Emoji".to_string(),
+        "Segoe UI Emoji".to_string(),
+    ])
+}
 
 pub struct TerminalWidget {
     terminal: Terminal<'static, 'static>,
@@ -241,13 +271,41 @@ fn bold_display_palette_color(rgb: RgbColor, base_bg: RgbColor) -> RgbColor {
     }
 
     match hue {
-        h if !(15.0..345.0).contains(&h) => RgbColor { r: 255, g: 123, b: 114 },
-        h if h < 45.0 => RgbColor { r: 255, g: 184, b: 108 },
-        h if h < 70.0 => RgbColor { r: 229, g: 192, b: 123 },
-        h if h < 150.0 => RgbColor { r: 152, g: 195, b: 121 },
-        h if h < 210.0 => RgbColor { r: 86, g: 212, b: 221 },
-        h if h < 270.0 => RgbColor { r: 97, g: 175, b: 239 },
-        _ => RgbColor { r: 198, g: 120, b: 221 },
+        h if !(15.0..345.0).contains(&h) => RgbColor {
+            r: 255,
+            g: 123,
+            b: 114,
+        },
+        h if h < 45.0 => RgbColor {
+            r: 255,
+            g: 184,
+            b: 108,
+        },
+        h if h < 70.0 => RgbColor {
+            r: 229,
+            g: 192,
+            b: 123,
+        },
+        h if h < 150.0 => RgbColor {
+            r: 152,
+            g: 195,
+            b: 121,
+        },
+        h if h < 210.0 => RgbColor {
+            r: 86,
+            g: 212,
+            b: 221,
+        },
+        h if h < 270.0 => RgbColor {
+            r: 97,
+            g: 175,
+            b: 239,
+        },
+        _ => RgbColor {
+            r: 198,
+            g: 120,
+            b: 221,
+        },
     }
 }
 
@@ -301,7 +359,7 @@ fn emphasized_bold_colors(style: RowTextStyle) -> (RgbColor, Option<RgbColor>) {
 fn resolved_render_style(style: RowTextStyle) -> (RgbColor, Option<RgbColor>, FontWeight) {
     if style.bold {
         let (fg, bg) = emphasized_bold_colors(style);
-        (fg, bg, FontWeight::EXTRA_BOLD)
+        (fg, bg, FontWeight::BOLD)
     } else {
         (style.fg, style.bg, FontWeight::NORMAL)
     }
@@ -717,7 +775,10 @@ impl TerminalWidget {
         let modifiers = &event.keystroke.modifiers;
         modifiers.control
             && modifiers.shift
-            && event.keystroke.key.eq_ignore_ascii_case(FEEDBACK_CAPTURE_KEY)
+            && event
+                .keystroke
+                .key
+                .eq_ignore_ascii_case(FEEDBACK_CAPTURE_KEY)
     }
 
     fn capture_feedback(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -770,7 +831,9 @@ impl TerminalWidget {
                 let width = cell.width()?;
                 let advance = width.column_advance();
                 let graphemes_len = cell.graphemes_len()?;
-                if graphemes_len == 0 || matches!(width, CellWidth::SpacerTail | CellWidth::SpacerHead) {
+                if graphemes_len == 0
+                    || matches!(width, CellWidth::SpacerTail | CellWidth::SpacerHead)
+                {
                     col_idx += advance;
                     continue;
                 }
@@ -822,9 +885,10 @@ impl TerminalWidget {
                 background: rgb_hex(colors.background),
                 cursor: colors.cursor.map(rgb_hex),
             },
-            cursor: snapshot
-                .cursor_viewport()?
-                .map(|cursor| CaptureCursor { x: cursor.x, y: cursor.y }),
+            cursor: snapshot.cursor_viewport()?.map(|cursor| CaptureCursor {
+                x: cursor.x,
+                y: cursor.y,
+            }),
             rows,
         })
     }
@@ -1057,7 +1121,7 @@ impl Render for TerminalWidget {
                 return div()
                     .size_full()
                     .bg(self.theme.background)
-                    .child("Failed to update render state")
+                    .child("Failed to update render state");
             }
         };
 
@@ -1070,6 +1134,8 @@ impl Render for TerminalWidget {
         let mut elements: Vec<gpui::AnyElement> = Vec::new();
         let mut base_text_style = window.text_style();
         base_text_style.font_family = TERMINAL_FONT_FAMILY.into();
+        base_text_style.font_features = terminal_font_features();
+        base_text_style.font_fallbacks = Some(terminal_font_fallbacks());
         base_text_style.font_size = px(TERMINAL_FONT_SIZE_PX).into();
         base_text_style.line_height = cell_size.1.into();
         base_text_style.white_space = WhiteSpace::Nowrap;
@@ -1204,11 +1270,13 @@ impl Render for TerminalWidget {
                     .font_family(TERMINAL_FONT_FAMILY)
                     .line_height(cell_size.1)
                     .when_some(segment_bg, |div, bg| div.bg(rgb_to_rgba(bg)))
-                    .child(StyledText::new(segment.text).with_runs(vec![text_run_for_style(
-                        &base_text_style,
-                        segment.style,
-                        segment_len,
-                    )]));
+                    .child(
+                        StyledText::new(segment.text).with_runs(vec![text_run_for_style(
+                            &base_text_style,
+                            segment.style,
+                            segment_len,
+                        )]),
+                    );
                 elements.push(segment_div.into_any_element());
             }
             let _ = row.set_dirty(false);
