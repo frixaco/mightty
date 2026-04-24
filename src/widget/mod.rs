@@ -14,6 +14,7 @@ use crate::ghostty::{
     render::{CellIterator, CellWidth, RowIterator},
     style::{RgbColor, Underline},
 };
+use crate::pane_container::shortcut_action;
 use gpui::{
     Context, FocusHandle, FontFallbacks, FontFeatures, FontStyle, FontWeight, InteractiveElement,
     IntoElement, KeyDownEvent, KeyUpEvent, MouseButton, MouseDownEvent, Pixels, Render, Size,
@@ -748,6 +749,10 @@ impl TerminalWidget {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.dispatch_app_shortcut(&event.keystroke, window, cx) {
+            return;
+        }
+
         if self.is_feedback_capture_shortcut(event) {
             self.capture_feedback(window, cx);
             return;
@@ -761,8 +766,34 @@ impl TerminalWidget {
         self.send_encoded_key(action, &event.keystroke, cx);
     }
 
-    fn handle_key_up(&mut self, event: &KeyUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn handle_key_up(&mut self, event: &KeyUpEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_app_shortcut(&event.keystroke) {
+            window.prevent_default();
+            cx.stop_propagation();
+            return;
+        }
+
         self.send_encoded_key(Action::Release, &event.keystroke, cx);
+    }
+
+    fn dispatch_app_shortcut(
+        &mut self,
+        keystroke: &gpui::Keystroke,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(action) = shortcut_action(keystroke) else {
+            return false;
+        };
+
+        window.dispatch_action(action, cx);
+        window.prevent_default();
+        cx.stop_propagation();
+        true
+    }
+
+    fn is_app_shortcut(&self, keystroke: &gpui::Keystroke) -> bool {
+        shortcut_action(keystroke).is_some()
     }
 
     fn send_encoded_key(

@@ -34,7 +34,7 @@ Add lightweight tab management, vertical pane splitting, pane closing, and pane 
 
 - The left sidebar should be persistent whenever the main window is open.
 - The sidebar should use the same black background as the rest of the window.
-- The sidebar width should be fixed at `52px` for now.
+- The sidebar width should be fixed at `160px` for now so each tab can show its number and short title without looking like a square icon.
 - `Ctrl+B` toggles the sidebar between visible and hidden.
 - When hidden, the sidebar should completely disappear and the terminal area should reclaim the full width.
 - Hiding the sidebar must not lose tab state, active tab state, pane state, or terminal state.
