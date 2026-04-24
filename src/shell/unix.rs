@@ -4,13 +4,15 @@
 
 use std::io;
 
+use super::{PtyRead, PtySize};
+
 #[derive(Debug)]
-pub enum ConPtyError {
+pub enum PtyError {
     Unsupported,
     InvalidDimensions,
 }
 
-impl std::fmt::Display for ConPtyError {
+impl std::fmt::Display for PtyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Unsupported => write!(f, "PTY support is not implemented on this platform"),
@@ -19,49 +21,45 @@ impl std::fmt::Display for ConPtyError {
     }
 }
 
-impl std::error::Error for ConPtyError {}
+impl std::error::Error for PtyError {}
 
-pub struct ConPtyShell;
+pub struct PtySession;
 
-impl ConPtyShell {
-    pub fn spawn(_command: &str, rows: u16, cols: u16) -> Result<Self, ConPtyError> {
-        if rows == 0 || cols == 0 {
-            return Err(ConPtyError::InvalidDimensions);
+impl PtySession {
+    pub fn spawn(_command: &str, size: PtySize) -> Result<Self, PtyError> {
+        if !size.is_valid() {
+            return Err(PtyError::InvalidDimensions);
         }
 
-        Err(ConPtyError::Unsupported)
+        Err(PtyError::Unsupported)
     }
 
-    pub fn read(&mut self, _buf: &mut [u8]) -> Result<usize, ConPtyError> {
-        Err(ConPtyError::Unsupported)
+    pub fn try_read(&mut self, _buf: &mut [u8]) -> Result<PtyRead, PtyError> {
+        Err(PtyError::Unsupported)
     }
 
-    pub fn write(&mut self, _data: &[u8]) -> Result<(), ConPtyError> {
-        Err(ConPtyError::Unsupported)
+    pub fn write(&mut self, _data: &[u8]) -> Result<(), PtyError> {
+        Err(PtyError::Unsupported)
     }
 
-    pub fn peek(&mut self) -> Result<bool, ConPtyError> {
-        Err(ConPtyError::Unsupported)
-    }
-
-    pub fn resize(&mut self, rows: u16, cols: u16) -> Result<(), ConPtyError> {
-        if rows == 0 || cols == 0 {
-            return Err(ConPtyError::InvalidDimensions);
+    pub fn resize(&mut self, size: PtySize) -> Result<(), PtyError> {
+        if !size.is_valid() {
+            return Err(PtyError::InvalidDimensions);
         }
 
-        Err(ConPtyError::Unsupported)
+        Err(PtyError::Unsupported)
     }
 
-    pub fn shutdown(self) -> Result<(), ConPtyError> {
+    pub fn has_exited(&self) -> Result<bool, PtyError> {
+        Err(PtyError::Unsupported)
+    }
+
+    pub fn shutdown(self) -> Result<(), PtyError> {
         Ok(())
-    }
-
-    pub fn is_conpty_available() -> bool {
-        false
     }
 }
 
-impl From<io::Error> for ConPtyError {
+impl From<io::Error> for PtyError {
     fn from(_error: io::Error) -> Self {
         Self::Unsupported
     }

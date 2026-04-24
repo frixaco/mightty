@@ -1,7 +1,7 @@
 //! Terminal Widget
 //!
 //! GPUI component that renders terminal content and handles user interaction.
-//! Combines ConPtyShell, libghostty Terminal, and key encoding into a complete
+//! Combines a PTY session, libghostty Terminal, and key encoding into a complete
 //! terminal widget.
 
 use crate::feedback::{
@@ -30,7 +30,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 #[cfg(windows)]
-use crate::shell::ConPtyShell;
+use crate::shell::{PtyRead, PtySession, PtySize};
 
 /// Cursor style options
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -522,7 +522,7 @@ impl TerminalWidget {
 
         #[cfg(windows)]
         let io_thread = Some(std::thread::spawn(move || {
-            let mut shell = match ConPtyShell::spawn(&shell_cmd, rows, cols) {
+            let mut shell = match PtySession::spawn(&shell_cmd, PtySize::new(rows, cols)) {
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!("Failed to spawn shell: {}", e);
@@ -576,33 +576,33 @@ impl TerminalWidget {
 
                 if let Some((rows, cols)) = pending_resize {
                     did_work = true;
-                    if shell.resize(rows, cols).is_err() {
+                    if shell.resize(PtySize::new(rows, cols)).is_err() {
                         exit_flag_thread.store(true, Ordering::Relaxed);
                         return;
                     }
                 }
 
                 loop {
-                    match shell.peek() {
-                        Ok(true) => match shell.read(&mut buf) {
-                            Ok(n) if n > 0 => {
-                                did_work = true;
-                                output_buffer.extend_from_slice(&buf[0..n]);
-                                if output_buffer.len() >= IO_BATCH_THRESHOLD {
-                                    if output_tx.send(std::mem::take(&mut output_buffer)).is_err() {
-                                        exit_flag_thread.store(true, Ordering::Relaxed);
-                                        return;
-                                    }
-                                    output_buffer = Vec::with_capacity(IO_BUFFER_CAPACITY);
+                    match shell.try_read(&mut buf) {
+                        Ok(PtyRead::Data(n)) => {
+                            did_work = true;
+                            output_buffer.extend_from_slice(&buf[0..n]);
+                            if output_buffer.len() >= IO_BATCH_THRESHOLD {
+                                if output_tx.send(std::mem::take(&mut output_buffer)).is_err() {
+                                    exit_flag_thread.store(true, Ordering::Relaxed);
+                                    return;
                                 }
+                                output_buffer = Vec::with_capacity(IO_BUFFER_CAPACITY);
                             }
-                            Ok(_) => break,
-                            Err(_) => {
-                                exit_flag_thread.store(true, Ordering::Relaxed);
-                                return;
+                        }
+                        Ok(PtyRead::WouldBlock) => break,
+                        Ok(PtyRead::Eof) => {
+                            if !output_buffer.is_empty() {
+                                let _ = output_tx.send(std::mem::take(&mut output_buffer));
                             }
-                        },
-                        Ok(false) => break,
+                            exit_flag_thread.store(true, Ordering::Relaxed);
+                            return;
+                        }
                         Err(_) => {
                             exit_flag_thread.store(true, Ordering::Relaxed);
                             return;

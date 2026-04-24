@@ -82,10 +82,8 @@ Useful runtime shortcuts:
 
 ## TODO
 
-- Replace the Windows-specific `ConPtyShell` naming with a platform-neutral PTY API, such as `PtySession`, `PtyError`, and `PtySize`.
-- Keep ConPTY as the Windows backend behind that API.
-- Implement a Unix PTY backend behind the same API for macOS/Linux, using a nonblocking PTY master for reads, writes, resize, child exit detection, and shell spawning from `$SHELL`.
-- Prefer a single `try_read()` style method over the current `peek()` plus `read()` shape, so Windows can use `PeekNamedPipe` internally while Unix can return `WouldBlock` as no pending output.
+- Implement a Unix PTY backend behind the existing `PtySession` API for macOS/Linux, using a nonblocking PTY master for reads, writes, resize, child exit detection, and shell spawning from `$SHELL`.
+- Remove the temporary `ConPtyShell` and `ConPtyError` compatibility aliases once all callers use the platform-neutral PTY names.
 
 ## Project Layout
 
