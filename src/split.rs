@@ -40,7 +40,7 @@ impl Split {
 impl Render for Split {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         if self.panes.is_empty() {
-            return div().size_full().bg(gpui::rgba(0x1a1a1a));
+            return div().size_full().bg(gpui::rgb(0x000000));
         }
 
         div().size_full().flex().flex_row().gap_0().children(

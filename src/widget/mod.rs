@@ -15,10 +15,10 @@ use crate::ghostty::{
     style::{RgbColor, Underline},
 };
 use gpui::{
-    Bounds, Context, FocusHandle, FontFallbacks, FontFeatures, FontStyle, FontWeight,
-    InteractiveElement, IntoElement, KeyDownEvent, KeyUpEvent, MouseButton, MouseDownEvent, Pixels,
-    Render, StrikethroughStyle, Styled, StyledText, TextRun, TextStyle, UnderlineStyle, WhiteSpace,
-    Window, div, prelude::*, px,
+    Context, FocusHandle, FontFallbacks, FontFeatures, FontStyle, FontWeight, InteractiveElement,
+    IntoElement, KeyDownEvent, KeyUpEvent, MouseButton, MouseDownEvent, Pixels, Render, Size,
+    StrikethroughStyle, Styled, StyledText, TextRun, TextStyle, UnderlineStyle, WhiteSpace, Window,
+    canvas, div, prelude::*, px,
 };
 use std::sync::{
     Arc,
@@ -124,6 +124,7 @@ pub struct TerminalWidget {
     blink_accumulator: Duration,
     last_frame_time: Option<Instant>,
     size: (u16, u16),
+    layout_size: Option<Size<Pixels>>,
     cell_size: (Pixels, Pixels),
     theme: TerminalTheme,
     has_exited: bool,
@@ -142,7 +143,7 @@ impl Default for TerminalTheme {
     fn default() -> Self {
         Self {
             foreground: gpui::rgb(0xc0c0c0),
-            background: gpui::rgb(0x1a1a1a),
+            background: gpui::rgb(0x000000),
             cursor: gpui::rgb(0xffffff),
             selection: gpui::rgb(0x3d3d3d),
             palette: [
@@ -650,6 +651,7 @@ impl TerminalWidget {
             blink_accumulator: Duration::ZERO,
             last_frame_time: None,
             size,
+            layout_size: None,
             cell_size: (px(9.6), px(19.2)),
             theme,
             has_exited: false,
@@ -705,14 +707,14 @@ impl TerminalWidget {
         }
     }
 
-    fn calculate_dimensions(&self, bounds: &Bounds<Pixels>) -> (u16, u16) {
-        let cols = (bounds.size.width / self.cell_size.0).floor() as u16;
-        let rows = (bounds.size.height / self.cell_size.1).floor() as u16;
+    fn calculate_dimensions(&self, size: Size<Pixels>) -> (u16, u16) {
+        let cols = (size.width / self.cell_size.0).floor() as u16;
+        let rows = (size.height / self.cell_size.1).floor() as u16;
         (cols.max(1), rows.max(1))
     }
 
-    fn resize_to_bounds(&mut self, bounds: &Bounds<Pixels>, cx: &mut Context<Self>) {
-        let (cols, rows) = self.calculate_dimensions(bounds);
+    fn resize_to_size(&mut self, size: Size<Pixels>, cx: &mut Context<Self>) {
+        let (cols, rows) = self.calculate_dimensions(size);
         if cols != self.size.0 || rows != self.size.1 {
             let cell_width: f32 = self.cell_size.0.into();
             let cell_height: f32 = self.cell_size.1.into();
@@ -728,6 +730,16 @@ impl TerminalWidget {
                 cx.notify();
             }
         }
+    }
+
+    fn update_layout_size(&mut self, size: Size<Pixels>, cx: &mut Context<Self>) {
+        if self.layout_size == Some(size) {
+            return;
+        }
+
+        self.layout_size = Some(size);
+        self.resize_to_size(size, cx);
+        cx.notify();
     }
 
     fn handle_key_down(
@@ -1147,8 +1159,8 @@ impl Render for TerminalWidget {
 
         self.process_output(cx);
 
-        let bounds = window.bounds();
-        self.resize_to_bounds(&bounds, cx);
+        let layout_size = self.layout_size.unwrap_or_else(|| window.viewport_size());
+        self.resize_to_size(layout_size, cx);
 
         let snapshot = match self.render_state.update(&self.terminal) {
             Ok(s) => s,
@@ -1352,6 +1364,8 @@ impl Render for TerminalWidget {
             elements.push(cursor_div.into_any_element());
         }
 
+        let entity = cx.entity();
+
         div()
             .size_full()
             .bg(rgb_to_rgba(colors.background))
@@ -1371,6 +1385,18 @@ impl Render for TerminalWidget {
                 }),
             )
             .children(elements)
+            .child(
+                canvas(
+                    move |bounds, _window, cx| {
+                        entity.update(cx, |this, cx| {
+                            this.update_layout_size(bounds.size, cx);
+                        });
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full(),
+            )
     }
 }
 

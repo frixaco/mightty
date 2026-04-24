@@ -1,10 +1,28 @@
-use gpui::{Context, Entity, IntoElement, KeyBinding, Render, Window, actions, div, prelude::*};
+use gpui::{
+    Context, Entity, Font, FontFallbacks, IntoElement, KeyBinding, Render, Window,
+    WindowControlArea, actions, div, font, prelude::*, px,
+};
+use gpui_component::InteractiveElementExt;
+use std::sync::OnceLock;
 
 use crate::pane::Pane;
 use crate::split::Split;
 use crate::widget::TerminalConfig;
 
 actions!(terminal, [SplitRight]);
+
+const WINDOW_BACKGROUND: u32 = 0x000000;
+const WINDOW_HORIZONTAL_PADDING_PX: f32 = 8.0;
+const TITLE_BAR_HEIGHT_PX: f32 = 34.0;
+const WINDOW_CONTROL_WIDTH_PX: f32 = 46.0;
+
+#[derive(Clone, Copy)]
+enum WindowsCaptionButton {
+    Minimize,
+    Maximize,
+    Restore,
+    Close,
+}
 
 pub struct PaneContainer {
     split: Entity<Split>,
@@ -77,14 +95,146 @@ impl PaneContainer {
     }
 }
 
+fn window_control_button(
+    id: &'static str,
+    area: WindowControlArea,
+    button: WindowsCaptionButton,
+    is_close: bool,
+) -> impl IntoElement {
+    div()
+        .id(id)
+        .flex()
+        .h_full()
+        .w(px(WINDOW_CONTROL_WIDTH_PX))
+        .flex_shrink_0()
+        .items_center()
+        .justify_center()
+        .occlude()
+        .window_control_area(area)
+        .hover(move |style| {
+            if is_close {
+                style.bg(gpui::rgb(0xc42b1c))
+            } else {
+                style.bg(gpui::rgb(0x202020))
+            }
+        })
+        .active(move |style| {
+            if is_close {
+                style.bg(gpui::rgb(0x8f1f14))
+            } else {
+                style.bg(gpui::rgb(0x2a2a2a))
+            }
+        })
+        .text_size(px(10.0))
+        .text_color(gpui::white())
+        .line_height(px(TITLE_BAR_HEIGHT_PX))
+        .font(caption_icon_font())
+        .child(button.icon())
+}
+
+impl WindowsCaptionButton {
+    fn icon(self) -> &'static str {
+        match self {
+            Self::Minimize => "\u{e921}",
+            Self::Maximize => "\u{e922}",
+            Self::Restore => "\u{e923}",
+            Self::Close => "\u{e8bb}",
+        }
+    }
+}
+
+fn caption_icon_font() -> Font {
+    static CAPTION_ICON_FONT: OnceLock<Font> = OnceLock::new();
+
+    CAPTION_ICON_FONT
+        .get_or_init(|| {
+            let mut icon_font = font(caption_icon_font_family());
+            icon_font.fallbacks = Some(FontFallbacks::from_fonts(vec![
+                "Segoe MDL2 Assets".to_string(),
+            ]));
+            icon_font
+        })
+        .clone()
+}
+
+#[cfg(target_os = "windows")]
+fn caption_icon_font_family() -> &'static str {
+    use windows_sys::Wdk::System::SystemServices::RtlGetVersion;
+    use windows_sys::Win32::System::SystemInformation::OSVERSIONINFOW;
+
+    let mut version: OSVERSIONINFOW = unsafe { std::mem::zeroed() };
+    version.dwOSVersionInfoSize = std::mem::size_of::<OSVERSIONINFOW>() as u32;
+
+    let status = unsafe { RtlGetVersion(&mut version) };
+    if status >= 0 && version.dwBuildNumber >= 22000 {
+        "Segoe Fluent Icons"
+    } else {
+        "Segoe MDL2 Assets"
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn caption_icon_font_family() -> &'static str {
+    "Segoe Fluent Icons"
+}
+
 impl Render for PaneContainer {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.check_for_exits(cx);
+
+        let maximize_button = if window.is_maximized() {
+            WindowsCaptionButton::Restore
+        } else {
+            WindowsCaptionButton::Maximize
+        };
 
         div()
             .size_full()
-            .bg(gpui::rgba(0x1a1a1a))
+            .flex()
+            .flex_col()
+            .bg(gpui::rgb(WINDOW_BACKGROUND))
             .on_action(cx.listener(Self::on_split_right))
-            .child(self.split.clone())
+            .child(
+                div()
+                    .h(px(TITLE_BAR_HEIGHT_PX))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .bg(gpui::rgb(WINDOW_BACKGROUND))
+                    .child(
+                        div()
+                            .id("titlebar-drag")
+                            .h_full()
+                            .flex_1()
+                            .window_control_area(WindowControlArea::Drag)
+                            .on_double_click(|_, window, _| window.zoom_window()),
+                    )
+                    .child(window_control_button(
+                        "minimize",
+                        WindowControlArea::Min,
+                        WindowsCaptionButton::Minimize,
+                        false,
+                    ))
+                    .child(window_control_button(
+                        "maximize",
+                        WindowControlArea::Max,
+                        maximize_button,
+                        false,
+                    ))
+                    .child(window_control_button(
+                        "close",
+                        WindowControlArea::Close,
+                        WindowsCaptionButton::Close,
+                        true,
+                    )),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .overflow_hidden()
+                    .pl(px(WINDOW_HORIZONTAL_PADDING_PX))
+                    .pr(px(WINDOW_HORIZONTAL_PADDING_PX))
+                    .child(self.split.clone()),
+            )
     }
 }

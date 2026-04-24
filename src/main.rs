@@ -1,5 +1,5 @@
 use gpui::{App, Application, Bounds, WindowBounds, WindowOptions, prelude::*, px, size};
-use gpui_component::Root;
+use gpui_component::{Root, Theme, ThemeMode, TitleBar};
 use mightty::{pane_container::PaneContainer, widget::TerminalConfig};
 use std::borrow::Cow;
 use std::time::Duration;
@@ -33,6 +33,7 @@ fn main() {
     Application::new().run(|cx: &mut App| {
         load_embedded_fonts(cx);
         gpui_component::init(cx);
+        Theme::change(ThemeMode::Dark, None, cx);
 
         PaneContainer::bind_keys(cx);
 
@@ -40,6 +41,7 @@ fn main() {
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
+                titlebar: Some(TitleBar::title_bar_options()),
                 ..Default::default()
             },
             |window, cx| {
