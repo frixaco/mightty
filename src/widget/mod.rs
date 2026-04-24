@@ -21,7 +21,7 @@ use gpui::{
     Window, div, prelude::*, px,
 };
 use std::sync::{
-    Arc, Condvar, Mutex,
+    Arc,
     atomic::{AtomicBool, Ordering},
     mpsc::{Receiver, Sender, channel},
 };
@@ -67,11 +67,13 @@ impl Default for TerminalConfig {
 }
 
 type OutputData = Vec<u8>;
-type IoWakeSignal = Arc<(Mutex<bool>, Condvar)>;
 
 const TERMINAL_FONT_FAMILY: &str = "JetBrainsMono Nerd Font Mono";
 const TERMINAL_FONT_SIZE_PX: f32 = 16.0;
 const FEEDBACK_CAPTURE_KEY: &str = "f12";
+const IO_BUFFER_CAPACITY: usize = 64 * 1024;
+const IO_BATCH_THRESHOLD: usize = 16 * 1024;
+const IO_IDLE_SLEEP: Duration = Duration::from_millis(8);
 
 fn terminal_font_features() -> FontFeatures {
     FontFeatures(Arc::new(vec![
@@ -112,9 +114,8 @@ pub struct TerminalWidget {
     cell_iterator: CellIterator<'static>,
     config: TerminalConfig,
     output_rx: Receiver<OutputData>,
-    input_tx: Option<std::sync::mpsc::Sender<Vec<u8>>>,
+    input_tx: Option<Sender<Vec<u8>>>,
     resize_tx: Option<Sender<(u16, u16)>>,
-    io_wake: IoWakeSignal,
     shutdown_flag: Arc<AtomicBool>,
     exit_flag: Arc<AtomicBool>,
     io_thread: Option<JoinHandle<()>>,
@@ -508,7 +509,6 @@ impl TerminalWidget {
         let key_encoder = Encoder::new().expect("Failed to create key encoder");
         let key_event = Event::new().expect("Failed to create key event");
 
-        let io_wake = Arc::new((Mutex::new(false), Condvar::new()));
         let shutdown_flag = Arc::new(AtomicBool::new(false));
         let exit_flag = Arc::new(AtomicBool::new(false));
         let exit_flag_thread = Arc::clone(&exit_flag);
@@ -517,7 +517,6 @@ impl TerminalWidget {
         let rows = config.initial_rows;
         let cols = config.initial_cols;
         let shutdown_thread = Arc::clone(&shutdown_flag);
-        let _io_wake_thread = Arc::clone(&io_wake);
 
         #[cfg(windows)]
         let io_thread = Some(std::thread::spawn(move || {
@@ -531,8 +530,7 @@ impl TerminalWidget {
             };
 
             let mut buf = [0u8; 32768];
-            let mut output_buffer: Vec<u8> = Vec::with_capacity(65536);
-            let output_batch_threshold = 16384;
+            let mut output_buffer: Vec<u8> = Vec::with_capacity(IO_BUFFER_CAPACITY);
 
             loop {
                 if shutdown_thread.load(Ordering::Relaxed) {
@@ -588,12 +586,12 @@ impl TerminalWidget {
                             Ok(n) if n > 0 => {
                                 did_work = true;
                                 output_buffer.extend_from_slice(&buf[0..n]);
-                                if output_buffer.len() >= output_batch_threshold {
+                                if output_buffer.len() >= IO_BATCH_THRESHOLD {
                                     if output_tx.send(std::mem::take(&mut output_buffer)).is_err() {
                                         exit_flag_thread.store(true, Ordering::Relaxed);
                                         return;
                                     }
-                                    output_buffer = Vec::with_capacity(65536);
+                                    output_buffer = Vec::with_capacity(IO_BUFFER_CAPACITY);
                                 }
                             }
                             Ok(_) => break,
@@ -616,11 +614,11 @@ impl TerminalWidget {
                         exit_flag_thread.store(true, Ordering::Relaxed);
                         return;
                     }
-                    output_buffer = Vec::with_capacity(65536);
+                    output_buffer = Vec::with_capacity(IO_BUFFER_CAPACITY);
                 }
 
                 if !did_work {
-                    std::thread::sleep(Duration::from_millis(8));
+                    std::thread::sleep(IO_IDLE_SLEEP);
                 }
             }
         }));
@@ -644,7 +642,6 @@ impl TerminalWidget {
             output_rx,
             input_tx: Some(input_tx),
             resize_tx: Some(resize_tx),
-            io_wake,
             shutdown_flag,
             exit_flag,
             io_thread,
@@ -697,14 +694,6 @@ impl TerminalWidget {
         }
     }
 
-    fn wake_io_thread(&self) {
-        let (lock, cvar) = &*self.io_wake;
-        if let Ok(mut pending) = lock.lock() {
-            *pending = true;
-            cvar.notify_one();
-        }
-    }
-
     fn process_output(&mut self, cx: &mut Context<Self>) {
         let mut has_new_data = false;
         while let Ok(data) = self.output_rx.try_recv() {
@@ -735,7 +724,6 @@ impl TerminalWidget {
                 self.size = (cols, rows);
                 if let Some(ref resize_tx) = self.resize_tx {
                     let _ = resize_tx.send((rows, cols));
-                    self.wake_io_thread();
                 }
                 cx.notify();
             }
@@ -776,12 +764,11 @@ impl TerminalWidget {
             None => return,
         };
 
-        if let Some(vt_bytes) = self.encode_key_event(action, keystroke) {
-            if let Err(e) = input_tx.send(vt_bytes) {
-                eprintln!("Failed to send input to shell: {:?}", e);
-                return;
-            }
-            self.wake_io_thread();
+        if let Some(vt_bytes) = self.encode_key_event(action, keystroke)
+            && let Err(e) = input_tx.send(vt_bytes)
+        {
+            eprintln!("Failed to send input to shell: {:?}", e);
+            return;
         }
         self.process_output(cx);
         cx.notify();
@@ -795,7 +782,7 @@ impl TerminalWidget {
         let consumed_mods = self.consumed_mods(
             &keystroke.key,
             ghostty_mods,
-            printable_text.as_deref(),
+            printable_text,
             unshifted_codepoint,
         );
 
@@ -805,7 +792,7 @@ impl TerminalWidget {
             .set_mods(ghostty_mods)
             .set_consumed_mods(consumed_mods)
             .set_unshifted_codepoint(unshifted_codepoint)
-            .set_utf8(printable_text.as_deref())
+            .set_utf8(printable_text)
             .set_composing(false);
 
         self.key_encoder.set_options_from_terminal(&self.terminal);
@@ -870,14 +857,14 @@ impl TerminalWidget {
         let colors = snapshot.colors()?;
 
         let mut rows = Vec::new();
-        let mut row_it = self.row_iterator.update(&snapshot)?;
+        let row_it = self.row_iterator.update(&snapshot)?;
         let mut row_idx = 0u16;
-        while let Some(row) = row_it.next() {
+        for row in row_it {
             let mut row_text = String::new();
             let mut cells = Vec::new();
-            let mut cell_it = self.cell_iterator.update(row)?;
+            let cell_it = self.cell_iterator.update(row)?;
             let mut col_idx = 0u16;
-            while let Some(cell) = cell_it.next() {
+            for cell in cell_it {
                 let width = cell.width()?;
                 let advance = width.column_advance();
                 let graphemes_len = cell.graphemes_len()?;
@@ -1011,9 +998,7 @@ impl TerminalWidget {
         if chars.next().is_some() {
             return Mods::empty();
         }
-        if mods.contains(Mods::SHIFT) && tc != ucp {
-            Mods::SHIFT
-        } else if self.key_implies_shift(key, ucp) {
+        if (mods.contains(Mods::SHIFT) && tc != ucp) || self.key_implies_shift(key, ucp) {
             Mods::SHIFT
         } else {
             Mods::empty()
@@ -1190,14 +1175,14 @@ impl Render for TerminalWidget {
         base_text_style.line_height = cell_size.1.into();
         base_text_style.white_space = WhiteSpace::Nowrap;
 
-        let mut row_it = match self.row_iterator.update(&snapshot) {
+        let row_it = match self.row_iterator.update(&snapshot) {
             Ok(it) => it,
             Err(_) => return div().size_full().bg(self.theme.background),
         };
 
         let mut row_idx: u16 = 0;
-        while let Some(row) = row_it.next() {
-            let mut cell_it = match self.cell_iterator.update(row) {
+        for row in row_it {
+            let cell_it = match self.cell_iterator.update(row) {
                 Ok(it) => it,
                 Err(_) => continue,
             };
@@ -1205,7 +1190,7 @@ impl Render for TerminalWidget {
             let mut row_segments = Vec::new();
             let mut pending_segment = None;
             let mut col_idx = 0u16;
-            while let Some(cell) = cell_it.next() {
+            for cell in cell_it {
                 let width = match cell.width() {
                     Ok(width) => width,
                     Err(_) => continue,
@@ -1336,37 +1321,35 @@ impl Render for TerminalWidget {
         let is_focused = self.focus_handle.is_focused(window);
         let cursor_visible = is_focused && (self.cursor_blink_phase || !self.config.cursor_blink);
 
-        if cursor_visible {
-            if let Ok(Some(cursor_pos)) = snapshot.cursor_viewport() {
-                let cursor_color = colors.cursor.unwrap_or(colors.foreground);
-                let (x, y) = cell_position(cursor_pos.y, cursor_pos.x, cell_size);
-                let cursor_rgba = rgb_to_rgba(cursor_color);
+        if cursor_visible && let Ok(Some(cursor_pos)) = snapshot.cursor_viewport() {
+            let cursor_color = colors.cursor.unwrap_or(colors.foreground);
+            let (x, y) = cell_position(cursor_pos.y, cursor_pos.x, cell_size);
+            let cursor_rgba = rgb_to_rgba(cursor_color);
 
-                let cursor_div = match self.config.cursor_style {
-                    CursorStyle::Block => div()
-                        .absolute()
-                        .left(x)
-                        .top(y)
-                        .w(cell_size.0)
-                        .h(cell_size.1)
-                        .bg(cursor_rgba),
-                    CursorStyle::Line => div()
-                        .absolute()
-                        .left(x)
-                        .top(y)
-                        .w(px(2.0))
-                        .h(cell_size.1)
-                        .bg(cursor_rgba),
-                    CursorStyle::Underline => div()
-                        .absolute()
-                        .left(x)
-                        .top(y + cell_size.1 - px(2.0))
-                        .w(cell_size.0)
-                        .h(px(2.0))
-                        .bg(cursor_rgba),
-                };
-                elements.push(cursor_div.into_any_element());
-            }
+            let cursor_div = match self.config.cursor_style {
+                CursorStyle::Block => div()
+                    .absolute()
+                    .left(x)
+                    .top(y)
+                    .w(cell_size.0)
+                    .h(cell_size.1)
+                    .bg(cursor_rgba),
+                CursorStyle::Line => div()
+                    .absolute()
+                    .left(x)
+                    .top(y)
+                    .w(px(2.0))
+                    .h(cell_size.1)
+                    .bg(cursor_rgba),
+                CursorStyle::Underline => div()
+                    .absolute()
+                    .left(x)
+                    .top(y + cell_size.1 - px(2.0))
+                    .w(cell_size.0)
+                    .h(px(2.0))
+                    .bg(cursor_rgba),
+            };
+            elements.push(cursor_div.into_any_element());
         }
 
         div()
@@ -1394,7 +1377,6 @@ impl Render for TerminalWidget {
 impl Drop for TerminalWidget {
     fn drop(&mut self) {
         self.shutdown_flag.store(true, Ordering::Relaxed);
-        self.wake_io_thread();
         self.input_tx = None;
         self.resize_tx = None;
         if let Some(handle) = self.io_thread.take() {
@@ -1425,10 +1407,10 @@ mod tests {
 
         let mut rows = row_iterator.update(&snapshot).expect("rows");
         let row = rows.next().expect("first row");
-        let mut cells = cell_iterator.update(row).expect("cells");
+        let cells = cell_iterator.update(row).expect("cells");
 
         let mut letters = Vec::new();
-        while let Some(cell) = cells.next() {
+        for cell in cells {
             let text: String = cell.graphemes().expect("graphemes").into_iter().collect();
             if text.is_empty() {
                 continue;
@@ -1468,11 +1450,11 @@ mod tests {
 
         let mut rows = row_iterator.update(&snapshot).expect("rows");
         let row = rows.next().expect("first row");
-        let mut cells = cell_iterator.update(row).expect("cells");
+        let cells = cell_iterator.update(row).expect("cells");
 
         let mut positions = Vec::new();
         let mut col_idx = 0u16;
-        while let Some(cell) = cells.next() {
+        for cell in cells {
             let width = cell.width().expect("width");
             let advance = width.column_advance();
             let text: String = cell.graphemes().expect("graphemes").into_iter().collect();

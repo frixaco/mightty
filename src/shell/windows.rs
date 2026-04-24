@@ -3,12 +3,15 @@
 //! Manages pseudo-terminal connection between UI and shell processes on Windows.
 //! Uses Windows ConPTY API (available on Windows 10 1809+).
 
-use std::ffi::{c_void, OsStr};
+use std::alloc::{Layout, alloc, dealloc};
+use std::ffi::{OsStr, c_void};
 use std::io;
 use std::os::raw::c_uint;
 use std::os::windows::ffi::OsStrExt;
 use std::ptr::null_mut;
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE, S_OK};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE, S_OK,
+};
 
 // External declarations for Windows file I/O functions
 unsafe extern "system" {
@@ -40,13 +43,14 @@ unsafe extern "system" {
 
 use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 use windows_sys::Win32::System::Console::{
-    ClosePseudoConsole, CreatePseudoConsole, ResizePseudoConsole, COORD, HPCON,
+    COORD, ClosePseudoConsole, CreatePseudoConsole, HPCON, ResizePseudoConsole,
 };
 use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::Threading::{
-    CreateProcessW, DeleteProcThreadAttributeList, InitializeProcThreadAttributeList,
-    UpdateProcThreadAttribute, EXTENDED_STARTUPINFO_PRESENT, LPPROC_THREAD_ATTRIBUTE_LIST,
-    PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, STARTUPINFOEXW, STARTUPINFOW,
+    CreateProcessW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT,
+    InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
+    PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION, STARTUPINFOEXW, STARTUPINFOW,
+    TerminateProcess, UpdateProcThreadAttribute,
 };
 
 /// Error type for ConPTY operations
@@ -99,8 +103,13 @@ impl ConPtyShell {
     /// * `cols` - Terminal width in columns (must be > 0)
     ///
     /// # Example
-    /// ```
-    /// let shell = ConPtyShell::spawn("cmd.exe", 24, 80)?;
+    /// ```no_run
+    /// use mightty::shell::ConPtyShell;
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let _shell = ConPtyShell::spawn("cmd.exe", 24, 80)?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn spawn(command: &str, rows: u16, cols: u16) -> Result<Self, ConPtyError> {
         if rows == 0 || cols == 0 {
@@ -115,7 +124,14 @@ impl ConPtyShell {
         unsafe {
             // Create pipes for PTY communication
             let (pty_input_write, pty_input_read) = Self::create_pipe()?;
-            let (pty_output_write, pty_output_read) = Self::create_pipe()?;
+            let (pty_output_write, pty_output_read) = match Self::create_pipe() {
+                Ok(pipe) => pipe,
+                Err(err) => {
+                    CloseHandle(pty_input_write);
+                    CloseHandle(pty_input_read);
+                    return Err(err);
+                }
+            };
 
             // Create pseudo console
             let size = COORD {
@@ -140,7 +156,15 @@ impl ConPtyShell {
             CloseHandle(pty_output_write);
 
             // Create process attached to PTY
-            let process_handle = Self::create_process_with_pty(command, pty_handle)?;
+            let process_handle = match Self::create_process_with_pty(command, pty_handle) {
+                Ok(handle) => handle,
+                Err(err) => {
+                    ClosePseudoConsole(pty_handle);
+                    CloseHandle(pty_input_write);
+                    CloseHandle(pty_output_read);
+                    return Err(err);
+                }
+            };
 
             Ok(ConPtyShell {
                 pty_handle,
@@ -250,7 +274,7 @@ impl ConPtyShell {
         unsafe {
             // Terminate the process
             if self.process_handle != INVALID_HANDLE_VALUE {
-                windows_sys::Win32::System::Threading::TerminateProcess(self.process_handle, 0);
+                TerminateProcess(self.process_handle, 0);
                 CloseHandle(self.process_handle);
             }
 
@@ -320,7 +344,7 @@ impl ConPtyShell {
     }
 
     /// Create an anonymous pipe
-    unsafe fn create_pipe() -> Result<(HANDLE, HANDLE), ConPtyError> {
+    fn create_pipe() -> Result<(HANDLE, HANDLE), ConPtyError> {
         let mut read_handle: HANDLE = INVALID_HANDLE_VALUE;
         let mut write_handle: HANDLE = INVALID_HANDLE_VALUE;
 
@@ -330,7 +354,7 @@ impl ConPtyShell {
             bInheritHandle: 1, // TRUE
         };
 
-        let result = CreatePipe(&mut read_handle, &mut write_handle, &security_attrs, 0);
+        let result = unsafe { CreatePipe(&mut read_handle, &mut write_handle, &security_attrs, 0) };
 
         if result == 0 {
             return Err(ConPtyError::Io(io::Error::last_os_error()));
@@ -340,94 +364,86 @@ impl ConPtyShell {
     }
 
     /// Create a process attached to the pseudo console
-    unsafe fn create_process_with_pty(
-        command: &str,
-        pty_handle: HPCON,
-    ) -> Result<HANDLE, ConPtyError> {
-        // Convert command to wide string
+    fn create_process_with_pty(command: &str, pty_handle: HPCON) -> Result<HANDLE, ConPtyError> {
         let cmd_wide: Vec<u16> = OsStr::new(command).encode_wide().chain(Some(0)).collect();
 
-        // Setup startup info with PTY attribute
-        let mut startup_info: STARTUPINFOEXW = std::mem::zeroed();
+        let mut startup_info: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
         startup_info.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
 
-        // Calculate attribute list size
         let mut attr_list_size: usize = 0;
-        InitializeProcThreadAttributeList(null_mut(), 1, 0, &mut attr_list_size);
+        unsafe {
+            InitializeProcThreadAttributeList(null_mut(), 1, 0, &mut attr_list_size);
+        }
 
-        // Allocate attribute list
+        let attr_list_layout = Layout::from_size_align(attr_list_size, 8)
+            .map_err(|_| ConPtyError::Io(io::Error::other("invalid attribute list layout")))?;
         let attr_list: LPPROC_THREAD_ATTRIBUTE_LIST =
-            std::alloc::alloc(std::alloc::Layout::from_size_align(attr_list_size, 8).unwrap())
-                as *mut _;
+            unsafe { alloc(attr_list_layout) as LPPROC_THREAD_ATTRIBUTE_LIST };
 
         if attr_list.is_null() {
-            return Err(ConPtyError::Io(io::Error::new(
-                io::ErrorKind::Other,
-                "Failed to allocate attribute list",
+            return Err(ConPtyError::Io(io::Error::other(
+                "failed to allocate attribute list",
             )));
         }
 
-        // Initialize attribute list
-        let result = InitializeProcThreadAttributeList(attr_list, 1, 0, &mut attr_list_size);
+        let cleanup_attr_list = |initialized: bool| unsafe {
+            if initialized {
+                DeleteProcThreadAttributeList(attr_list);
+            }
+            dealloc(attr_list as *mut u8, attr_list_layout);
+        };
+
+        let result =
+            unsafe { InitializeProcThreadAttributeList(attr_list, 1, 0, &mut attr_list_size) };
         if result == 0 {
-            std::alloc::dealloc(
-                attr_list as *mut u8,
-                std::alloc::Layout::from_size_align(attr_list_size, 8).unwrap(),
-            );
+            cleanup_attr_list(false);
             return Err(ConPtyError::Io(io::Error::last_os_error()));
         }
 
-        // Update attribute with PTY handle - need to cast isize to pointer
-        let result = UpdateProcThreadAttribute(
-            attr_list,
-            0,
-            PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE as usize,
-            pty_handle as *mut c_void,
-            std::mem::size_of::<HPCON>(),
-            null_mut(),
-            null_mut(),
-        );
+        let result = unsafe {
+            UpdateProcThreadAttribute(
+                attr_list,
+                0,
+                PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE as usize,
+                pty_handle as *mut c_void,
+                std::mem::size_of::<HPCON>(),
+                null_mut(),
+                null_mut(),
+            )
+        };
 
         if result == 0 {
-            DeleteProcThreadAttributeList(attr_list);
-            std::alloc::dealloc(
-                attr_list as *mut u8,
-                std::alloc::Layout::from_size_align(attr_list_size, 8).unwrap(),
-            );
+            cleanup_attr_list(true);
             return Err(ConPtyError::Io(io::Error::last_os_error()));
         }
 
         startup_info.lpAttributeList = attr_list;
 
-        // Create process
-        let mut process_info: PROCESS_INFORMATION = std::mem::zeroed();
-        let result = CreateProcessW(
-            null_mut(),                   // Application name (use command line)
-            cmd_wide.as_ptr() as *mut _,  // Command line
-            null_mut(),                   // Process security attributes
-            null_mut(),                   // Thread security attributes
-            1,                            // Inherit handles (TRUE)
-            EXTENDED_STARTUPINFO_PRESENT, // Creation flags
-            null_mut(),                   // Environment
-            null_mut(),                   // Current directory
-            &startup_info.StartupInfo as *const _ as *mut STARTUPINFOW,
-            &mut process_info,
-        );
+        let mut process_info: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+        let result = unsafe {
+            CreateProcessW(
+                null_mut(),
+                cmd_wide.as_ptr() as *mut _,
+                null_mut(),
+                null_mut(),
+                1,
+                EXTENDED_STARTUPINFO_PRESENT,
+                null_mut(),
+                null_mut(),
+                &startup_info.StartupInfo as *const _ as *mut STARTUPINFOW,
+                &mut process_info,
+            )
+        };
+        let process_error = (result == 0).then(|| unsafe { GetLastError() });
+        cleanup_attr_list(true);
 
-        // Cleanup attribute list
-        DeleteProcThreadAttributeList(attr_list);
-        std::alloc::dealloc(
-            attr_list as *mut u8,
-            std::alloc::Layout::from_size_align(attr_list_size, 8).unwrap(),
-        );
-
-        if result == 0 {
-            let error_code = windows_sys::Win32::Foundation::GetLastError();
+        if let Some(error_code) = process_error {
             return Err(ConPtyError::ProcessCreationFailed(error_code));
         }
 
-        // Close thread handle, we only need process handle
-        CloseHandle(process_info.hThread);
+        unsafe {
+            CloseHandle(process_info.hThread);
+        }
 
         Ok(process_info.hProcess)
     }
@@ -441,7 +457,7 @@ impl Drop for ConPtyShell {
 
         unsafe {
             if self.process_handle != INVALID_HANDLE_VALUE {
-                windows_sys::Win32::System::Threading::TerminateProcess(self.process_handle, 0);
+                TerminateProcess(self.process_handle, 0);
                 CloseHandle(self.process_handle);
             }
 

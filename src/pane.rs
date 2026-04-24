@@ -1,4 +1,4 @@
-use gpui::{div, prelude::*, Context, Entity, IntoElement, Render, Window};
+use gpui::{Context, Entity, IntoElement, Render, Window, div, prelude::*};
 
 use crate::widget::{TerminalConfig, TerminalWidget};
 

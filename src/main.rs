@@ -1,20 +1,8 @@
-use gpui::{prelude::*, px, size, App, Application, Bounds, WindowBounds, WindowOptions};
+use gpui::{App, Application, Bounds, WindowBounds, WindowOptions, prelude::*, px, size};
 use gpui_component::Root;
+use mightty::{pane_container::PaneContainer, widget::TerminalConfig};
 use std::borrow::Cow;
-
-mod ghostty;
-mod feedback;
-mod widget;
-mod pane;
-mod split;
-mod pane_container;
-
-#[cfg(windows)]
-mod shell;
-
 use std::time::Duration;
-use widget::TerminalConfig;
-use pane_container::PaneContainer;
 
 fn load_embedded_fonts(cx: &mut App) {
     let fonts = vec![

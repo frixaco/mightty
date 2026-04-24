@@ -24,7 +24,7 @@ fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("missing OUT_DIR"));
     let install_dir = out_dir.join("ghostty-install");
     if install_dir.exists() {
-        let _ = fs::remove_dir_all(&install_dir);
+        fs::remove_dir_all(&install_dir).expect("failed to remove previous ghostty install dir");
     }
     fs::create_dir_all(&install_dir).expect("failed to create ghostty install dir");
 
@@ -74,12 +74,11 @@ fn zig_command(project_dir: &Path) -> PathBuf {
         .args(["which", "zig"])
         .current_dir(project_dir)
         .output()
+        && output.status.success()
     {
-        if output.status.success() {
-            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !path.is_empty() {
-                return PathBuf::from(path);
-            }
+        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !path.is_empty() {
+            return PathBuf::from(path);
         }
     }
 

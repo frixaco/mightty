@@ -1,14 +1,15 @@
-use gpui::{div, prelude::*, Context, Entity, IntoElement, Render, Window};
+use gpui::{Context, Entity, IntoElement, Render, Window, div, prelude::*};
 
 use crate::pane::Pane;
 
+#[derive(Default)]
 pub struct Split {
     panes: Vec<Entity<Pane>>,
 }
 
 impl Split {
     pub fn new() -> Self {
-        Self { panes: Vec::new() }
+        Self::default()
     }
 
     pub fn with_pane(pane: Entity<Pane>) -> Self {

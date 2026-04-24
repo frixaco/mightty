@@ -7,13 +7,13 @@
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
-pub use windows::ConPtyShell;
-#[cfg(windows)]
 pub use windows::ConPtyError;
+#[cfg(windows)]
+pub use windows::ConPtyShell;
 
 #[cfg(not(windows))]
 mod unix;
 #[cfg(not(windows))]
-pub use unix::ConPtyShell;
-#[cfg(not(windows))]
 pub use unix::ConPtyError;
+#[cfg(not(windows))]
+pub use unix::ConPtyShell;

@@ -162,12 +162,12 @@ fn capture_hwnd_png(hwnd: isize, path: &Path) -> io::Result<()> {
     use std::mem::size_of;
     use std::ptr::null_mut;
     use windows_sys::Win32::Foundation::{HWND, POINT, RECT};
-    use windows_sys::Win32::Graphics::Gdi::{
-        BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CreateCompatibleBitmap,
-        CreateCompatibleDC, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDIBits, GetDC, HBITMAP,
-        HGDIOBJ, RGBQUAD, ReleaseDC, SRCCOPY, SelectObject,
-    };
     use windows_sys::Win32::Graphics::Gdi::ClientToScreen;
+    use windows_sys::Win32::Graphics::Gdi::{
+        BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC,
+        DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, GetDIBits, HBITMAP, HGDIOBJ, RGBQUAD,
+        ReleaseDC, SRCCOPY, SelectObject,
+    };
     use windows_sys::Win32::UI::WindowsAndMessaging::GetClientRect;
 
     unsafe {
@@ -220,7 +220,10 @@ fn capture_hwnd_png(hwnd: isize, path: &Path) -> io::Result<()> {
             return Err(io::Error::last_os_error());
         }
 
-        if BitBlt(mem_dc, 0, 0, width, height, screen_dc, origin.x, origin.y, SRCCOPY) == 0 {
+        if BitBlt(
+            mem_dc, 0, 0, width, height, screen_dc, origin.x, origin.y, SRCCOPY,
+        ) == 0
+        {
             SelectObject(mem_dc, old_bitmap);
             DeleteObject(bitmap as HGDIOBJ);
             DeleteDC(mem_dc);

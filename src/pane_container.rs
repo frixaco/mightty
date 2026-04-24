@@ -1,4 +1,4 @@
-use gpui::{actions, div, prelude::*, Context, Entity, IntoElement, KeyBinding, Render, Window};
+use gpui::{Context, Entity, IntoElement, KeyBinding, Render, Window, actions, div, prelude::*};
 
 use crate::pane::Pane;
 use crate::split::Split;

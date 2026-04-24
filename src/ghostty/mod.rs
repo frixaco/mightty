@@ -518,8 +518,10 @@ impl<'a> Drop for RowIterator<'a> {
     }
 }
 
-impl<'a> Rows<'a> {
-    pub fn next(&mut self) -> Option<Row<'_>> {
+impl<'a> Iterator for Rows<'a> {
+    type Item = Row<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
         if unsafe { ghostty_render_state_row_iterator_next(self.raw) } {
             Some(Row {
                 raw: self.raw,
@@ -579,8 +581,10 @@ impl<'a> Drop for CellIterator<'a> {
     }
 }
 
-impl<'a> Cells<'a> {
-    pub fn next(&mut self) -> Option<Cell<'_>> {
+impl<'a> Iterator for Cells<'a> {
+    type Item = Cell<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
         if unsafe { ghostty_render_state_row_cells_next(self.raw) } {
             Some(Cell {
                 raw: self.raw,
