@@ -173,20 +173,9 @@ impl SplitNode {
                 true
             }
             Self::Pane(_) => false,
-            Self::Split {
-                direction: split_direction,
-                children,
-            } => {
-                for index in 0..children.len() {
-                    if let Self::Pane(existing_pane) = &children[index]
-                        && existing_pane.entity_id() == target_id
-                        && *split_direction == direction
-                    {
-                        children.insert(index + 1, Self::Pane(pane));
-                        return true;
-                    }
-
-                    if children[index].split_pane(target_id, direction, pane.clone()) {
+            Self::Split { children, .. } => {
+                for child in children {
+                    if child.split_pane(target_id, direction, pane.clone()) {
                         return true;
                     }
                 }
@@ -255,6 +244,9 @@ impl SplitNode {
                 div()
                     .size_full()
                     .flex()
+                    .flex_1()
+                    .min_w_0()
+                    .min_h_0()
                     .when(is_row, |div| div.flex_row())
                     .when(!is_row, |div| div.flex_col())
                     .children(elements)
