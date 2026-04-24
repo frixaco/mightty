@@ -1,5 +1,5 @@
 /target
-ghostty
-cmux
-ghostling
-fonts
+/ghostty/
+/cmux/
+/ghostling/
+/fonts/

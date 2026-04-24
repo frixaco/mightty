@@ -182,3 +182,32 @@ Deliverables:
 - Short documentation of the pinned Ghostty commit and Zig version.
 
 Only after this milestone should the GPUI renderer migration begin.
+
+Status:
+
+- Ghostty pinned commit: `b0d359cbbd945f9f3807327526ef79fcaf0477df`.
+- Ghostty commit date: 2026-04-23.
+- Ghostty commit subject: `more zon2nix update for improved 0.16 compatibility (#12405)`.
+- Required Zig version: `0.15.2`, read from `ghostty/build.zig.zon`.
+- `cargo build` status: passing on Windows.
+- `cargo run` smoke status: launches and stays running; the launched `mightty.exe` was stopped after verification.
+- DLL output verified: `target/debug/ghostty-vt.dll` and `target/debug/deps/ghostty-vt.dll`.
+
+## Execution Notes
+
+Completed in this pass:
+
+- Fast-forwarded the local `ghostty` source from `7127abfe285014c62bc1f9b24d4e038af7f94afa` to `b0d359cbbd945f9f3807327526ef79fcaf0477df`.
+- Kept Zig pinned to `0.15.2` via `.mise.toml` and `build.rs` validation.
+- Removed generated `ghostty/zig-pkg` output and confirmed builds no longer leave the nested Ghostty checkout dirty.
+- Updated the Rust wrapper for upstream `ghostty_terminal_set` effects and default color APIs.
+- Routed Ghostty write-PTY responses back to the shell input channel so DSR/OSC/query responses are not silently dropped.
+- Moved default foreground/background/cursor/palette ownership into Ghostty terminal state.
+- Fixed GPUI color construction from `rgba(0xRRGGBB)` to `rgb(0xRRGGBB)` so terminal colors are opaque instead of accidentally using blue as alpha.
+- Tightened `.gitignore` root-only generated directory ignores so `src/ghostty/` is not hidden as ignored source.
+
+Remaining next slice:
+
+- Replace the current render-state cell iterator wrapper with viewport line/style-run APIs.
+- Introduce the custom GPUI terminal surface.
+- Delete `RowSegment`, `RowTextStyle`, absolute-positioned `StyledText` rendering, and bold color hacks after the custom surface is functional.

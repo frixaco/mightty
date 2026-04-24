@@ -140,34 +140,71 @@ pub struct TerminalTheme {
 impl Default for TerminalTheme {
     fn default() -> Self {
         Self {
-            foreground: gpui::rgba(0xc0c0c0),
-            background: gpui::rgba(0x1a1a1a),
-            cursor: gpui::rgba(0xffffff),
-            selection: gpui::rgba(0x3d3d3d),
+            foreground: gpui::rgb(0xc0c0c0),
+            background: gpui::rgb(0x1a1a1a),
+            cursor: gpui::rgb(0xffffff),
+            selection: gpui::rgb(0x3d3d3d),
             palette: [
-                gpui::rgba(0x000000),
-                gpui::rgba(0xcd0000),
-                gpui::rgba(0x00cd00),
-                gpui::rgba(0xcdcd00),
-                gpui::rgba(0x0000ee),
-                gpui::rgba(0xcd00cd),
-                gpui::rgba(0x00cdcd),
-                gpui::rgba(0xe5e5e5),
-                gpui::rgba(0x7f7f7f),
-                gpui::rgba(0xff0000),
-                gpui::rgba(0x00ff00),
-                gpui::rgba(0xffff00),
-                gpui::rgba(0x5c5cff),
-                gpui::rgba(0xff00ff),
-                gpui::rgba(0x00ffff),
-                gpui::rgba(0xffffff),
+                gpui::rgb(0x000000),
+                gpui::rgb(0xcd0000),
+                gpui::rgb(0x00cd00),
+                gpui::rgb(0xcdcd00),
+                gpui::rgb(0x0000ee),
+                gpui::rgb(0xcd00cd),
+                gpui::rgb(0x00cdcd),
+                gpui::rgb(0xe5e5e5),
+                gpui::rgb(0x7f7f7f),
+                gpui::rgb(0xff0000),
+                gpui::rgb(0x00ff00),
+                gpui::rgb(0xffff00),
+                gpui::rgb(0x5c5cff),
+                gpui::rgb(0xff00ff),
+                gpui::rgb(0x00ffff),
+                gpui::rgb(0xffffff),
             ],
         }
     }
 }
 
 fn rgb_to_rgba(rgb: RgbColor) -> gpui::Rgba {
-    gpui::rgba((rgb.r as u32) << 16 | (rgb.g as u32) << 8 | rgb.b as u32)
+    gpui::rgb((rgb.r as u32) << 16 | (rgb.g as u32) << 8 | rgb.b as u32)
+}
+
+fn rgba_to_rgb(rgba: gpui::Rgba) -> RgbColor {
+    RgbColor {
+        r: (rgba.r * 255.0).round().clamp(0.0, 255.0) as u8,
+        g: (rgba.g * 255.0).round().clamp(0.0, 255.0) as u8,
+        b: (rgba.b * 255.0).round().clamp(0.0, 255.0) as u8,
+    }
+}
+
+fn terminal_palette(theme_palette: [gpui::Rgba; 16]) -> [RgbColor; 256] {
+    let mut palette = [RgbColor { r: 0, g: 0, b: 0 }; 256];
+    for (index, color) in theme_palette.into_iter().enumerate() {
+        palette[index] = rgba_to_rgb(color);
+    }
+
+    let levels = [0, 95, 135, 175, 215, 255];
+    let mut index = 16;
+    for r in levels {
+        for g in levels {
+            for b in levels {
+                palette[index] = RgbColor { r, g, b };
+                index += 1;
+            }
+        }
+    }
+
+    for gray_index in 0..24 {
+        let value = 8 + gray_index * 10;
+        palette[232 + gray_index as usize] = RgbColor {
+            r: value,
+            g: value,
+            b: value,
+        };
+    }
+
+    palette
 }
 
 fn rgb_hex(rgb: RgbColor) -> RgbHex {
@@ -442,12 +479,28 @@ fn cell_position(row: u16, col: u16, cell_size: (Pixels, Pixels)) -> (Pixels, Pi
 
 impl TerminalWidget {
     pub fn new(config: TerminalConfig, cx: &mut Context<Self>) -> Self {
-        let terminal = Terminal::new(TerminalOptions {
+        let (output_tx, output_rx) = channel::<OutputData>();
+        let (input_tx, input_rx) = channel::<Vec<u8>>();
+        let (resize_tx, resize_rx) = channel::<(u16, u16)>();
+        let theme = TerminalTheme::default();
+
+        let mut terminal = Terminal::new(TerminalOptions {
             cols: config.initial_cols,
             rows: config.initial_rows,
             max_scrollback: config.scrollback,
         })
         .expect("Failed to create terminal");
+        terminal
+            .set_pty_response_sender(input_tx.clone())
+            .expect("Failed to configure terminal PTY responses");
+        terminal
+            .set_default_colors(
+                rgba_to_rgb(theme.foreground),
+                rgba_to_rgb(theme.background),
+                rgba_to_rgb(theme.cursor),
+                &terminal_palette(theme.palette),
+            )
+            .expect("Failed to configure terminal default colors");
 
         let render_state = RenderState::new().expect("Failed to create render state");
         let row_iterator = RowIterator::new().expect("Failed to create row iterator");
@@ -455,9 +508,6 @@ impl TerminalWidget {
         let key_encoder = Encoder::new().expect("Failed to create key encoder");
         let key_event = Event::new().expect("Failed to create key event");
 
-        let (output_tx, output_rx) = channel::<OutputData>();
-        let (input_tx, input_rx) = channel::<Vec<u8>>();
-        let (resize_tx, resize_rx) = channel::<(u16, u16)>();
         let io_wake = Arc::new((Mutex::new(false), Condvar::new()));
         let shutdown_flag = Arc::new(AtomicBool::new(false));
         let exit_flag = Arc::new(AtomicBool::new(false));
@@ -604,7 +654,7 @@ impl TerminalWidget {
             last_frame_time: None,
             size,
             cell_size: (px(9.6), px(19.2)),
-            theme: TerminalTheme::default(),
+            theme,
             has_exited: false,
         }
     }
@@ -1300,17 +1350,13 @@ impl Render for TerminalWidget {
                         .w(cell_size.0)
                         .h(cell_size.1)
                         .bg(cursor_rgba),
-                    CursorStyle::Line => {
-                        let (cw, ch) = (px(2.0), px(16.0));
-                        let baseline = px(13.5);
-                        div()
-                            .absolute()
-                            .left(x + px(1.0))
-                            .top(y + baseline - ch / 2.0)
-                            .w(cw)
-                            .h(ch)
-                            .bg(cursor_rgba)
-                    }
+                    CursorStyle::Line => div()
+                        .absolute()
+                        .left(x)
+                        .top(y)
+                        .w(px(2.0))
+                        .h(cell_size.1)
+                        .bg(cursor_rgba),
                     CursorStyle::Underline => div()
                         .absolute()
                         .left(x)

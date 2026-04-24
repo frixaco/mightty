@@ -19,13 +19,21 @@ A GPU-powered terminal emulator built for productivity.
 
 **Prerequisites:**
 - [Rust](https://rustup.rs/)
-- [Zig](https://ziglang.org/download/) (0.13.0+)
+- [Zig](https://ziglang.org/download/) 0.15.2
+
+This repo includes a `.mise.toml` pin for Zig:
+
+```bash
+mise install
+```
 
 ```bash
 cargo build --release
 ```
 
-The build script builds and embeds `libghostty-vt` from the local `ghostty/` checkout.
+The build script builds and embeds `libghostty-vt` from the local `ghostty/` checkout. It validates the Zig version before invoking Ghostty's Zig build.
+
+Pinned Ghostty commit: `b0d359cbbd945f9f3807327526ef79fcaf0477df`.
 
 ## Run
 
