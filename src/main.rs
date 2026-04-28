@@ -46,7 +46,6 @@ fn main() {
             },
             |window, cx| {
                 let config = TerminalConfig {
-                    shell: "pwsh.exe".to_string(),
                     initial_rows: 30,
                     initial_cols: 100,
                     scrollback: 10000,

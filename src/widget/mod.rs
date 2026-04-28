@@ -29,7 +29,6 @@ use std::sync::{
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-#[cfg(windows)]
 use crate::shell::{PtyRead, PtySession, PtySize};
 
 /// Cursor style options
@@ -56,7 +55,7 @@ pub struct TerminalConfig {
 impl Default for TerminalConfig {
     fn default() -> Self {
         Self {
-            shell: "pwsh.exe".to_string(),
+            shell: default_shell(),
             initial_rows: 24,
             initial_cols: 80,
             scrollback: 1000,
@@ -65,6 +64,16 @@ impl Default for TerminalConfig {
             blink_interval: Duration::from_millis(500),
         }
     }
+}
+
+#[cfg(windows)]
+fn default_shell() -> String {
+    "pwsh.exe".to_string()
+}
+
+#[cfg(unix)]
+fn default_shell() -> String {
+    std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
 }
 
 type OutputData = Vec<u8>;
@@ -520,7 +529,6 @@ impl TerminalWidget {
         let cols = config.initial_cols;
         let shutdown_thread = Arc::clone(&shutdown_flag);
 
-        #[cfg(windows)]
         let io_thread = Some(std::thread::spawn(move || {
             let mut shell = match PtySession::spawn(&shell_cmd, PtySize::new(rows, cols)) {
                 Ok(s) => s,
@@ -624,12 +632,6 @@ impl TerminalWidget {
                 }
             }
         }));
-
-        #[cfg(not(windows))]
-        let io_thread: Option<JoinHandle<()>> = {
-            exit_flag.store(true, Ordering::Relaxed);
-            None
-        };
 
         let size = (config.initial_cols, config.initial_rows);
 

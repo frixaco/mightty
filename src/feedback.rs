@@ -2,7 +2,7 @@ use gpui::Window;
 use serde::Serialize;
 use std::fs::{self, File};
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug)]

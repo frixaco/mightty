@@ -13,7 +13,14 @@ use crate::widget::TerminalConfig;
 
 actions!(
     terminal,
-    [SplitRight, SplitDown, NewTab, CloseActive, ToggleSidebar]
+    [
+        SplitRight,
+        SplitDown,
+        NewTab,
+        CloseActive,
+        ToggleSidebar,
+        Quit
+    ]
 );
 
 #[derive(Clone, Action, PartialEq, Eq, Deserialize)]
@@ -25,6 +32,7 @@ pub struct SelectTab {
 const WINDOW_BACKGROUND: u32 = 0x000000;
 const WINDOW_HORIZONTAL_PADDING_PX: f32 = 8.0;
 const TITLE_BAR_HEIGHT_PX: f32 = 34.0;
+const MAC_TRAFFIC_LIGHT_SPACER_PX: f32 = 78.0;
 const WINDOW_CONTROL_WIDTH_PX: f32 = 46.0;
 const SIDEBAR_WIDTH_PX: f32 = 160.0;
 const SIDEBAR_GAP_PX: f32 = 8.0;
@@ -71,7 +79,9 @@ impl PaneContainer {
             KeyBinding::new("alt-enter", SplitRight, None),
             KeyBinding::new("alt-shift-enter", SplitDown, None),
             KeyBinding::new("ctrl-t", NewTab, None),
+            KeyBinding::new("cmd-t", NewTab, None),
             KeyBinding::new("ctrl-d", CloseActive, None),
+            KeyBinding::new("cmd-q", Quit, None),
             KeyBinding::new("ctrl-b", ToggleSidebar, None),
             KeyBinding::new("ctrl-1", SelectTab { index: 0 }, None),
             KeyBinding::new("ctrl-2", SelectTab { index: 1 }, None),
@@ -161,6 +171,7 @@ impl PaneContainer {
         }
 
         if self.tabs.len() <= 1 {
+            cx.quit();
             return;
         }
 
@@ -251,6 +262,10 @@ impl PaneContainer {
     fn on_select_tab(&mut self, action: &SelectTab, _window: &mut Window, cx: &mut Context<Self>) {
         self.activate_tab(action.index, cx);
     }
+
+    fn on_quit(&mut self, _action: &Quit, _window: &mut Window, cx: &mut Context<Self>) {
+        cx.quit();
+    }
 }
 
 pub fn shortcut_action(keystroke: &gpui::Keystroke) -> Option<Box<dyn gpui::Action>> {
@@ -262,6 +277,14 @@ pub fn shortcut_action(keystroke: &gpui::Keystroke) -> Option<Box<dyn gpui::Acti
             Some(Box::new(SplitDown))
         } else {
             Some(Box::new(SplitRight))
+        };
+    }
+
+    if modifiers.platform && !modifiers.control && !modifiers.alt && !modifiers.shift {
+        return match key {
+            "t" => Some(Box::new(NewTab)),
+            "q" => Some(Box::new(Quit)),
+            _ => None,
         };
     }
 
@@ -406,12 +429,6 @@ impl Render for PaneContainer {
             self.focus_active_tab(window, cx);
         }
 
-        let maximize_button = if window.is_maximized() {
-            WindowsCaptionButton::Restore
-        } else {
-            WindowsCaptionButton::Maximize
-        };
-
         div()
             .size_full()
             .flex()
@@ -423,40 +440,8 @@ impl Render for PaneContainer {
             .on_action(cx.listener(Self::on_close_active))
             .on_action(cx.listener(Self::on_toggle_sidebar))
             .on_action(cx.listener(Self::on_select_tab))
-            .child(
-                div()
-                    .h(px(TITLE_BAR_HEIGHT_PX))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .bg(gpui::rgb(WINDOW_BACKGROUND))
-                    .child(
-                        div()
-                            .id("titlebar-drag")
-                            .h_full()
-                            .flex_1()
-                            .window_control_area(WindowControlArea::Drag)
-                            .on_double_click(|_, window, _| window.zoom_window()),
-                    )
-                    .child(window_control_button(
-                        "minimize",
-                        WindowControlArea::Min,
-                        WindowsCaptionButton::Minimize,
-                        false,
-                    ))
-                    .child(window_control_button(
-                        "maximize",
-                        WindowControlArea::Max,
-                        maximize_button,
-                        false,
-                    ))
-                    .child(window_control_button(
-                        "close",
-                        WindowControlArea::Close,
-                        WindowsCaptionButton::Close,
-                        true,
-                    )),
-            )
+            .on_action(cx.listener(Self::on_quit))
+            .child(render_titlebar(window))
             .child(
                 div()
                     .flex_1()
@@ -477,6 +462,70 @@ impl Render for PaneContainer {
                     ),
             )
     }
+}
+
+fn render_titlebar(window: &mut Window) -> impl IntoElement {
+    let maximize_button = if window.is_maximized() {
+        WindowsCaptionButton::Restore
+    } else {
+        WindowsCaptionButton::Maximize
+    };
+
+    div()
+        .h(px(TITLE_BAR_HEIGHT_PX))
+        .flex()
+        .flex_row()
+        .items_center()
+        .bg(gpui::rgb(WINDOW_BACKGROUND))
+        .when(cfg!(target_os = "macos"), |titlebar| {
+            titlebar
+                .child(
+                    div()
+                        .id("mac-traffic-light-space")
+                        .h_full()
+                        .w(px(MAC_TRAFFIC_LIGHT_SPACER_PX))
+                        .flex_shrink_0()
+                        .window_control_area(WindowControlArea::Drag)
+                        .on_double_click(|_, window, _| window.titlebar_double_click()),
+                )
+                .child(
+                    div()
+                        .id("titlebar-drag")
+                        .h_full()
+                        .flex_1()
+                        .window_control_area(WindowControlArea::Drag)
+                        .on_double_click(|_, window, _| window.titlebar_double_click()),
+                )
+        })
+        .when(!cfg!(target_os = "macos"), |titlebar| {
+            titlebar
+                .child(
+                    div()
+                        .id("titlebar-drag")
+                        .h_full()
+                        .flex_1()
+                        .window_control_area(WindowControlArea::Drag)
+                        .on_double_click(|_, window, _| window.zoom_window()),
+                )
+                .child(window_control_button(
+                    "minimize",
+                    WindowControlArea::Min,
+                    WindowsCaptionButton::Minimize,
+                    false,
+                ))
+                .child(window_control_button(
+                    "maximize",
+                    WindowControlArea::Max,
+                    maximize_button,
+                    false,
+                ))
+                .child(window_control_button(
+                    "close",
+                    WindowControlArea::Close,
+                    WindowsCaptionButton::Close,
+                    true,
+                ))
+        })
 }
 
 impl PaneContainer {
@@ -543,5 +592,23 @@ impl PaneContainer {
                             .child(title),
                     )
             }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn shortcut_name(keystroke: &str) -> Option<&'static str> {
+        let keystroke = gpui::Keystroke::parse(keystroke).expect("parse keystroke");
+        shortcut_action(&keystroke).map(|action| action.name())
+    }
+
+    #[test]
+    fn app_shortcuts_include_platform_tab_and_quit() {
+        assert_eq!(shortcut_name("ctrl-t"), Some(NewTab.name()));
+        assert_eq!(shortcut_name("cmd-t"), Some(NewTab.name()));
+        assert_eq!(shortcut_name("cmd-q"), Some(Quit.name()));
+        assert_eq!(shortcut_name("ctrl-d"), Some(CloseActive.name()));
     }
 }

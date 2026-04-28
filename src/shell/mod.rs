@@ -2,7 +2,7 @@
 //!
 //! Manages pseudo-terminal connection between UI and shell processes.
 //! On Windows: Uses ConPTY API (Windows 10 1809+)
-//! On Unix: Stub implementation (PTY support not yet implemented)
+//! On Unix: Uses forkpty-backed pseudo-terminal sessions.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PtySize {
@@ -38,13 +38,16 @@ pub type ConPtyError = PtyError;
 #[cfg(windows)]
 pub type ConPtyShell = PtySession;
 
-#[cfg(not(windows))]
+#[cfg(unix)]
 mod unix;
-#[cfg(not(windows))]
+#[cfg(unix)]
 pub use unix::PtyError;
-#[cfg(not(windows))]
+#[cfg(unix)]
 pub use unix::PtySession;
-#[cfg(not(windows))]
+#[cfg(unix)]
 pub type ConPtyError = PtyError;
-#[cfg(not(windows))]
+#[cfg(unix)]
 pub type ConPtyShell = PtySession;
+
+#[cfg(not(any(windows, unix)))]
+compile_error!("mightty shell bridge supports Windows and Unix targets only");
