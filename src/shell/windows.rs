@@ -1,7 +1,8 @@
 //! ConPTY shell bridge.
 //!
 //! Manages pseudo-terminal connection between UI and shell processes on Windows.
-//! Uses Windows ConPTY API (available on Windows 10 1809+).
+//! Uses synchronous ConPTY pipes serviced by separate input/control and output
+//! threads.
 
 use std::alloc::{Layout, alloc, dealloc};
 use std::ffi::{OsStr, c_void};
@@ -46,15 +47,6 @@ unsafe extern "system" {
         lpNumberOfBytesWritten: *mut c_uint,
         lpOverlapped: *mut c_void,
     ) -> i32;
-
-    fn PeekNamedPipe(
-        hNamedPipe: HANDLE,
-        lpBuffer: *mut c_void,
-        nBufferSize: c_uint,
-        lpBytesRead: *mut c_uint,
-        lpTotalBytesAvail: *mut c_uint,
-        lpBytesLeftThisMessage: *mut c_uint,
-    ) -> i32;
 }
 
 #[derive(Debug)]
@@ -68,6 +60,7 @@ pub enum PtyError {
     ProcessWaitFailed(u32),
     InvalidDimensions,
     ZeroLengthWrite,
+    AlreadySplit,
 }
 
 impl PtyError {
@@ -98,6 +91,7 @@ impl std::fmt::Display for PtyError {
             }
             Self::InvalidDimensions => write!(f, "invalid terminal dimensions"),
             Self::ZeroLengthWrite => write!(f, "write made no progress"),
+            Self::AlreadySplit => write!(f, "PTY session handles were already split"),
         }
     }
 }
@@ -118,12 +112,36 @@ impl From<io::Error> for PtyError {
 }
 
 pub struct PtySession {
+    input: Option<PtyInput>,
+    output: Option<PtyOutput>,
+    control: Option<PtyControl>,
+}
+
+pub struct PtyParts {
+    pub input: PtyInput,
+    pub output: PtyOutput,
+    pub control: PtyControl,
+}
+
+pub struct PtyInput {
+    handle: HANDLE,
+}
+
+pub struct PtyOutput {
+    handle: HANDLE,
+}
+
+pub struct PtyControl {
     pty_handle: HPCON,
     process_handle: HANDLE,
-    input_pipe: HANDLE,
-    output_pipe: HANDLE,
     shutdown_called: bool,
 }
+
+// The split handle wrappers have unique ownership of their Windows handles and
+// close them in Drop. Moving that ownership to a dedicated I/O thread is safe.
+unsafe impl Send for PtyInput {}
+unsafe impl Send for PtyOutput {}
+unsafe impl Send for PtyControl {}
 
 impl PtySession {
     /// Spawn a new shell process with the specified dimensions.
@@ -185,136 +203,73 @@ impl PtySession {
             CloseHandle(pty_output_write);
 
             Ok(Self {
-                pty_handle,
-                process_handle,
-                input_pipe: pty_input_write,
-                output_pipe: pty_output_read,
-                shutdown_called: false,
+                input: Some(PtyInput {
+                    handle: pty_input_write,
+                }),
+                output: Some(PtyOutput {
+                    handle: pty_output_read,
+                }),
+                control: Some(PtyControl {
+                    pty_handle,
+                    process_handle,
+                    shutdown_called: false,
+                }),
             })
         }
     }
 
-    pub fn try_read(&mut self, buf: &mut [u8]) -> Result<PtyRead, PtyError> {
-        if buf.is_empty() {
-            return Ok(PtyRead::WouldBlock);
-        }
+    pub fn split(mut self) -> Result<PtyParts, PtyError> {
+        Ok(PtyParts {
+            input: self.input.take().ok_or(PtyError::AlreadySplit)?,
+            output: self.output.take().ok_or(PtyError::AlreadySplit)?,
+            control: self.control.take().ok_or(PtyError::AlreadySplit)?,
+        })
+    }
 
-        let Some(bytes_available) = self.bytes_available()? else {
-            return Ok(PtyRead::Eof);
-        };
-
-        if bytes_available == 0 {
-            return if self.has_exited()? {
-                Ok(PtyRead::Eof)
-            } else {
-                Ok(PtyRead::WouldBlock)
-            };
-        }
-
-        let bytes_to_read = bytes_available.min(buf.len() as u32);
-        unsafe {
-            let mut bytes_read = 0u32;
-            let result = ReadFile(
-                self.output_pipe,
-                buf.as_mut_ptr(),
-                bytes_to_read,
-                &mut bytes_read,
-                null_mut(),
-            );
-
-            if result == 0 {
-                let error = io::Error::last_os_error();
-                if error.kind() == io::ErrorKind::BrokenPipe {
-                    return Ok(PtyRead::Eof);
-                }
-                return Err(PtyError::from_io("read from ConPTY output pipe", error));
-            }
-
-            if bytes_read == 0 {
-                Ok(PtyRead::Eof)
-            } else {
-                Ok(PtyRead::Data(bytes_read as usize))
-            }
-        }
+    pub fn read(&mut self, buf: &mut [u8]) -> Result<PtyRead, PtyError> {
+        self.output
+            .as_mut()
+            .ok_or(PtyError::AlreadySplit)?
+            .read(buf)
     }
 
     pub fn write(&mut self, data: &[u8]) -> Result<(), PtyError> {
-        let mut written_total = 0usize;
-
-        while written_total < data.len() {
-            let remaining = &data[written_total..];
-            let bytes_to_write = remaining.len().min(u32::MAX as usize) as u32;
-
-            unsafe {
-                let mut bytes_written = 0u32;
-                let result = WriteFile(
-                    self.input_pipe,
-                    remaining.as_ptr(),
-                    bytes_to_write,
-                    &mut bytes_written,
-                    null_mut(),
-                );
-
-                if result == 0 {
-                    return Err(PtyError::io("write to ConPTY input pipe"));
-                }
-
-                if bytes_written == 0 {
-                    return Err(PtyError::ZeroLengthWrite);
-                }
-
-                written_total += bytes_written as usize;
-            }
-        }
-
-        Ok(())
+        self.input
+            .as_mut()
+            .ok_or(PtyError::AlreadySplit)?
+            .write_all(data)
     }
 
     pub fn resize(&mut self, size: PtySize) -> Result<(), PtyError> {
-        if !size.is_valid() {
-            return Err(PtyError::InvalidDimensions);
-        }
-
-        unsafe {
-            let result = ResizePseudoConsole(self.pty_handle, size_to_coord(size));
-            if result != S_OK {
-                return Err(PtyError::io("resize pseudoconsole"));
-            }
-
-            Ok(())
-        }
+        self.control
+            .as_mut()
+            .ok_or(PtyError::AlreadySplit)?
+            .resize(size)
     }
 
     pub fn has_exited(&self) -> Result<bool, PtyError> {
-        if self.process_handle == INVALID_HANDLE_VALUE {
-            return Ok(true);
-        }
-
-        match unsafe { WaitForSingleObject(self.process_handle, 0) } {
-            WAIT_OBJECT_0 => Ok(true),
-            WAIT_TIMEOUT => Ok(false),
-            WAIT_FAILED => Err(PtyError::io("wait for process")),
-            status => Err(PtyError::ProcessWaitFailed(status)),
-        }
+        self.control
+            .as_ref()
+            .ok_or(PtyError::AlreadySplit)?
+            .has_exited()
     }
 
     pub fn exit_code(&self) -> Result<Option<u32>, PtyError> {
-        if !self.has_exited()? {
-            return Ok(None);
-        }
-
-        let mut exit_code = 0u32;
-        let result = unsafe { GetExitCodeProcess(self.process_handle, &mut exit_code) };
-        if result == 0 {
-            return Err(PtyError::io("get process exit code"));
-        }
-
-        Ok(Some(exit_code))
+        self.control
+            .as_ref()
+            .ok_or(PtyError::AlreadySplit)?
+            .exit_code()
     }
 
     pub fn shutdown(mut self) -> Result<(), PtyError> {
-        self.shutdown_called = true;
-        self.close_handles(true)
+        drop(self.input.take());
+        let result = self
+            .control
+            .as_mut()
+            .ok_or(PtyError::AlreadySplit)?
+            .shutdown();
+        drop(self.output.take());
+        result
     }
 
     pub fn is_conpty_available() -> bool {
@@ -354,30 +309,6 @@ impl PtySession {
             }
 
             false
-        }
-    }
-
-    fn bytes_available(&self) -> Result<Option<u32>, PtyError> {
-        unsafe {
-            let mut bytes_available: u32 = 0;
-            let result = PeekNamedPipe(
-                self.output_pipe,
-                null_mut(),
-                0,
-                null_mut(),
-                &mut bytes_available,
-                null_mut(),
-            );
-
-            if result == 0 {
-                let error = io::Error::last_os_error();
-                if error.kind() == io::ErrorKind::BrokenPipe {
-                    return Ok(None);
-                }
-                return Err(PtyError::from_io("peek ConPTY output pipe", error));
-            }
-
-            Ok(Some(bytes_available))
         }
     }
 
@@ -501,16 +432,143 @@ impl PtySession {
 
         Ok(process_info.hProcess)
     }
+}
+
+impl PtyInput {
+    pub fn write_all(&mut self, data: &[u8]) -> Result<(), PtyError> {
+        let mut written_total = 0usize;
+
+        while written_total < data.len() {
+            let remaining = &data[written_total..];
+            let bytes_to_write = remaining.len().min(u32::MAX as usize) as u32;
+
+            unsafe {
+                let mut bytes_written = 0u32;
+                let result = WriteFile(
+                    self.handle,
+                    remaining.as_ptr(),
+                    bytes_to_write,
+                    &mut bytes_written,
+                    null_mut(),
+                );
+
+                if result == 0 {
+                    return Err(PtyError::io("write to ConPTY input pipe"));
+                }
+
+                if bytes_written == 0 {
+                    return Err(PtyError::ZeroLengthWrite);
+                }
+
+                written_total += bytes_written as usize;
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl Drop for PtyInput {
+    fn drop(&mut self) {
+        close_handle(&mut self.handle);
+    }
+}
+
+impl PtyOutput {
+    pub fn read(&mut self, buf: &mut [u8]) -> Result<PtyRead, PtyError> {
+        if buf.is_empty() {
+            return Ok(PtyRead::Data(0));
+        }
+
+        let bytes_to_read = buf.len().min(u32::MAX as usize) as u32;
+        unsafe {
+            let mut bytes_read = 0u32;
+            let result = ReadFile(
+                self.handle,
+                buf.as_mut_ptr(),
+                bytes_to_read,
+                &mut bytes_read,
+                null_mut(),
+            );
+
+            if result == 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::BrokenPipe {
+                    return Ok(PtyRead::Eof);
+                }
+                return Err(PtyError::from_io("read from ConPTY output pipe", error));
+            }
+
+            if bytes_read == 0 {
+                Ok(PtyRead::Eof)
+            } else {
+                Ok(PtyRead::Data(bytes_read as usize))
+            }
+        }
+    }
+}
+
+impl Drop for PtyOutput {
+    fn drop(&mut self) {
+        close_handle(&mut self.handle);
+    }
+}
+
+impl PtyControl {
+    pub fn resize(&mut self, size: PtySize) -> Result<(), PtyError> {
+        if !size.is_valid() {
+            return Err(PtyError::InvalidDimensions);
+        }
+
+        unsafe {
+            let result = ResizePseudoConsole(self.pty_handle, size_to_coord(size));
+            if result != S_OK {
+                return Err(PtyError::io("resize pseudoconsole"));
+            }
+
+            Ok(())
+        }
+    }
+
+    pub fn has_exited(&self) -> Result<bool, PtyError> {
+        if self.process_handle == INVALID_HANDLE_VALUE {
+            return Ok(true);
+        }
+
+        match unsafe { WaitForSingleObject(self.process_handle, 0) } {
+            WAIT_OBJECT_0 => Ok(true),
+            WAIT_TIMEOUT => Ok(false),
+            WAIT_FAILED => Err(PtyError::io("wait for process")),
+            status => Err(PtyError::ProcessWaitFailed(status)),
+        }
+    }
+
+    pub fn exit_code(&self) -> Result<Option<u32>, PtyError> {
+        if !self.has_exited()? {
+            return Ok(None);
+        }
+
+        let mut exit_code = 0u32;
+        let result = unsafe { GetExitCodeProcess(self.process_handle, &mut exit_code) };
+        if result == 0 {
+            return Err(PtyError::io("get process exit code"));
+        }
+
+        Ok(Some(exit_code))
+    }
+
+    pub fn shutdown(&mut self) -> Result<(), PtyError> {
+        self.shutdown_called = true;
+        self.close_handles(true)
+    }
 
     fn close_handles(&mut self, allow_graceful_wait: bool) -> Result<(), PtyError> {
         let mut first_error = None;
 
         unsafe {
-            if self.input_pipe != INVALID_HANDLE_VALUE {
-                if CloseHandle(self.input_pipe) == 0 {
-                    first_error.get_or_insert_with(|| PtyError::io("close ConPTY input pipe"));
-                }
-                self.input_pipe = INVALID_HANDLE_VALUE;
+            if self.pty_handle != 0 {
+                ClosePseudoConsole(self.pty_handle);
+                self.pty_handle = 0;
             }
 
             if self.process_handle != INVALID_HANDLE_VALUE {
@@ -547,18 +605,6 @@ impl PtySession {
                 }
                 self.process_handle = INVALID_HANDLE_VALUE;
             }
-
-            if self.pty_handle != 0 {
-                ClosePseudoConsole(self.pty_handle);
-                self.pty_handle = 0;
-            }
-
-            if self.output_pipe != INVALID_HANDLE_VALUE {
-                if CloseHandle(self.output_pipe) == 0 {
-                    first_error.get_or_insert_with(|| PtyError::io("close ConPTY output pipe"));
-                }
-                self.output_pipe = INVALID_HANDLE_VALUE;
-            }
         }
 
         if let Some(err) = first_error {
@@ -569,13 +615,22 @@ impl PtySession {
     }
 }
 
-impl Drop for PtySession {
+impl Drop for PtyControl {
     fn drop(&mut self) {
         if self.shutdown_called {
             return;
         }
 
         let _ = self.close_handles(false);
+    }
+}
+
+fn close_handle(handle: &mut HANDLE) {
+    if *handle != INVALID_HANDLE_VALUE {
+        unsafe {
+            CloseHandle(*handle);
+        }
+        *handle = INVALID_HANDLE_VALUE;
     }
 }
 
@@ -604,6 +659,8 @@ fn application_name(command: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc;
+    use std::thread;
     use std::time::{Duration, Instant};
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(3);
@@ -613,29 +670,42 @@ mod tests {
             .expect("spawn cmd.exe")
     }
 
-    fn wait_for_output(shell: &mut PtySession, marker: &str) -> String {
-        let deadline = Instant::now() + TEST_TIMEOUT;
-        let mut output = Vec::new();
-        let mut buf = [0u8; 4096];
-
-        while Instant::now() < deadline {
-            match shell.try_read(&mut buf).expect("read from pty") {
-                PtyRead::Data(n) => {
-                    output.extend_from_slice(&buf[..n]);
-                    let text = String::from_utf8_lossy(&output);
-                    if text.contains(marker) {
-                        return text.into_owned();
+    fn read_until(mut output: PtyOutput, marker: &'static str) -> mpsc::Receiver<String> {
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let mut text = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                match output.read(&mut buf) {
+                    Ok(PtyRead::Data(0)) => {}
+                    Ok(PtyRead::Data(n)) => {
+                        text.extend_from_slice(&buf[..n]);
+                        let decoded = String::from_utf8_lossy(&text);
+                        if decoded.contains(marker) {
+                            let _ = tx.send(decoded.into_owned());
+                            return;
+                        }
+                    }
+                    Ok(PtyRead::Eof) | Err(_) => {
+                        let _ = tx.send(String::from_utf8_lossy(&text).into_owned());
+                        return;
                     }
                 }
-                PtyRead::WouldBlock => std::thread::sleep(Duration::from_millis(10)),
-                PtyRead::Eof => break,
             }
-        }
+        });
 
-        panic!(
-            "timed out waiting for marker {marker:?}; output was {:?}",
-            String::from_utf8_lossy(&output)
+        rx
+    }
+
+    fn assert_marker(rx: mpsc::Receiver<String>, marker: &str) -> String {
+        let output = rx
+            .recv_timeout(TEST_TIMEOUT)
+            .unwrap_or_else(|_| panic!("timed out waiting for marker {marker:?}"));
+        assert!(
+            output.contains(marker),
+            "expected marker {marker:?}; output was {output:?}"
         );
+        output
     }
 
     #[test]
@@ -655,15 +725,60 @@ mod tests {
 
     #[test]
     fn reads_command_output() {
-        let mut shell = spawn_test_cmd();
-        shell
-            .write(b"echo mightty-ready\r\n")
+        let PtyParts {
+            mut input,
+            output,
+            mut control,
+        } = spawn_test_cmd().split().expect("split session");
+        let output_rx = read_until(output, "mightty-ready");
+
+        input
+            .write_all(b"echo mightty-ready\r\n")
             .expect("write command");
+        assert_marker(output_rx, "mightty-ready");
 
-        let output = wait_for_output(&mut shell, "mightty-ready");
-        assert!(output.contains("mightty-ready"));
+        control.shutdown().expect("shutdown shell");
+    }
 
-        shell.shutdown().expect("shutdown shell");
+    #[test]
+    fn reads_input_written_after_idle_without_polling() {
+        let PtyParts {
+            mut input,
+            output,
+            mut control,
+        } = spawn_test_cmd().split().expect("split session");
+        let output_rx = read_until(output, "mightty-idle-ready");
+
+        thread::sleep(Duration::from_millis(80));
+        input
+            .write_all(b"echo mightty-idle-ready\r\n")
+            .expect("write command after idle");
+        assert_marker(output_rx, "mightty-idle-ready");
+
+        control.shutdown().expect("shutdown shell");
+    }
+
+    #[test]
+    fn reads_large_output_in_order() {
+        let PtyParts {
+            mut input,
+            output,
+            mut control,
+        } = spawn_test_cmd().split().expect("split session");
+        let output_rx = read_until(output, "mightty-high-done");
+
+        input
+            .write_all(
+                b"for /l %i in (1,1,5000) do @echo mightty-line-%i\r\necho mightty-high-done\r\n",
+            )
+            .expect("write high-output command");
+        let output = assert_marker(output_rx, "mightty-high-done");
+        let first = output.find("mightty-line-1").expect("line 1");
+        let last = output.find("mightty-line-5000").expect("line 5000");
+        let done = output.find("mightty-high-done").expect("done marker");
+        assert!(first < last && last < done);
+
+        control.shutdown().expect("shutdown shell");
     }
 
     #[test]
@@ -672,18 +787,11 @@ mod tests {
         shell.write(b"exit\r\n").expect("write exit");
 
         let deadline = Instant::now() + TEST_TIMEOUT;
-        let mut buf = [0u8; 1024];
         while Instant::now() < deadline {
             if shell.has_exited().expect("check process exit") {
                 return;
             }
-
-            match shell.try_read(&mut buf).expect("read from pty") {
-                PtyRead::Data(_) | PtyRead::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                PtyRead::Eof => return,
-            }
+            thread::sleep(Duration::from_millis(10));
         }
 
         panic!("timed out waiting for process exit");

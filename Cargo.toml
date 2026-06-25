@@ -14,6 +14,7 @@ path = "src/main.rs"
 [dependencies]
 gpui = "0.2"
 gpui-component = "0.5"
+flume = "0.11"
 image = { version = "0.25", default-features = false, features = ["png"] }
 libghostty-vt = { version = "0.2.0", default-features = false }
 raw-window-handle = "0.6"

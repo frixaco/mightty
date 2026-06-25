@@ -18,18 +18,19 @@ use crate::pane_container::shortcut_action;
 use gpui::{
     Context, FocusHandle, FontFallbacks, FontFeatures, FontStyle, FontWeight, InteractiveElement,
     IntoElement, KeyDownEvent, KeyUpEvent, MouseButton, MouseDownEvent, Pixels, Render, Size,
-    StrikethroughStyle, Styled, StyledText, TextRun, TextStyle, UnderlineStyle, WhiteSpace, Window,
-    canvas, div, prelude::*, px,
+    StrikethroughStyle, Styled, StyledText, Task, TextRun, TextStyle, Timer, UnderlineStyle,
+    WhiteSpace, Window, canvas, div, prelude::*, px,
 };
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
-    mpsc::{Receiver, Sender, channel},
 };
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use crate::shell::{PtyRead, PtySession, PtySize};
+use crate::shell::PtySize;
+#[cfg(windows)]
+use crate::shell::{PtyRead, PtySession};
 
 /// Cursor style options
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -55,7 +56,7 @@ pub struct TerminalConfig {
 impl Default for TerminalConfig {
     fn default() -> Self {
         Self {
-            shell: default_shell(),
+            shell: "pwsh.exe".to_string(),
             initial_rows: 24,
             initial_cols: 80,
             scrollback: 1000,
@@ -66,24 +67,12 @@ impl Default for TerminalConfig {
     }
 }
 
-#[cfg(windows)]
-fn default_shell() -> String {
-    "pwsh.exe".to_string()
-}
-
-#[cfg(unix)]
-fn default_shell() -> String {
-    std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
-}
-
-type OutputData = Vec<u8>;
-
 const TERMINAL_FONT_FAMILY: &str = "JetBrainsMono Nerd Font Mono";
 const TERMINAL_FONT_SIZE_PX: f32 = 16.0;
 const FEEDBACK_CAPTURE_KEY: &str = "f12";
-const IO_BUFFER_CAPACITY: usize = 64 * 1024;
-const IO_BATCH_THRESHOLD: usize = 16 * 1024;
-const IO_IDLE_SLEEP: Duration = Duration::from_millis(8);
+const PTY_READ_BUFFER_SIZE: usize = 32 * 1024;
+const PTY_OUTPUT_QUEUE_CAPACITY: usize = 64;
+const PTY_OUTPUT_DRAIN_BUDGET: usize = 256 * 1024;
 
 fn terminal_font_features() -> FontFeatures {
     FontFeatures(Arc::new(vec![
@@ -123,16 +112,13 @@ pub struct TerminalWidget {
     row_iterator: RowIterator<'static>,
     cell_iterator: CellIterator<'static>,
     config: TerminalConfig,
-    output_rx: Receiver<OutputData>,
-    input_tx: Option<Sender<Vec<u8>>>,
-    resize_tx: Option<Sender<(u16, u16)>>,
-    shutdown_flag: Arc<AtomicBool>,
+    pty_tx: Option<flume::Sender<PtyCommand>>,
     exit_flag: Arc<AtomicBool>,
-    io_thread: Option<JoinHandle<()>>,
+    pty_worker: Option<PtyWorker>,
+    output_task: Task<()>,
+    cursor_blink_task: Task<()>,
     focus_handle: FocusHandle,
     cursor_blink_phase: bool,
-    blink_accumulator: Duration,
-    last_frame_time: Option<Instant>,
     size: (u16, u16),
     layout_size: Option<Size<Pixels>>,
     cell_size: (Pixels, Pixels),
@@ -285,6 +271,122 @@ impl RowSegment {
             text,
             style,
         }
+    }
+}
+
+enum PtyCommand {
+    Write(Vec<u8>),
+    Resize(PtySize),
+    Shutdown,
+}
+
+enum PtyEvent {
+    Output(Vec<u8>),
+    Exited,
+}
+
+#[cfg(windows)]
+struct PtyWorker {
+    command_tx: flume::Sender<PtyCommand>,
+    control_thread: Option<JoinHandle<()>>,
+    reader_thread: Option<JoinHandle<()>>,
+}
+
+#[cfg(not(windows))]
+struct PtyWorker;
+
+#[cfg(windows)]
+impl PtyWorker {
+    fn spawn(
+        shell_cmd: String,
+        rows: u16,
+        cols: u16,
+        exit_flag: Arc<AtomicBool>,
+    ) -> Result<(Self, flume::Receiver<PtyEvent>), crate::shell::PtyError> {
+        let session = PtySession::spawn(&shell_cmd, PtySize::new(rows, cols))?;
+        let parts = session.split()?;
+        let (command_tx, command_rx) = flume::unbounded::<PtyCommand>();
+        let (event_tx, event_rx) = flume::bounded::<PtyEvent>(PTY_OUTPUT_QUEUE_CAPACITY);
+
+        let mut input = parts.input;
+        let mut control = parts.control;
+        let control_exit_flag = Arc::clone(&exit_flag);
+        let control_event_tx = event_tx.clone();
+        let control_thread = std::thread::spawn(move || {
+            while let Ok(command) = command_rx.recv() {
+                let result = match command {
+                    PtyCommand::Write(data) => input.write_all(&data),
+                    PtyCommand::Resize(size) => control.resize(size),
+                    PtyCommand::Shutdown => break,
+                };
+
+                if let Err(err) = result {
+                    eprintln!("ConPTY command failed: {err}");
+                    control_exit_flag.store(true, Ordering::Relaxed);
+                    let _ = control_event_tx.try_send(PtyEvent::Exited);
+                    break;
+                }
+            }
+
+            let _ = control.shutdown();
+        });
+
+        let mut output = parts.output;
+        let reader_exit_flag = Arc::clone(&exit_flag);
+        let reader_thread = std::thread::spawn(move || {
+            let mut buf = [0u8; PTY_READ_BUFFER_SIZE];
+
+            loop {
+                match output.read(&mut buf) {
+                    Ok(PtyRead::Data(0)) => {}
+                    Ok(PtyRead::Data(n)) => {
+                        if event_tx.send(PtyEvent::Output(buf[..n].to_vec())).is_err() {
+                            break;
+                        }
+                    }
+                    Ok(PtyRead::Eof) => break,
+                    Err(err) => {
+                        eprintln!("ConPTY output read failed: {err}");
+                        break;
+                    }
+                }
+            }
+
+            reader_exit_flag.store(true, Ordering::Relaxed);
+            let _ = event_tx.try_send(PtyEvent::Exited);
+        });
+
+        Ok((
+            Self {
+                command_tx,
+                control_thread: Some(control_thread),
+                reader_thread: Some(reader_thread),
+            },
+            event_rx,
+        ))
+    }
+
+    fn command_tx(&self) -> flume::Sender<PtyCommand> {
+        self.command_tx.clone()
+    }
+
+    fn shutdown(&mut self) {
+        let _ = self.command_tx.send(PtyCommand::Shutdown);
+
+        if let Some(handle) = self.control_thread.take() {
+            let _ = handle.join();
+        }
+
+        if let Some(handle) = self.reader_thread.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for PtyWorker {
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        self.shutdown();
     }
 }
 
@@ -514,12 +616,17 @@ fn cell_position(row: u16, col: u16, cell_size: (Pixels, Pixels)) -> (Pixels, Pi
     (cell_size.0 * col as f32, cell_size.1 * row as f32)
 }
 
+fn pty_event_len(event: &PtyEvent) -> usize {
+    match event {
+        PtyEvent::Output(data) => data.len(),
+        PtyEvent::Exited => 0,
+    }
+}
+
 impl TerminalWidget {
     pub fn new(config: TerminalConfig, cx: &mut Context<Self>) -> Self {
-        let (output_tx, output_rx) = channel::<OutputData>();
-        let (input_tx, input_rx) = channel::<Vec<u8>>();
-        let (resize_tx, resize_rx) = channel::<(u16, u16)>();
         let theme = TerminalTheme::default();
+        let exit_flag = Arc::new(AtomicBool::new(false));
 
         let mut terminal = Terminal::new(TerminalOptions {
             cols: config.initial_cols,
@@ -527,10 +634,39 @@ impl TerminalWidget {
             max_scrollback: config.scrollback,
         })
         .expect("Failed to create terminal");
-        let pty_response_tx = input_tx.clone();
+
+        #[cfg(windows)]
+        let (pty_worker, pty_event_rx, pty_tx) = {
+            match PtyWorker::spawn(
+                config.shell.clone(),
+                config.initial_rows,
+                config.initial_cols,
+                Arc::clone(&exit_flag),
+            ) {
+                Ok((worker, event_rx)) => {
+                    let command_tx = worker.command_tx();
+                    (Some(worker), Some(event_rx), Some(command_tx))
+                }
+                Err(err) => {
+                    eprintln!("Failed to spawn shell: {err}");
+                    exit_flag.store(true, Ordering::Relaxed);
+                    (None, None, None)
+                }
+            }
+        };
+
+        #[cfg(not(windows))]
+        let (pty_worker, pty_event_rx, pty_tx) = {
+            exit_flag.store(true, Ordering::Relaxed);
+            (None, None, None)
+        };
+
+        let pty_response_tx = pty_tx.clone();
         terminal
             .on_pty_write(move |_terminal, data| {
-                let _ = pty_response_tx.send(data.to_vec());
+                if let Some(tx) = &pty_response_tx {
+                    let _ = tx.send(PtyCommand::Write(data.to_vec()));
+                }
             })
             .expect("Failed to configure terminal PTY responses");
         terminal
@@ -548,122 +684,9 @@ impl TerminalWidget {
         let key_encoder = Encoder::new().expect("Failed to create key encoder");
         let key_event = Event::new().expect("Failed to create key event");
 
-        let shutdown_flag = Arc::new(AtomicBool::new(false));
-        let exit_flag = Arc::new(AtomicBool::new(false));
-        let exit_flag_thread = Arc::clone(&exit_flag);
-
-        let shell_cmd = config.shell.clone();
-        let rows = config.initial_rows;
-        let cols = config.initial_cols;
-        let shutdown_thread = Arc::clone(&shutdown_flag);
-
-        let io_thread = Some(std::thread::spawn(move || {
-            let mut shell = match PtySession::spawn(&shell_cmd, PtySize::new(rows, cols)) {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("Failed to spawn shell: {}", e);
-                    exit_flag_thread.store(true, Ordering::Relaxed);
-                    return;
-                }
-            };
-
-            let mut buf = [0u8; 32768];
-            let mut output_buffer: Vec<u8> = Vec::with_capacity(IO_BUFFER_CAPACITY);
-
-            loop {
-                if shutdown_thread.load(Ordering::Relaxed) {
-                    if !output_buffer.is_empty() {
-                        let _ = output_tx.send(std::mem::take(&mut output_buffer));
-                    }
-                    let _ = shell.shutdown();
-                    return;
-                }
-
-                let mut did_work = false;
-
-                loop {
-                    match input_rx.try_recv() {
-                        Ok(data) => {
-                            did_work = true;
-                            if shell.write(&data).is_err() {
-                                exit_flag_thread.store(true, Ordering::Relaxed);
-                                return;
-                            }
-                        }
-                        Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                            exit_flag_thread.store(true, Ordering::Relaxed);
-                            return;
-                        }
-                    }
-                }
-
-                let mut pending_resize = None;
-                loop {
-                    match resize_rx.try_recv() {
-                        Ok(size) => pending_resize = Some(size),
-                        Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                            exit_flag_thread.store(true, Ordering::Relaxed);
-                            return;
-                        }
-                    }
-                }
-
-                if let Some((rows, cols)) = pending_resize {
-                    did_work = true;
-                    if shell.resize(PtySize::new(rows, cols)).is_err() {
-                        exit_flag_thread.store(true, Ordering::Relaxed);
-                        return;
-                    }
-                }
-
-                loop {
-                    match shell.try_read(&mut buf) {
-                        Ok(PtyRead::Data(n)) => {
-                            did_work = true;
-                            output_buffer.extend_from_slice(&buf[0..n]);
-                            if output_buffer.len() >= IO_BATCH_THRESHOLD {
-                                if output_tx.send(std::mem::take(&mut output_buffer)).is_err() {
-                                    exit_flag_thread.store(true, Ordering::Relaxed);
-                                    return;
-                                }
-                                output_buffer = Vec::with_capacity(IO_BUFFER_CAPACITY);
-                            }
-                        }
-                        Ok(PtyRead::WouldBlock) => break,
-                        Ok(PtyRead::Eof) => {
-                            if !output_buffer.is_empty() {
-                                let _ = output_tx.send(std::mem::take(&mut output_buffer));
-                            }
-                            exit_flag_thread.store(true, Ordering::Relaxed);
-                            return;
-                        }
-                        Err(_) => {
-                            exit_flag_thread.store(true, Ordering::Relaxed);
-                            return;
-                        }
-                    }
-                }
-
-                if !output_buffer.is_empty() {
-                    did_work = true;
-                    if output_tx.send(std::mem::take(&mut output_buffer)).is_err() {
-                        exit_flag_thread.store(true, Ordering::Relaxed);
-                        return;
-                    }
-                    output_buffer = Vec::with_capacity(IO_BUFFER_CAPACITY);
-                }
-
-                if !did_work {
-                    std::thread::sleep(IO_IDLE_SLEEP);
-                }
-            }
-        }));
-
         let size = (config.initial_cols, config.initial_rows);
 
-        Self {
+        let mut widget = Self {
             terminal,
             key_encoder,
             key_event,
@@ -671,22 +694,25 @@ impl TerminalWidget {
             row_iterator,
             cell_iterator,
             config,
-            output_rx,
-            input_tx: Some(input_tx),
-            resize_tx: Some(resize_tx),
-            shutdown_flag,
+            pty_tx,
             exit_flag,
-            io_thread,
+            pty_worker,
+            output_task: Task::ready(()),
+            cursor_blink_task: Task::ready(()),
             focus_handle: cx.focus_handle(),
             cursor_blink_phase: true,
-            blink_accumulator: Duration::ZERO,
-            last_frame_time: None,
             size,
             layout_size: None,
             cell_size: (px(9.6), px(19.2)),
             theme,
             has_exited: false,
+        };
+
+        if let Some(event_rx) = pty_event_rx {
+            widget.start_output_task(event_rx, cx);
         }
+        widget.schedule_cursor_blink(cx);
+        widget
     }
 
     pub fn set_exit_flag(&mut self, flag: Arc<AtomicBool>) {
@@ -714,27 +740,86 @@ impl TerminalWidget {
         &self.focus_handle
     }
 
-    fn update_cursor_blink(&mut self, elapsed: Duration) {
+    fn schedule_cursor_blink(&mut self, cx: &mut Context<Self>) {
         if !self.config.cursor_blink {
             self.cursor_blink_phase = true;
-            self.blink_accumulator = Duration::ZERO;
+            self.cursor_blink_task = Task::ready(());
             return;
         }
-        self.blink_accumulator += elapsed;
-        if self.blink_accumulator >= self.config.blink_interval {
-            self.blink_accumulator = Duration::ZERO;
-            self.cursor_blink_phase = !self.cursor_blink_phase;
+
+        let interval = self.config.blink_interval;
+        self.cursor_blink_task = cx.spawn(async move |this, cx| {
+            Timer::after(interval).await;
+            if let Some(this) = this.upgrade() {
+                this.update(cx, |this, cx| {
+                    if !this.config.cursor_blink {
+                        this.cursor_blink_phase = true;
+                        this.cursor_blink_task = Task::ready(());
+                        cx.notify();
+                        return;
+                    }
+
+                    this.cursor_blink_phase = !this.cursor_blink_phase;
+                    cx.notify();
+                    this.schedule_cursor_blink(cx);
+                })
+                .ok();
+            }
+        });
+    }
+
+    fn start_output_task(&mut self, event_rx: flume::Receiver<PtyEvent>, cx: &mut Context<Self>) {
+        self.output_task = cx.spawn(async move |this, cx| {
+            while let Ok(first_event) = event_rx.recv_async().await {
+                let mut events = vec![first_event];
+                let mut drained_bytes = events.iter().map(pty_event_len).sum::<usize>();
+
+                while drained_bytes < PTY_OUTPUT_DRAIN_BUDGET {
+                    match event_rx.try_recv() {
+                        Ok(event) => {
+                            drained_bytes += pty_event_len(&event);
+                            events.push(event);
+                        }
+                        Err(flume::TryRecvError::Empty) => break,
+                        Err(flume::TryRecvError::Disconnected) => break,
+                    }
+                }
+
+                let Some(this) = this.upgrade() else {
+                    break;
+                };
+
+                this.update(cx, |this, cx| {
+                    for event in events {
+                        this.apply_pty_event(event);
+                    }
+                    cx.notify();
+                })
+                .ok();
+            }
+        });
+    }
+
+    fn apply_pty_event(&mut self, event: PtyEvent) {
+        match event {
+            PtyEvent::Output(data) => self.terminal.vt_write(&data),
+            PtyEvent::Exited => self.exit_flag.store(true, Ordering::Relaxed),
         }
     }
 
-    fn process_output(&mut self, cx: &mut Context<Self>) {
-        let mut has_new_data = false;
-        while let Ok(data) = self.output_rx.try_recv() {
-            self.terminal.vt_write(&data);
-            has_new_data = true;
+    fn send_pty_command(&self, command: PtyCommand) {
+        if let Some(tx) = &self.pty_tx
+            && tx.send(command).is_err()
+        {
+            self.exit_flag.store(true, Ordering::Relaxed);
         }
-        if has_new_data {
+    }
+
+    fn reset_cursor_blink(&mut self, cx: &mut Context<Self>) {
+        if self.config.cursor_blink {
+            self.cursor_blink_phase = true;
             cx.notify();
+            self.schedule_cursor_blink(cx);
         }
     }
 
@@ -755,9 +840,7 @@ impl TerminalWidget {
                 .is_ok()
             {
                 self.size = (cols, rows);
-                if let Some(ref resize_tx) = self.resize_tx {
-                    let _ = resize_tx.send((rows, cols));
-                }
+                self.send_pty_command(PtyCommand::Resize(PtySize::new(rows, cols)));
                 cx.notify();
             }
         }
@@ -832,19 +915,10 @@ impl TerminalWidget {
         keystroke: &gpui::Keystroke,
         cx: &mut Context<Self>,
     ) {
-        let input_tx = match &self.input_tx {
-            Some(tx) => tx.clone(),
-            None => return,
-        };
-
-        if let Some(vt_bytes) = self.encode_key_event(action, keystroke)
-            && let Err(e) = input_tx.send(vt_bytes)
-        {
-            eprintln!("Failed to send input to shell: {:?}", e);
-            return;
+        if let Some(vt_bytes) = self.encode_key_event(action, keystroke) {
+            self.send_pty_command(PtyCommand::Write(vt_bytes));
         }
-        self.process_output(cx);
-        cx.notify();
+        self.reset_cursor_blink(cx);
     }
 
     fn encode_key_event(&mut self, action: Action, keystroke: &gpui::Keystroke) -> Option<Vec<u8>> {
@@ -891,9 +965,7 @@ impl TerminalWidget {
                 .eq_ignore_ascii_case(FEEDBACK_CAPTURE_KEY)
     }
 
-    fn capture_feedback(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.process_output(cx);
-
+    fn capture_feedback(&mut self, window: &mut Window, _cx: &mut Context<Self>) {
         let capture = match self.build_feedback_capture() {
             Ok(capture) => capture,
             Err(err) => {
@@ -1205,21 +1277,6 @@ impl TerminalWidget {
 
 impl Render for TerminalWidget {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        window.request_animation_frame();
-
-        let now = Instant::now();
-        if let Some(last_time) = self.last_frame_time {
-            let elapsed = now.duration_since(last_time);
-            let old_blink_phase = self.cursor_blink_phase;
-            self.update_cursor_blink(elapsed);
-            if old_blink_phase != self.cursor_blink_phase {
-                cx.notify();
-            }
-        }
-        self.last_frame_time = Some(now);
-
-        self.process_output(cx);
-
         let layout_size = self.layout_size.unwrap_or_else(|| window.viewport_size());
         self.resize_to_size(layout_size, cx);
 
@@ -1463,12 +1520,13 @@ impl Render for TerminalWidget {
 
 impl Drop for TerminalWidget {
     fn drop(&mut self) {
-        self.shutdown_flag.store(true, Ordering::Relaxed);
-        self.input_tx = None;
-        self.resize_tx = None;
-        if let Some(handle) = self.io_thread.take() {
-            let _ = handle.join();
+        self.output_task = Task::ready(());
+        self.cursor_blink_task = Task::ready(());
+        self.pty_tx = None;
+        if let Some(worker) = self.pty_worker.as_mut() {
+            worker.shutdown();
         }
+        self.pty_worker = None;
     }
 }
 

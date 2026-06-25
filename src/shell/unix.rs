@@ -121,24 +121,17 @@ impl PtySession {
             }
         }
 
-        let mut session = Self {
+        Ok(Self {
             master_fd,
             child_pid,
             child_reaped: Cell::new(false),
             shutdown_called: false,
-        };
-
-        if let Err(err) = session.set_nonblocking() {
-            let _ = session.close_handles(false);
-            return Err(err);
-        }
-
-        Ok(session)
+        })
     }
 
-    pub fn try_read(&mut self, buf: &mut [u8]) -> Result<PtyRead, PtyError> {
+    pub fn read(&mut self, buf: &mut [u8]) -> Result<PtyRead, PtyError> {
         if buf.is_empty() {
-            return Ok(PtyRead::WouldBlock);
+            return Ok(PtyRead::Data(0));
         }
 
         loop {
@@ -157,21 +150,9 @@ impl PtySession {
             let error = io::Error::last_os_error();
             match error.raw_os_error() {
                 Some(libc::EINTR) => continue,
-                Some(libc::EAGAIN) => {
-                    return if self.has_exited()? {
-                        Ok(PtyRead::Eof)
-                    } else {
-                        Ok(PtyRead::WouldBlock)
-                    };
-                }
+                Some(libc::EAGAIN) => continue,
                 #[cfg(any(target_os = "linux", target_os = "android"))]
-                Some(libc::EWOULDBLOCK) => {
-                    return if self.has_exited()? {
-                        Ok(PtyRead::Eof)
-                    } else {
-                        Ok(PtyRead::WouldBlock)
-                    };
-                }
+                Some(libc::EWOULDBLOCK) => continue,
                 Some(libc::EIO) => {
                     let _ = self.reap_child();
                     return Ok(PtyRead::Eof);
@@ -240,21 +221,6 @@ impl PtySession {
     pub fn shutdown(mut self) -> Result<(), PtyError> {
         self.shutdown_called = true;
         self.close_handles(true)
-    }
-
-    fn set_nonblocking(&self) -> Result<(), PtyError> {
-        let flags = unsafe { libc::fcntl(self.master_fd, libc::F_GETFL) };
-        if flags < 0 {
-            return Err(PtyError::io("get PTY flags"));
-        }
-
-        let result =
-            unsafe { libc::fcntl(self.master_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
-        if result < 0 {
-            return Err(PtyError::io("set PTY nonblocking"));
-        }
-
-        Ok(())
     }
 
     fn reap_child(&self) -> Result<bool, PtyError> {
@@ -375,12 +341,12 @@ mod tests {
     }
 
     fn wait_for_output(shell: &mut PtySession, marker: &str) -> String {
-        let deadline = Instant::now() + TEST_TIMEOUT;
         let mut output = Vec::new();
         let mut buf = [0u8; 4096];
 
-        while Instant::now() < deadline {
-            match shell.try_read(&mut buf).expect("read from pty") {
+        loop {
+            match shell.read(&mut buf).expect("read from pty") {
+                PtyRead::Data(0) => {}
                 PtyRead::Data(n) => {
                     output.extend_from_slice(&buf[..n]);
                     let text = String::from_utf8_lossy(&output);
@@ -388,13 +354,12 @@ mod tests {
                         return text.into_owned();
                     }
                 }
-                PtyRead::WouldBlock => thread::sleep(Duration::from_millis(10)),
                 PtyRead::Eof => break,
             }
         }
 
         panic!(
-            "timed out waiting for marker {marker:?}; output was {:?}",
+            "expected marker {marker:?}; output was {:?}",
             String::from_utf8_lossy(&output)
         );
     }
@@ -439,10 +404,8 @@ mod tests {
                 return;
             }
 
-            match shell.try_read(&mut buf).expect("read from pty") {
-                PtyRead::Data(_) | PtyRead::WouldBlock => {
-                    thread::sleep(Duration::from_millis(10));
-                }
+            match shell.read(&mut buf).expect("read from pty") {
+                PtyRead::Data(_) => thread::sleep(Duration::from_millis(10)),
                 PtyRead::Eof => return,
             }
         }

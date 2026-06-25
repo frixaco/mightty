@@ -23,7 +23,6 @@ impl PtySize {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PtyRead {
     Data(usize),
-    WouldBlock,
     Eof,
 }
 

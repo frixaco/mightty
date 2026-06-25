@@ -3397,6 +3397,7 @@ dependencies = [
 name = "mightty"
 version = "0.1.0"
 dependencies = [
+ "flume",
  "gpui",
  "gpui-component",
  "image",
