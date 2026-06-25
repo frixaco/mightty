@@ -8,7 +8,7 @@ Core pieces:
 - **GPUI** and **gpui-component** for the application shell and rendering.
 - **libghostty-vt** for terminal state, escape sequence handling, rendering snapshots, and key encoding.
 - **Windows ConPTY** for shell process I/O.
-- Embedded **JetBrainsMono Nerd Font Mono** assets for terminal text rendering.
+- Local **JetBrainsMono Nerd Font Mono** assets for embedded terminal text rendering.
 
 This is currently Windows-first. The `shell` module has a Unix placeholder so the module boundary is explicit, but Unix PTY support is not implemented.
 
@@ -20,8 +20,8 @@ src/
 ├── lib.rs               # Library module exports
 ├── feedback.rs          # JSON and PNG feedback capture support
 ├── pane.rs              # Single terminal pane wrapper
-├── pane_container.rs    # Top-level pane container and key bindings
-├── split.rs             # Simple row of terminal panes
+├── pane_container.rs    # Tabs, sidebar, top-level pane actions, and key bindings
+├── split.rs             # Orientation-aware terminal pane split tree
 ├── widget/
 │   └── mod.rs           # TerminalWidget: rendering, input, shell bridge thread
 ├── ghostty/
@@ -34,7 +34,7 @@ src/
 
 Important non-source paths:
 - `ghostty/`: local Ghostty checkout used by `build.rs`.
-- `fonts/JetBrainsMono/`: embedded font files referenced by `src/main.rs`.
+- `fonts/JetBrainsMono/`: local font files embedded by `src/main.rs`.
 - `captures/`: generated at runtime by feedback capture and intentionally not part of source.
 
 ## Build System
@@ -53,7 +53,12 @@ The repo includes `.mise.toml` pinning Zig `0.15.2`. `ZIG=/path/to/zig` can over
 ## Current Behavior
 
 - Default shell command is `pwsh.exe`.
-- `Alt+Enter` opens another pane to the right.
+- `Ctrl+T` creates a new tab.
+- Tabs appear in a left sidebar and can be selected with `Ctrl+1` through `Ctrl+9`.
+- `Ctrl+B` toggles the sidebar.
+- `Alt+Enter` splits the active pane to the right.
+- `Alt+Shift+Enter` splits the active pane downward.
+- `Ctrl+D` closes the active pane, or closes the active tab when it has one pane.
 - Exited panes are removed when more than one pane exists.
 - `Ctrl+Shift+F12` writes a feedback capture under `captures/`.
   - JSON terminal-state capture is cross-platform.
@@ -84,7 +89,7 @@ Rendering snapshots use `RenderState`, `RowIterator`, and `CellIterator`. `Rows`
 - Preserve the thin FFI boundary in `src/ghostty/mod.rs`; expose only APIs the app uses.
 - Be careful with Windows handles in `src/shell/windows.rs`; every failure path must close owned handles.
 - Avoid broad UI rewrites unless the task explicitly asks for product design work.
-- Keep docs accurate to implemented behavior. Do not document planned tabs, horizontal splits, or Unix PTY support as shipped features.
+- Keep docs accurate to implemented behavior. Do not document Unix PTY support as shipped behavior.
 - Run formatting and checks before handing off.
 
 ## Common Commands
