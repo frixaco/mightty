@@ -219,6 +219,30 @@ fn terminal_palette(theme_palette: [gpui::Rgba; 16]) -> [RgbColor; 256] {
     palette
 }
 
+trait CellWidthExt {
+    fn column_advance(self) -> u16;
+}
+
+impl CellWidthExt for CellWidth {
+    fn column_advance(self) -> u16 {
+        match self {
+            Self::Narrow => 1,
+            Self::Wide => 2,
+            Self::SpacerTail | Self::SpacerHead => 0,
+        }
+    }
+}
+
+trait RenderCellExt {
+    fn width(&self) -> crate::ghostty::Result<CellWidth>;
+}
+
+impl RenderCellExt for libghostty_vt::render::CellIteration<'_, '_> {
+    fn width(&self) -> crate::ghostty::Result<CellWidth> {
+        self.raw_cell()?.wide()
+    }
+}
+
 fn rgb_hex(rgb: RgbColor) -> RgbHex {
     RgbHex::new(rgb.r, rgb.g, rgb.b)
 }
@@ -231,6 +255,7 @@ fn underline_name(underline: Underline) -> &'static str {
         Underline::Curly => "curly",
         Underline::Dotted => "dotted",
         Underline::Dashed => "dashed",
+        _ => "unknown",
     }
 }
 
@@ -502,16 +527,19 @@ impl TerminalWidget {
             max_scrollback: config.scrollback,
         })
         .expect("Failed to create terminal");
+        let pty_response_tx = input_tx.clone();
         terminal
-            .set_pty_response_sender(input_tx.clone())
+            .on_pty_write(move |_terminal, data| {
+                let _ = pty_response_tx.send(data.to_vec());
+            })
             .expect("Failed to configure terminal PTY responses");
         terminal
-            .set_default_colors(
-                rgba_to_rgb(theme.foreground),
-                rgba_to_rgb(theme.background),
-                rgba_to_rgb(theme.cursor),
-                &terminal_palette(theme.palette),
-            )
+            .set_default_fg_color(Some(rgba_to_rgb(theme.foreground)))
+            .and_then(|terminal| terminal.set_default_bg_color(Some(rgba_to_rgb(theme.background))))
+            .and_then(|terminal| terminal.set_default_cursor_color(Some(rgba_to_rgb(theme.cursor))))
+            .and_then(|terminal| {
+                terminal.set_default_color_palette(Some(terminal_palette(theme.palette)))
+            })
             .expect("Failed to configure terminal default colors");
 
         let render_state = RenderState::new().expect("Failed to create render state");
@@ -902,14 +930,14 @@ impl TerminalWidget {
         let colors = snapshot.colors()?;
 
         let mut rows = Vec::new();
-        let row_it = self.row_iterator.update(&snapshot)?;
+        let mut row_it = self.row_iterator.update(&snapshot)?;
         let mut row_idx = 0u16;
-        for row in row_it {
+        while let Some(row) = row_it.next() {
             let mut row_text = String::new();
             let mut cells = Vec::new();
-            let cell_it = self.cell_iterator.update(row)?;
+            let mut cell_it = self.cell_iterator.update(row)?;
             let mut col_idx = 0u16;
-            for cell in cell_it {
+            while let Some(cell) = cell_it.next() {
                 let width = cell.width()?;
                 let advance = width.column_advance();
                 let graphemes_len = cell.graphemes_len()?;
@@ -1220,14 +1248,14 @@ impl Render for TerminalWidget {
         base_text_style.line_height = cell_size.1.into();
         base_text_style.white_space = WhiteSpace::Nowrap;
 
-        let row_it = match self.row_iterator.update(&snapshot) {
+        let mut row_it = match self.row_iterator.update(&snapshot) {
             Ok(it) => it,
             Err(_) => return div().size_full().bg(self.theme.background),
         };
 
         let mut row_idx: u16 = 0;
-        for row in row_it {
-            let cell_it = match self.cell_iterator.update(row) {
+        while let Some(row) = row_it.next() {
+            let mut cell_it = match self.cell_iterator.update(row) {
                 Ok(it) => it,
                 Err(_) => continue,
             };
@@ -1235,7 +1263,7 @@ impl Render for TerminalWidget {
             let mut row_segments = Vec::new();
             let mut pending_segment = None;
             let mut col_idx = 0u16;
-            for cell in cell_it {
+            while let Some(cell) = cell_it.next() {
                 let width = match cell.width() {
                     Ok(width) => width,
                     Err(_) => continue,
@@ -1466,10 +1494,10 @@ mod tests {
 
         let mut rows = row_iterator.update(&snapshot).expect("rows");
         let row = rows.next().expect("first row");
-        let cells = cell_iterator.update(row).expect("cells");
+        let mut cells = cell_iterator.update(row).expect("cells");
 
         let mut letters = Vec::new();
-        for cell in cells {
+        while let Some(cell) = cells.next() {
             let text: String = cell.graphemes().expect("graphemes").into_iter().collect();
             if text.is_empty() {
                 continue;
@@ -1509,11 +1537,11 @@ mod tests {
 
         let mut rows = row_iterator.update(&snapshot).expect("rows");
         let row = rows.next().expect("first row");
-        let cells = cell_iterator.update(row).expect("cells");
+        let mut cells = cell_iterator.update(row).expect("cells");
 
         let mut positions = Vec::new();
         let mut col_idx = 0u16;
-        for cell in cells {
+        while let Some(cell) = cells.next() {
             let width = cell.width().expect("width");
             let advance = width.column_advance();
             let text: String = cell.graphemes().expect("graphemes").into_iter().collect();

@@ -7,10 +7,10 @@ mightty is a small GPU-powered terminal emulator prototype.
 Core pieces:
 - **GPUI** and **gpui-component** for the application shell and rendering.
 - **libghostty-vt** for terminal state, escape sequence handling, rendering snapshots, and key encoding.
-- **Windows ConPTY** for shell process I/O.
+- **Windows ConPTY** and **Unix forkpty** for shell process I/O.
 - Local **JetBrainsMono Nerd Font Mono** assets for embedded terminal text rendering.
 
-This is currently Windows-first. The `shell` module has a Unix placeholder so the module boundary is explicit, but Unix PTY support is not implemented.
+Windows remains the primary target, with a Unix shell bridge available behind the same shell module boundary.
 
 ## Source Layout
 
@@ -19,40 +19,38 @@ src/
 ├── main.rs              # Binary entry point, window setup, font loading
 ├── lib.rs               # Library module exports
 ├── feedback.rs          # JSON and PNG feedback capture support
-├── pane.rs              # Single terminal pane wrapper
 ├── pane_container.rs    # Tabs, sidebar, top-level pane actions, and key bindings
-├── split.rs             # Orientation-aware terminal pane split tree
+├── split.rs             # Orientation-aware terminal split tree
 ├── widget/
-│   └── mod.rs           # TerminalWidget: rendering, input, shell bridge thread
+│   ├── mod.rs           # TerminalWidget lifecycle and GPUI task wiring
+│   ├── pty.rs           # Wake-driven PTY worker bridge
+│   ├── input.rs         # GPUI key event to libghostty-vt key encoding
+│   ├── render.rs        # Terminal cell rendering
+│   └── capture.rs       # Terminal-state feedback snapshot
 ├── ghostty/
-│   └── mod.rs           # Minimal safe wrapper around used libghostty-vt APIs
+│   └── mod.rs           # Project facade over the libghostty-vt crate
 └── shell/
     ├── mod.rs           # Platform shell bridge exports
     ├── windows.rs       # ConPTY implementation
-    └── unix.rs          # Unsupported placeholder
+    └── unix.rs          # forkpty implementation
 ```
 
 Important non-source paths:
-- `ghostty/`: local Ghostty checkout used by `build.rs`.
+- `ghostty/`: local Ghostty checkout used by `.cargo/config.toml` as `GHOSTTY_SOURCE_DIR`.
 - `fonts/JetBrainsMono/`: local font files embedded by `src/main.rs`.
 - `captures/`: generated at runtime by feedback capture and intentionally not part of source.
 
 ## Build System
 
-`build.rs` expects the Ghostty submodule checkout at `ghostty/`.
-
-The build script:
-1. Validates Zig `0.15.2`.
-2. Runs Ghostty's Zig build with `-Demit-lib-vt=true -Dsimd=false`.
-3. Installs artifacts under Cargo's `OUT_DIR`.
-4. On Windows, copies `ghostty-vt.dll` into the target output directory and `deps/` when present.
-5. On non-Windows targets, emits static link directives for `ghostty-vt`.
+The `libghostty-vt-sys` dependency builds Ghostty's VT library through Cargo.
+The repo's `.cargo/config.toml` sets `GHOSTTY_SOURCE_DIR` to the local `ghostty/`
+checkout so normal Cargo commands do not need to fetch Ghostty.
 
 The repo includes `.mise.toml` pinning Zig `0.15.2`. `ZIG=/path/to/zig` can override discovery.
 
 ## Current Behavior
 
-- Default shell command is `pwsh.exe`.
+- Default shell command is `pwsh.exe` on Windows and `$SHELL` on Unix.
 - `Ctrl+T` creates a new tab.
 - Tabs appear in a left sidebar and can be selected with `Ctrl+1` through `Ctrl+9`.
 - `Ctrl+B` toggles the sidebar.
@@ -81,15 +79,16 @@ terminal.vt_write(b"hello");
 terminal.resize(80, 24, 10, 20)?;
 ```
 
-Rendering snapshots use `RenderState`, `RowIterator`, and `CellIterator`. `Rows` and `Cells` implement `Iterator`.
+Rendering snapshots use `RenderState`, `RowIterator`, and `CellIterator` from `libghostty-vt`.
+The row and cell iterations are lending iterators, so drive them with `while let Some(row) = rows.next()`.
 
 ## Development Guidelines
 
 - Keep code simple and local. Do not add abstraction unless it removes real complexity.
-- Preserve the thin FFI boundary in `src/ghostty/mod.rs`; expose only APIs the app uses.
+- Keep `src/ghostty/mod.rs` as a small facade over `libghostty-vt`; do not reintroduce manual FFI bindings.
 - Be careful with Windows handles in `src/shell/windows.rs`; every failure path must close owned handles.
 - Avoid broad UI rewrites unless the task explicitly asks for product design work.
-- Keep docs accurate to implemented behavior. Do not document Unix PTY support as shipped behavior.
+- Keep docs accurate to implemented behavior.
 - Run formatting and checks before handing off.
 
 ## Common Commands

@@ -14,7 +14,7 @@ in the GPUI-rendered output even though the terminal state was correct.
 Terminal text follows this path:
 
 1. shell output bytes are written into Ghostty with `Terminal::vt_write`
-2. Ghostty render state is read through `src/ghostty/mod.rs`
+2. Ghostty render state is read through the `libghostty-vt` facade in `src/ghostty/mod.rs`
 3. `src/widget/mod.rs` converts Ghostty cells into positioned GPUI text segments
 4. GPUI and DirectWrite shape those segments into pixels on Windows
 

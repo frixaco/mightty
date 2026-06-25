@@ -1,15 +1,18 @@
 # mightty
 
-mightty is a small GPU-powered terminal emulator prototype built with Rust, GPUI, Windows ConPTY, and Ghostty's `libghostty-vt`.
+mightty is a small GPU-powered terminal emulator prototype built with Rust, GPUI, platform PTYs, and Ghostty's `libghostty-vt`.
 
-It is currently Windows-first. Unix shell support is represented by a placeholder module, but PTY integration is not implemented yet.
+It is currently Windows-first, with Windows shell I/O through ConPTY and Unix shell I/O through a forkpty-backed bridge.
 
 ## Features
 
 - GPU-rendered terminal UI through GPUI.
 - Terminal emulation through `libghostty-vt`.
 - Windows shell I/O through ConPTY.
-- Multiple side-by-side panes with `Alt+Enter`.
+- Unix shell I/O through forkpty.
+- Tabs in a compact left sidebar.
+- Right and down pane splits.
+- Active pane and tab closing.
 - Embedded JetBrainsMono Nerd Font Mono for terminal text.
 - Feedback capture with `Ctrl+Shift+F12`.
 
@@ -17,15 +20,16 @@ It is currently Windows-first. Unix shell support is represented by a placeholde
 
 - [GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui) for UI rendering.
 - [gpui-component](https://crates.io/crates/gpui-component) for the root component wrapper.
-- [Ghostty](https://github.com/ghostty-org/ghostty) for `libghostty-vt`.
-- Windows ConPTY for shell process integration.
+- [libghostty-vt](https://crates.io/crates/libghostty-vt) for the Ghostty VT engine.
+- Windows ConPTY and Unix forkpty for shell process integration.
 
 ## Requirements
 
 - Rust with edition 2024 support.
 - Zig `0.15.2`.
-- The Ghostty submodule initialized at `ghostty/`.
-- Windows for the runnable shell bridge.
+- The Ghostty checkout at `ghostty/`, used by `.cargo/config.toml` as `GHOSTTY_SOURCE_DIR`.
+- Local JetBrainsMono Nerd Font Mono files under `fonts/JetBrainsMono/`.
+- Windows for the primary shell bridge target, or a Unix platform for the forkpty bridge.
 
 This repo includes a `.mise.toml` pin for Zig:
 
@@ -35,12 +39,6 @@ mise install
 
 You can also set `ZIG` to a specific Zig executable.
 
-Pinned Ghostty commit:
-
-```text
-b0d359cbbd945f9f3807327526ef79fcaf0477df
-```
-
 ## Build
 
 ```bash
@@ -48,13 +46,13 @@ cargo build
 cargo build --release
 ```
 
-`build.rs` validates Zig, builds the local `ghostty/` checkout with:
+The `libghostty-vt-sys` dependency builds Ghostty's VT library during Cargo builds.
+This repo's `.cargo/config.toml` points `GHOSTTY_SOURCE_DIR` at the local
+`ghostty/` checkout so normal Cargo commands do not need to fetch Ghostty.
 
-```bash
-zig build -Demit-lib-vt=true -Dsimd=false
+```powershell
+cargo build
 ```
-
-On Windows, the build copies `ghostty-vt.dll` into Cargo's target output directory so the app and tests can load it.
 
 ## Run
 
@@ -62,7 +60,7 @@ On Windows, the build copies `ghostty-vt.dll` into Cargo's target output directo
 cargo run
 ```
 
-The default shell is `pwsh.exe`.
+The default shell is `pwsh.exe` on Windows and `$SHELL` on Unix.
 
 ## Development
 
@@ -77,13 +75,13 @@ cargo test
 
 Useful runtime shortcuts:
 
-- `Alt+Enter`: open a new pane to the right.
+- `Ctrl+T`: open a new tab.
+- `Ctrl+B`: hide or show the tab sidebar.
+- `Ctrl+1` through `Ctrl+9`: switch to an existing tab.
+- `Alt+Enter`: split the active pane to the right.
+- `Alt+Shift+Enter`: split the active pane downward.
+- `Ctrl+D`: close the active pane, or close the active tab when it has one pane.
 - `Ctrl+Shift+F12`: write a terminal feedback capture to `captures/`.
-
-## TODO
-
-- Implement a Unix PTY backend behind the existing `PtySession` API for macOS/Linux, using a nonblocking PTY master for reads, writes, resize, child exit detection, and shell spawning from `$SHELL`.
-- Remove the temporary `ConPtyShell` and `ConPtyError` compatibility aliases once all callers use the platform-neutral PTY names.
 
 ## Project Layout
 
@@ -92,14 +90,18 @@ src/
 ├── main.rs              # App entry point and window setup
 ├── lib.rs               # Library module exports
 ├── feedback.rs          # Feedback capture output
-├── pane.rs              # Single pane wrapper
-├── pane_container.rs    # Pane actions and key binding
-├── split.rs             # Side-by-side pane layout
-├── widget/mod.rs        # Terminal widget, rendering, input, shell I/O thread
-├── ghostty/mod.rs       # Safe wrapper around used libghostty-vt APIs
+├── pane_container.rs    # Tabs, sidebar, pane actions, and key bindings
+├── split.rs             # Orientation-aware terminal split tree
+├── widget/
+│   ├── mod.rs           # Terminal widget lifecycle and GPUI task wiring
+│   ├── pty.rs           # Wake-driven PTY worker bridge
+│   ├── input.rs         # GPUI key event to libghostty-vt key encoding
+│   ├── render.rs        # Terminal cell rendering
+│   └── capture.rs       # Terminal-state feedback snapshot
+├── ghostty/mod.rs       # Project facade over the libghostty-vt crate
 └── shell/
     ├── windows.rs       # Windows ConPTY implementation
-    └── unix.rs          # Unsupported placeholder
+    └── unix.rs          # Unix forkpty implementation
 ```
 
 ## License
