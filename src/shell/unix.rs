@@ -69,14 +69,29 @@ impl From<io::Error> for PtyError {
     }
 }
 
-pub struct PtySession {
+pub struct PtyParts {
+    pub input: PtyInput,
+    pub output: PtyOutput,
+    pub control: PtyControl,
+}
+
+pub struct PtyInput {
+    master_fd: RawFd,
+}
+
+pub struct PtyOutput {
+    master_fd: RawFd,
+}
+
+pub struct PtyControl {
     master_fd: RawFd,
     child_pid: libc::pid_t,
     child_reaped: Cell<bool>,
+    exit_code: Cell<Option<u32>>,
     shutdown_called: bool,
 }
 
-impl PtySession {
+impl PtyParts {
     pub fn spawn(command: &str, size: PtySize) -> Result<Self, PtyError> {
         if !size.is_valid() {
             return Err(PtyError::InvalidDimensions);
@@ -121,48 +136,39 @@ impl PtySession {
             }
         }
 
+        let input_fd = duplicate_fd(master_fd, "duplicate PTY input fd")?;
+        let output_fd = match duplicate_fd(master_fd, "duplicate PTY output fd") {
+            Ok(fd) => fd,
+            Err(err) => {
+                close_fd(input_fd);
+                close_fd(master_fd);
+                unsafe {
+                    libc::kill(child_pid, libc::SIGKILL);
+                }
+                return Err(err);
+            }
+        };
+
         Ok(Self {
-            master_fd,
-            child_pid,
-            child_reaped: Cell::new(false),
-            shutdown_called: false,
+            input: PtyInput {
+                master_fd: input_fd,
+            },
+            output: PtyOutput {
+                master_fd: output_fd,
+            },
+            control: PtyControl {
+                master_fd,
+                child_pid,
+                child_reaped: Cell::new(false),
+                exit_code: Cell::new(None),
+                shutdown_called: false,
+            },
         })
     }
+}
 
-    pub fn read(&mut self, buf: &mut [u8]) -> Result<PtyRead, PtyError> {
-        if buf.is_empty() {
-            return Ok(PtyRead::Data(0));
-        }
-
-        loop {
-            let bytes_read =
-                unsafe { libc::read(self.master_fd, buf.as_mut_ptr().cast(), buf.len()) };
-
-            if bytes_read > 0 {
-                return Ok(PtyRead::Data(bytes_read as usize));
-            }
-
-            if bytes_read == 0 {
-                let _ = self.reap_child();
-                return Ok(PtyRead::Eof);
-            }
-
-            let error = io::Error::last_os_error();
-            match error.raw_os_error() {
-                Some(libc::EINTR) => continue,
-                Some(libc::EAGAIN) => continue,
-                #[cfg(any(target_os = "linux", target_os = "android"))]
-                Some(libc::EWOULDBLOCK) => continue,
-                Some(libc::EIO) => {
-                    let _ = self.reap_child();
-                    return Ok(PtyRead::Eof);
-                }
-                _ => return Err(PtyError::from_io("read from PTY master", error)),
-            }
-        }
-    }
-
-    pub fn write(&mut self, data: &[u8]) -> Result<(), PtyError> {
+impl PtyInput {
+    pub fn write_all(&mut self, data: &[u8]) -> Result<(), PtyError> {
         let mut written_total = 0usize;
 
         while written_total < data.len() {
@@ -182,20 +188,63 @@ impl PtySession {
             let error = io::Error::last_os_error();
             match error.raw_os_error() {
                 Some(libc::EINTR) => continue,
-                Some(libc::EAGAIN) => {
-                    thread::sleep(SHUTDOWN_POLL);
-                }
+                Some(libc::EAGAIN) => thread::sleep(SHUTDOWN_POLL),
                 #[cfg(any(target_os = "linux", target_os = "android"))]
-                Some(libc::EWOULDBLOCK) => {
-                    thread::sleep(SHUTDOWN_POLL);
-                }
+                Some(libc::EWOULDBLOCK) => thread::sleep(SHUTDOWN_POLL),
                 _ => return Err(PtyError::from_io("write to PTY master", error)),
             }
         }
 
         Ok(())
     }
+}
 
+impl Drop for PtyInput {
+    fn drop(&mut self) {
+        close_fd(self.master_fd);
+        self.master_fd = INVALID_FD;
+    }
+}
+
+impl PtyOutput {
+    pub fn read(&mut self, buf: &mut [u8]) -> Result<PtyRead, PtyError> {
+        if buf.is_empty() {
+            return Ok(PtyRead::Data(0));
+        }
+
+        loop {
+            let bytes_read =
+                unsafe { libc::read(self.master_fd, buf.as_mut_ptr().cast(), buf.len()) };
+
+            if bytes_read > 0 {
+                return Ok(PtyRead::Data(bytes_read as usize));
+            }
+
+            if bytes_read == 0 {
+                return Ok(PtyRead::Eof);
+            }
+
+            let error = io::Error::last_os_error();
+            match error.raw_os_error() {
+                Some(libc::EINTR) => continue,
+                Some(libc::EAGAIN) => continue,
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                Some(libc::EWOULDBLOCK) => continue,
+                Some(libc::EIO) => return Ok(PtyRead::Eof),
+                _ => return Err(PtyError::from_io("read from PTY master", error)),
+            }
+        }
+    }
+}
+
+impl Drop for PtyOutput {
+    fn drop(&mut self) {
+        close_fd(self.master_fd);
+        self.master_fd = INVALID_FD;
+    }
+}
+
+impl PtyControl {
     pub fn resize(&mut self, size: PtySize) -> Result<(), PtyError> {
         if !size.is_valid() {
             return Err(PtyError::InvalidDimensions);
@@ -218,7 +267,15 @@ impl PtySession {
         self.reap_child()
     }
 
-    pub fn shutdown(mut self) -> Result<(), PtyError> {
+    pub fn exit_code(&self) -> Result<Option<u32>, PtyError> {
+        if !self.has_exited()? {
+            return Ok(None);
+        }
+
+        Ok(self.exit_code.get())
+    }
+
+    pub fn shutdown(&mut self) -> Result<(), PtyError> {
         self.shutdown_called = true;
         self.close_handles(true)
     }
@@ -233,6 +290,8 @@ impl PtySession {
             let result =
                 unsafe { libc::waitpid(self.child_pid, status.as_mut_ptr(), libc::WNOHANG) };
             if result == self.child_pid {
+                let status = unsafe { status.assume_init() };
+                self.exit_code.set(exit_code_from_status(status));
                 self.child_reaped.set(true);
                 return Ok(true);
             }
@@ -311,13 +370,44 @@ impl PtySession {
     }
 }
 
-impl Drop for PtySession {
+impl Drop for PtyControl {
     fn drop(&mut self) {
         if self.shutdown_called {
             return;
         }
 
         let _ = self.close_handles(false);
+    }
+}
+
+pub fn is_conpty_available() -> bool {
+    true
+}
+
+fn duplicate_fd(fd: RawFd, operation: &'static str) -> Result<RawFd, PtyError> {
+    let duplicated = unsafe { libc::dup(fd) };
+    if duplicated < 0 {
+        Err(PtyError::io(operation))
+    } else {
+        Ok(duplicated)
+    }
+}
+
+fn close_fd(fd: RawFd) {
+    if fd != INVALID_FD {
+        unsafe {
+            libc::close(fd);
+        }
+    }
+}
+
+fn exit_code_from_status(status: libc::c_int) -> Option<u32> {
+    if libc::WIFEXITED(status) {
+        Some(libc::WEXITSTATUS(status) as u32)
+    } else if libc::WIFSIGNALED(status) {
+        Some((128 + libc::WTERMSIG(status)) as u32)
+    } else {
+        None
     }
 }
 
@@ -333,81 +423,101 @@ fn winsize_from_size(size: PtySize) -> libc::winsize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc;
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(3);
 
-    fn spawn_test_shell() -> PtySession {
-        PtySession::spawn("/bin/sh", PtySize::new(24, 80)).expect("spawn /bin/sh")
+    fn spawn_test_shell() -> PtyParts {
+        PtyParts::spawn("/bin/sh", PtySize::new(24, 80)).expect("spawn /bin/sh")
     }
 
-    fn wait_for_output(shell: &mut PtySession, marker: &str) -> String {
-        let mut output = Vec::new();
-        let mut buf = [0u8; 4096];
+    fn read_until(mut output: PtyOutput, marker: &'static str) -> mpsc::Receiver<String> {
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let mut text = Vec::new();
+            let mut buf = [0u8; 4096];
 
-        loop {
-            match shell.read(&mut buf).expect("read from pty") {
-                PtyRead::Data(0) => {}
-                PtyRead::Data(n) => {
-                    output.extend_from_slice(&buf[..n]);
-                    let text = String::from_utf8_lossy(&output);
-                    if text.contains(marker) {
-                        return text.into_owned();
+            loop {
+                match output.read(&mut buf) {
+                    Ok(PtyRead::Data(0)) => {}
+                    Ok(PtyRead::Data(n)) => {
+                        text.extend_from_slice(&buf[..n]);
+                        let decoded = String::from_utf8_lossy(&text);
+                        if decoded.contains(marker) {
+                            let _ = tx.send(decoded.into_owned());
+                            return;
+                        }
+                    }
+                    Ok(PtyRead::Eof) | Err(_) => {
+                        let _ = tx.send(String::from_utf8_lossy(&text).into_owned());
+                        return;
                     }
                 }
-                PtyRead::Eof => break,
             }
-        }
+        });
 
-        panic!(
-            "expected marker {marker:?}; output was {:?}",
-            String::from_utf8_lossy(&output)
+        rx
+    }
+
+    fn assert_marker(rx: mpsc::Receiver<String>, marker: &str) -> String {
+        let output = rx
+            .recv_timeout(TEST_TIMEOUT)
+            .unwrap_or_else(|_| panic!("timed out waiting for marker {marker:?}"));
+        assert!(
+            output.contains(marker),
+            "expected marker {marker:?}; output was {output:?}"
         );
+        output
     }
 
     #[test]
     fn spawn_shell() {
-        let shell = PtySession::spawn("/bin/sh", PtySize::new(24, 80));
+        let shell = PtyParts::spawn("/bin/sh", PtySize::new(24, 80));
         assert!(shell.is_ok(), "failed to spawn /bin/sh: {:?}", shell.err());
     }
 
     #[test]
     fn invalid_dimensions() {
-        let result = PtySession::spawn("/bin/sh", PtySize::new(0, 80));
+        let result = PtyParts::spawn("/bin/sh", PtySize::new(0, 80));
         assert!(matches!(result, Err(PtyError::InvalidDimensions)));
 
-        let result = PtySession::spawn("/bin/sh", PtySize::new(24, 0));
+        let result = PtyParts::spawn("/bin/sh", PtySize::new(24, 0));
         assert!(matches!(result, Err(PtyError::InvalidDimensions)));
     }
 
     #[test]
     fn reads_command_output() {
-        let mut shell = spawn_test_shell();
-        shell
-            .write(b"printf 'mightty-ready\\n'\n")
+        let PtyParts {
+            mut input,
+            output,
+            mut control,
+        } = spawn_test_shell();
+        let output_rx = read_until(output, "mightty-ready");
+
+        input
+            .write_all(b"printf 'mightty-ready\\n'\n")
             .expect("write command");
+        assert_marker(output_rx, "mightty-ready");
 
-        let output = wait_for_output(&mut shell, "mightty-ready");
-        assert!(output.contains("mightty-ready"));
-
-        shell.shutdown().expect("shutdown shell");
+        control.shutdown().expect("shutdown shell");
     }
 
     #[test]
     fn reports_process_exit() {
-        let mut shell = spawn_test_shell();
-        shell.write(b"exit\n").expect("write exit");
+        let PtyParts {
+            mut input,
+            output: _output,
+            mut control,
+        } = spawn_test_shell();
+        input.write_all(b"exit\n").expect("write exit");
 
         let deadline = Instant::now() + TEST_TIMEOUT;
-        let mut buf = [0u8; 1024];
         while Instant::now() < deadline {
-            if shell.has_exited().expect("check process exit") {
+            if control.has_exited().expect("check process exit") {
+                control.shutdown().expect("shutdown shell");
                 return;
             }
-
-            match shell.read(&mut buf).expect("read from pty") {
-                PtyRead::Data(_) => thread::sleep(Duration::from_millis(10)),
-                PtyRead::Eof => return,
-            }
+            thread::sleep(Duration::from_millis(10));
         }
 
         panic!("timed out waiting for process exit");
@@ -415,16 +525,26 @@ mod tests {
 
     #[test]
     fn resizes_session() {
-        let mut shell = spawn_test_shell();
-        shell.resize(PtySize::new(40, 120)).expect("resize pty");
-        shell.shutdown().expect("shutdown shell");
+        let PtyParts {
+            input: _input,
+            output: _output,
+            mut control,
+        } = spawn_test_shell();
+        control.resize(PtySize::new(40, 120)).expect("resize pty");
+        control.shutdown().expect("shutdown shell");
     }
 
     #[test]
     fn writes_paste_sized_input() {
-        let mut shell = spawn_test_shell();
+        let PtyParts {
+            mut input,
+            output: _output,
+            mut control,
+        } = spawn_test_shell();
         let command = format!(": {}\n", "x".repeat(8192));
-        shell.write(command.as_bytes()).expect("write large input");
-        shell.shutdown().expect("shutdown shell");
+        input
+            .write_all(command.as_bytes())
+            .expect("write large input");
+        control.shutdown().expect("shutdown shell");
     }
 }

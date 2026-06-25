@@ -60,7 +60,6 @@ pub enum PtyError {
     ProcessWaitFailed(u32),
     InvalidDimensions,
     ZeroLengthWrite,
-    AlreadySplit,
 }
 
 impl PtyError {
@@ -91,7 +90,6 @@ impl std::fmt::Display for PtyError {
             }
             Self::InvalidDimensions => write!(f, "invalid terminal dimensions"),
             Self::ZeroLengthWrite => write!(f, "write made no progress"),
-            Self::AlreadySplit => write!(f, "PTY session handles were already split"),
         }
     }
 }
@@ -111,12 +109,6 @@ impl From<io::Error> for PtyError {
     }
 }
 
-pub struct PtySession {
-    input: Option<PtyInput>,
-    output: Option<PtyOutput>,
-    control: Option<PtyControl>,
-}
-
 pub struct PtyParts {
     pub input: PtyInput,
     pub output: PtyOutput,
@@ -124,17 +116,26 @@ pub struct PtyParts {
 }
 
 pub struct PtyInput {
-    handle: HANDLE,
+    handle: OwnedHandle,
 }
 
 pub struct PtyOutput {
-    handle: HANDLE,
+    handle: OwnedHandle,
 }
 
 pub struct PtyControl {
-    pty_handle: HPCON,
-    process_handle: HANDLE,
+    pty_handle: Option<HPCON>,
+    process_handle: Option<OwnedHandle>,
     shutdown_called: bool,
+}
+
+struct Pipe {
+    read: OwnedHandle,
+    write: OwnedHandle,
+}
+
+struct OwnedHandle {
+    handle: HANDLE,
 }
 
 // The split handle wrappers have unique ownership of their Windows handles and
@@ -143,14 +144,14 @@ unsafe impl Send for PtyInput {}
 unsafe impl Send for PtyOutput {}
 unsafe impl Send for PtyControl {}
 
-impl PtySession {
-    /// Spawn a new shell process with the specified dimensions.
+impl PtyParts {
+    /// Spawn a new shell process with split input, output, and control handles.
     ///
     /// ```no_run
-    /// use mightty::shell::{PtySession, PtySize};
+    /// use mightty::shell::{PtyParts, PtySize};
     ///
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// let _shell = PtySession::spawn("cmd.exe", PtySize::new(24, 80))?;
+    /// let _parts = PtyParts::spawn("cmd.exe", PtySize::new(24, 80))?;
     /// # Ok(())
     /// # }
     /// ```
@@ -159,160 +160,86 @@ impl PtySession {
             return Err(PtyError::InvalidDimensions);
         }
 
-        if !Self::is_conpty_available() {
+        if !is_conpty_available() {
             return Err(PtyError::ConPtyNotAvailable);
         }
 
         unsafe {
-            let (pty_input_write, pty_input_read) = Self::create_pipe()?;
-            let (pty_output_write, pty_output_read) = match Self::create_pipe() {
-                Ok(pipe) => pipe,
-                Err(err) => {
-                    CloseHandle(pty_input_write);
-                    CloseHandle(pty_input_read);
-                    return Err(err);
-                }
-            };
+            let pty_input = Pipe::create()?;
+            let pty_output = Pipe::create()?;
 
             let coord = size_to_coord(size);
             let mut pty_handle: HPCON = 0;
-            let result =
-                CreatePseudoConsole(coord, pty_input_read, pty_output_write, 0, &mut pty_handle);
+            let result = CreatePseudoConsole(
+                coord,
+                pty_input.read.raw(),
+                pty_output.write.raw(),
+                0,
+                &mut pty_handle,
+            );
 
             if result != S_OK {
-                CloseHandle(pty_input_write);
-                CloseHandle(pty_input_read);
-                CloseHandle(pty_output_write);
-                CloseHandle(pty_output_read);
                 return Err(PtyError::io("create pseudoconsole"));
             }
 
-            let process_handle = match Self::create_process_with_pty(command, pty_handle) {
+            let process_handle = match create_process_with_pty(command, pty_handle) {
                 Ok(handle) => handle,
                 Err(err) => {
                     ClosePseudoConsole(pty_handle);
-                    CloseHandle(pty_input_write);
-                    CloseHandle(pty_input_read);
-                    CloseHandle(pty_output_write);
-                    CloseHandle(pty_output_read);
                     return Err(err);
                 }
             };
 
-            CloseHandle(pty_input_read);
-            CloseHandle(pty_output_write);
-
             Ok(Self {
-                input: Some(PtyInput {
-                    handle: pty_input_write,
-                }),
-                output: Some(PtyOutput {
-                    handle: pty_output_read,
-                }),
-                control: Some(PtyControl {
-                    pty_handle,
-                    process_handle,
+                input: PtyInput {
+                    handle: pty_input.write,
+                },
+                output: PtyOutput {
+                    handle: pty_output.read,
+                },
+                control: PtyControl {
+                    pty_handle: Some(pty_handle),
+                    process_handle: Some(process_handle),
                     shutdown_called: false,
-                }),
+                },
             })
         }
     }
+}
 
-    pub fn split(mut self) -> Result<PtyParts, PtyError> {
-        Ok(PtyParts {
-            input: self.input.take().ok_or(PtyError::AlreadySplit)?,
-            output: self.output.take().ok_or(PtyError::AlreadySplit)?,
-            control: self.control.take().ok_or(PtyError::AlreadySplit)?,
-        })
-    }
+pub fn is_conpty_available() -> bool {
+    unsafe {
+        let size = COORD { X: 2, Y: 2 };
+        let mut test_handle: HPCON = 0;
 
-    pub fn read(&mut self, buf: &mut [u8]) -> Result<PtyRead, PtyError> {
-        self.output
-            .as_mut()
-            .ok_or(PtyError::AlreadySplit)?
-            .read(buf)
-    }
+        let test_input = match Pipe::create() {
+            Ok(p) => p,
+            Err(_) => return false,
+        };
+        let test_output = match Pipe::create() {
+            Ok(p) => p,
+            Err(_) => return false,
+        };
 
-    pub fn write(&mut self, data: &[u8]) -> Result<(), PtyError> {
-        self.input
-            .as_mut()
-            .ok_or(PtyError::AlreadySplit)?
-            .write_all(data)
-    }
+        let result = CreatePseudoConsole(
+            size,
+            test_input.read.raw(),
+            test_output.write.raw(),
+            1,
+            &mut test_handle,
+        );
 
-    pub fn resize(&mut self, size: PtySize) -> Result<(), PtyError> {
-        self.control
-            .as_mut()
-            .ok_or(PtyError::AlreadySplit)?
-            .resize(size)
-    }
-
-    pub fn has_exited(&self) -> Result<bool, PtyError> {
-        self.control
-            .as_ref()
-            .ok_or(PtyError::AlreadySplit)?
-            .has_exited()
-    }
-
-    pub fn exit_code(&self) -> Result<Option<u32>, PtyError> {
-        self.control
-            .as_ref()
-            .ok_or(PtyError::AlreadySplit)?
-            .exit_code()
-    }
-
-    pub fn shutdown(mut self) -> Result<(), PtyError> {
-        drop(self.input.take());
-        let result = self
-            .control
-            .as_mut()
-            .ok_or(PtyError::AlreadySplit)?
-            .shutdown();
-        drop(self.output.take());
-        result
-    }
-
-    pub fn is_conpty_available() -> bool {
-        unsafe {
-            let size = COORD { X: 2, Y: 2 };
-            let mut test_handle: HPCON = 0;
-
-            let (test_input_write, test_input_read) = match Self::create_pipe() {
-                Ok(p) => p,
-                Err(_) => return false,
-            };
-            let (test_output_write, test_output_read) = match Self::create_pipe() {
-                Ok(p) => p,
-                Err(_) => {
-                    CloseHandle(test_input_write);
-                    CloseHandle(test_input_read);
-                    return false;
-                }
-            };
-
-            let result = CreatePseudoConsole(
-                size,
-                test_input_read,
-                test_output_write,
-                1,
-                &mut test_handle,
-            );
-
-            CloseHandle(test_input_read);
-            CloseHandle(test_input_write);
-            CloseHandle(test_output_read);
-            CloseHandle(test_output_write);
-
-            if result == S_OK && test_handle != 0 {
-                ClosePseudoConsole(test_handle);
-                return true;
-            }
-
-            false
+        if result == S_OK && test_handle != 0 {
+            ClosePseudoConsole(test_handle);
+            return true;
         }
-    }
 
-    fn create_pipe() -> Result<(HANDLE, HANDLE), PtyError> {
+        false
+    }
+}
+
+impl Pipe {
+    fn create() -> Result<Self, PtyError> {
         let mut read_handle: HANDLE = INVALID_HANDLE_VALUE;
         let mut write_handle: HANDLE = INVALID_HANDLE_VALUE;
 
@@ -327,111 +254,149 @@ impl PtySession {
             return Err(PtyError::io("create anonymous pipe"));
         }
 
-        Ok((write_handle, read_handle))
+        Ok(Self {
+            read: OwnedHandle::new(read_handle),
+            write: OwnedHandle::new(write_handle),
+        })
+    }
+}
+
+impl OwnedHandle {
+    fn new(handle: HANDLE) -> Self {
+        Self { handle }
     }
 
-    fn create_process_with_pty(command: &str, pty_handle: HPCON) -> Result<HANDLE, PtyError> {
-        let mut cmd_wide: Vec<u16> = OsStr::new(command).encode_wide().chain(Some(0)).collect();
-        let application = application_name(command);
-        let application_wide = application.as_deref().map(|application| {
-            OsStr::new(application)
-                .encode_wide()
-                .chain(Some(0))
-                .collect::<Vec<u16>>()
-        });
-        let application_ptr = application_wide
-            .as_ref()
-            .map_or(null_mut(), |application| application.as_ptr() as *mut _);
+    fn raw(&self) -> HANDLE {
+        self.handle
+    }
 
-        let mut startup_info: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
-        startup_info.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
-        startup_info.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
-        startup_info.StartupInfo.hStdInput = INVALID_HANDLE_VALUE;
-        startup_info.StartupInfo.hStdOutput = INVALID_HANDLE_VALUE;
-        startup_info.StartupInfo.hStdError = INVALID_HANDLE_VALUE;
-
-        let mut attr_list_size: usize = 0;
-        unsafe {
-            InitializeProcThreadAttributeList(null_mut(), 1, 0, &mut attr_list_size);
+    fn close(&mut self, operation: &'static str) -> Result<(), PtyError> {
+        if self.handle == INVALID_HANDLE_VALUE || self.handle.is_null() {
+            return Ok(());
         }
 
-        let attr_list_layout = Layout::from_size_align(attr_list_size, 8).map_err(|_| {
-            PtyError::from_io(
-                "create attribute list layout",
-                io::Error::other("invalid attribute list layout"),
-            )
-        })?;
-        let attr_list: LPPROC_THREAD_ATTRIBUTE_LIST =
-            unsafe { alloc(attr_list_layout) as LPPROC_THREAD_ATTRIBUTE_LIST };
-
-        if attr_list.is_null() {
-            return Err(PtyError::from_io(
-                "allocate process attribute list",
-                io::Error::other("allocation returned null"),
-            ));
-        }
-
-        let cleanup_attr_list = |initialized: bool| unsafe {
-            if initialized {
-                DeleteProcThreadAttributeList(attr_list);
-            }
-            dealloc(attr_list as *mut u8, attr_list_layout);
-        };
-
-        let result =
-            unsafe { InitializeProcThreadAttributeList(attr_list, 1, 0, &mut attr_list_size) };
-        if result == 0 {
-            cleanup_attr_list(false);
-            return Err(PtyError::io("initialize process attribute list"));
-        }
-
-        let result = unsafe {
-            UpdateProcThreadAttribute(
-                attr_list,
-                0,
-                PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE as usize,
-                pty_handle as *const c_void,
-                std::mem::size_of::<HPCON>(),
-                null_mut(),
-                null_mut(),
-            )
-        };
+        let result = unsafe { CloseHandle(self.handle) };
+        self.handle = INVALID_HANDLE_VALUE;
 
         if result == 0 {
-            cleanup_attr_list(true);
-            return Err(PtyError::io("attach pseudoconsole attribute"));
+            Err(PtyError::io(operation))
+        } else {
+            Ok(())
         }
+    }
+}
 
-        startup_info.lpAttributeList = attr_list;
+impl Drop for OwnedHandle {
+    fn drop(&mut self) {
+        let _ = self.close("close handle");
+    }
+}
 
-        let mut process_info: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
-        let result = unsafe {
-            CreateProcessW(
-                application_ptr,
-                cmd_wide.as_mut_ptr(),
-                null_mut(),
-                null_mut(),
-                0,
-                EXTENDED_STARTUPINFO_PRESENT,
-                null_mut(),
-                null_mut(),
-                (&mut startup_info as *mut STARTUPINFOEXW).cast::<STARTUPINFOW>(),
-                &mut process_info,
-            )
-        };
-        let process_error = (result == 0).then(|| unsafe { GetLastError() });
+fn create_process_with_pty(command: &str, pty_handle: HPCON) -> Result<OwnedHandle, PtyError> {
+    let mut cmd_wide: Vec<u16> = OsStr::new(command).encode_wide().chain(Some(0)).collect();
+    let application = application_name(command);
+    let application_wide = application.as_deref().map(|application| {
+        OsStr::new(application)
+            .encode_wide()
+            .chain(Some(0))
+            .collect::<Vec<u16>>()
+    });
+    let application_ptr = application_wide
+        .as_ref()
+        .map_or(null_mut(), |application| application.as_ptr() as *mut _);
+
+    let mut startup_info: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
+    startup_info.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
+    startup_info.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    startup_info.StartupInfo.hStdInput = INVALID_HANDLE_VALUE;
+    startup_info.StartupInfo.hStdOutput = INVALID_HANDLE_VALUE;
+    startup_info.StartupInfo.hStdError = INVALID_HANDLE_VALUE;
+
+    let mut attr_list_size: usize = 0;
+    unsafe {
+        InitializeProcThreadAttributeList(null_mut(), 1, 0, &mut attr_list_size);
+    }
+
+    let attr_list_layout = Layout::from_size_align(attr_list_size, 8).map_err(|_| {
+        PtyError::from_io(
+            "create attribute list layout",
+            io::Error::other("invalid attribute list layout"),
+        )
+    })?;
+    let attr_list: LPPROC_THREAD_ATTRIBUTE_LIST =
+        unsafe { alloc(attr_list_layout) as LPPROC_THREAD_ATTRIBUTE_LIST };
+
+    if attr_list.is_null() {
+        return Err(PtyError::from_io(
+            "allocate process attribute list",
+            io::Error::other("allocation returned null"),
+        ));
+    }
+
+    let cleanup_attr_list = |initialized: bool| unsafe {
+        if initialized {
+            DeleteProcThreadAttributeList(attr_list);
+        }
+        dealloc(attr_list as *mut u8, attr_list_layout);
+    };
+
+    let result = unsafe { InitializeProcThreadAttributeList(attr_list, 1, 0, &mut attr_list_size) };
+    if result == 0 {
+        cleanup_attr_list(false);
+        return Err(PtyError::io("initialize process attribute list"));
+    }
+
+    let result = unsafe {
+        UpdateProcThreadAttribute(
+            attr_list,
+            0,
+            PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE as usize,
+            pty_handle as *const c_void,
+            std::mem::size_of::<HPCON>(),
+            null_mut(),
+            null_mut(),
+        )
+    };
+
+    if result == 0 {
         cleanup_attr_list(true);
-
-        if let Some(error_code) = process_error {
-            return Err(PtyError::ProcessCreationFailed(error_code));
-        }
-
-        unsafe {
-            CloseHandle(process_info.hThread);
-        }
-
-        Ok(process_info.hProcess)
+        return Err(PtyError::io("attach pseudoconsole attribute"));
     }
+
+    startup_info.lpAttributeList = attr_list;
+
+    let mut process_info: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+    let result = unsafe {
+        CreateProcessW(
+            application_ptr,
+            cmd_wide.as_mut_ptr(),
+            null_mut(),
+            null_mut(),
+            0,
+            EXTENDED_STARTUPINFO_PRESENT,
+            null_mut(),
+            null_mut(),
+            (&mut startup_info as *mut STARTUPINFOEXW).cast::<STARTUPINFOW>(),
+            &mut process_info,
+        )
+    };
+    let process_error = (result == 0).then(|| unsafe { GetLastError() });
+    cleanup_attr_list(true);
+
+    if let Some(error_code) = process_error {
+        return Err(PtyError::ProcessCreationFailed(error_code));
+    }
+
+    let process_handle = OwnedHandle::new(process_info.hProcess);
+    let mut thread_handle = OwnedHandle::new(process_info.hThread);
+    if let Err(err) = thread_handle.close("close process thread handle") {
+        unsafe {
+            TerminateProcess(process_handle.raw(), 0);
+        }
+        return Err(err);
+    }
+
+    Ok(process_handle)
 }
 
 impl PtyInput {
@@ -445,7 +410,7 @@ impl PtyInput {
             unsafe {
                 let mut bytes_written = 0u32;
                 let result = WriteFile(
-                    self.handle,
+                    self.handle.raw(),
                     remaining.as_ptr(),
                     bytes_to_write,
                     &mut bytes_written,
@@ -468,12 +433,6 @@ impl PtyInput {
     }
 }
 
-impl Drop for PtyInput {
-    fn drop(&mut self) {
-        close_handle(&mut self.handle);
-    }
-}
-
 impl PtyOutput {
     pub fn read(&mut self, buf: &mut [u8]) -> Result<PtyRead, PtyError> {
         if buf.is_empty() {
@@ -484,7 +443,7 @@ impl PtyOutput {
         unsafe {
             let mut bytes_read = 0u32;
             let result = ReadFile(
-                self.handle,
+                self.handle.raw(),
                 buf.as_mut_ptr(),
                 bytes_to_read,
                 &mut bytes_read,
@@ -508,12 +467,6 @@ impl PtyOutput {
     }
 }
 
-impl Drop for PtyOutput {
-    fn drop(&mut self) {
-        close_handle(&mut self.handle);
-    }
-}
-
 impl PtyControl {
     pub fn resize(&mut self, size: PtySize) -> Result<(), PtyError> {
         if !size.is_valid() {
@@ -521,7 +474,13 @@ impl PtyControl {
         }
 
         unsafe {
-            let result = ResizePseudoConsole(self.pty_handle, size_to_coord(size));
+            let Some(pty_handle) = self.pty_handle else {
+                return Err(PtyError::from_io(
+                    "resize pseudoconsole",
+                    io::Error::other("pseudoconsole handle is closed"),
+                ));
+            };
+            let result = ResizePseudoConsole(pty_handle, size_to_coord(size));
             if result != S_OK {
                 return Err(PtyError::io("resize pseudoconsole"));
             }
@@ -531,11 +490,11 @@ impl PtyControl {
     }
 
     pub fn has_exited(&self) -> Result<bool, PtyError> {
-        if self.process_handle == INVALID_HANDLE_VALUE {
+        let Some(process_handle) = &self.process_handle else {
             return Ok(true);
-        }
+        };
 
-        match unsafe { WaitForSingleObject(self.process_handle, 0) } {
+        match unsafe { WaitForSingleObject(process_handle.raw(), 0) } {
             WAIT_OBJECT_0 => Ok(true),
             WAIT_TIMEOUT => Ok(false),
             WAIT_FAILED => Err(PtyError::io("wait for process")),
@@ -544,12 +503,16 @@ impl PtyControl {
     }
 
     pub fn exit_code(&self) -> Result<Option<u32>, PtyError> {
+        let Some(process_handle) = &self.process_handle else {
+            return Ok(None);
+        };
+
         if !self.has_exited()? {
             return Ok(None);
         }
 
         let mut exit_code = 0u32;
-        let result = unsafe { GetExitCodeProcess(self.process_handle, &mut exit_code) };
+        let result = unsafe { GetExitCodeProcess(process_handle.raw(), &mut exit_code) };
         if result == 0 {
             return Err(PtyError::io("get process exit code"));
         }
@@ -566,44 +529,43 @@ impl PtyControl {
         let mut first_error = None;
 
         unsafe {
-            if self.pty_handle != 0 {
-                ClosePseudoConsole(self.pty_handle);
-                self.pty_handle = 0;
+            if let Some(pty_handle) = self.pty_handle.take() {
+                ClosePseudoConsole(pty_handle);
             }
 
-            if self.process_handle != INVALID_HANDLE_VALUE {
+            if let Some(mut process_handle) = self.process_handle.take() {
+                let raw_process_handle = process_handle.raw();
                 if allow_graceful_wait {
-                    match WaitForSingleObject(self.process_handle, SHUTDOWN_WAIT_MS) {
+                    match WaitForSingleObject(raw_process_handle, SHUTDOWN_WAIT_MS) {
                         WAIT_OBJECT_0 => {}
                         WAIT_TIMEOUT => {
-                            if TerminateProcess(self.process_handle, 0) == 0 {
+                            if TerminateProcess(raw_process_handle, 0) == 0 {
                                 first_error
                                     .get_or_insert_with(|| PtyError::io("terminate process"));
                             }
                         }
                         WAIT_FAILED => {
                             first_error.get_or_insert_with(|| PtyError::io("wait for process"));
-                            if TerminateProcess(self.process_handle, 0) == 0 {
+                            if TerminateProcess(raw_process_handle, 0) == 0 {
                                 first_error
                                     .get_or_insert_with(|| PtyError::io("terminate process"));
                             }
                         }
                         status => {
                             first_error.get_or_insert(PtyError::ProcessWaitFailed(status));
-                            if TerminateProcess(self.process_handle, 0) == 0 {
+                            if TerminateProcess(raw_process_handle, 0) == 0 {
                                 first_error
                                     .get_or_insert_with(|| PtyError::io("terminate process"));
                             }
                         }
                     }
-                } else if TerminateProcess(self.process_handle, 0) == 0 {
+                } else if TerminateProcess(raw_process_handle, 0) == 0 {
                     first_error.get_or_insert_with(|| PtyError::io("terminate process"));
                 }
 
-                if CloseHandle(self.process_handle) == 0 {
-                    first_error.get_or_insert_with(|| PtyError::io("close process handle"));
+                if let Err(err) = process_handle.close("close process handle") {
+                    first_error.get_or_insert(err);
                 }
-                self.process_handle = INVALID_HANDLE_VALUE;
             }
         }
 
@@ -622,15 +584,6 @@ impl Drop for PtyControl {
         }
 
         let _ = self.close_handles(false);
-    }
-}
-
-fn close_handle(handle: &mut HANDLE) {
-    if *handle != INVALID_HANDLE_VALUE {
-        unsafe {
-            CloseHandle(*handle);
-        }
-        *handle = INVALID_HANDLE_VALUE;
     }
 }
 
@@ -665,8 +618,8 @@ mod tests {
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(3);
 
-    fn spawn_test_cmd() -> PtySession {
-        PtySession::spawn("C:\\Windows\\System32\\cmd.exe /d /q", PtySize::new(24, 80))
+    fn spawn_test_cmd() -> PtyParts {
+        PtyParts::spawn("C:\\Windows\\System32\\cmd.exe /d /q", PtySize::new(24, 80))
             .expect("spawn cmd.exe")
     }
 
@@ -710,16 +663,16 @@ mod tests {
 
     #[test]
     fn spawn_cmd() {
-        let shell = PtySession::spawn("cmd.exe", PtySize::new(24, 80));
+        let shell = PtyParts::spawn("cmd.exe", PtySize::new(24, 80));
         assert!(shell.is_ok(), "failed to spawn cmd.exe: {:?}", shell.err());
     }
 
     #[test]
     fn invalid_dimensions() {
-        let result = PtySession::spawn("cmd.exe", PtySize::new(0, 80));
+        let result = PtyParts::spawn("cmd.exe", PtySize::new(0, 80));
         assert!(matches!(result, Err(PtyError::InvalidDimensions)));
 
-        let result = PtySession::spawn("cmd.exe", PtySize::new(24, 0));
+        let result = PtyParts::spawn("cmd.exe", PtySize::new(24, 0));
         assert!(matches!(result, Err(PtyError::InvalidDimensions)));
     }
 
@@ -729,7 +682,7 @@ mod tests {
             mut input,
             output,
             mut control,
-        } = spawn_test_cmd().split().expect("split session");
+        } = spawn_test_cmd();
         let output_rx = read_until(output, "mightty-ready");
 
         input
@@ -746,7 +699,7 @@ mod tests {
             mut input,
             output,
             mut control,
-        } = spawn_test_cmd().split().expect("split session");
+        } = spawn_test_cmd();
         let output_rx = read_until(output, "mightty-idle-ready");
 
         thread::sleep(Duration::from_millis(80));
@@ -764,7 +717,7 @@ mod tests {
             mut input,
             output,
             mut control,
-        } = spawn_test_cmd().split().expect("split session");
+        } = spawn_test_cmd();
         let output_rx = read_until(output, "mightty-high-done");
 
         input
@@ -783,12 +736,17 @@ mod tests {
 
     #[test]
     fn reports_process_exit() {
-        let mut shell = spawn_test_cmd();
-        shell.write(b"exit\r\n").expect("write exit");
+        let PtyParts {
+            mut input,
+            output: _output,
+            mut control,
+        } = spawn_test_cmd();
+        input.write_all(b"exit\r\n").expect("write exit");
 
         let deadline = Instant::now() + TEST_TIMEOUT;
         while Instant::now() < deadline {
-            if shell.has_exited().expect("check process exit") {
+            if control.has_exited().expect("check process exit") {
+                control.shutdown().expect("shutdown shell");
                 return;
             }
             thread::sleep(Duration::from_millis(10));
@@ -799,18 +757,28 @@ mod tests {
 
     #[test]
     fn resizes_session() {
-        let mut shell = spawn_test_cmd();
-        shell
+        let PtyParts {
+            input: _input,
+            output: _output,
+            mut control,
+        } = spawn_test_cmd();
+        control
             .resize(PtySize::new(40, 120))
             .expect("resize pseudoconsole");
-        shell.shutdown().expect("shutdown shell");
+        control.shutdown().expect("shutdown shell");
     }
 
     #[test]
     fn writes_paste_sized_input() {
-        let mut shell = spawn_test_cmd();
+        let PtyParts {
+            mut input,
+            output: _output,
+            mut control,
+        } = spawn_test_cmd();
         let command = format!("rem {}\r\n", "x".repeat(8192));
-        shell.write(command.as_bytes()).expect("write large input");
-        shell.shutdown().expect("shutdown shell");
+        input
+            .write_all(command.as_bytes())
+            .expect("write large input");
+        control.shutdown().expect("shutdown shell");
     }
 }

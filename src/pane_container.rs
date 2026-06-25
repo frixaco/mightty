@@ -1,15 +1,14 @@
 use gpui::{
     Action, App, Context, Entity, Font, FontFallbacks, IntoElement, KeyBinding, MouseButton,
-    MouseDownEvent, Render, Window, WindowControlArea, actions, div, font, prelude::*, px,
+    MouseDownEvent, Render, Task, Window, WindowControlArea, actions, div, font, prelude::*, px,
 };
 use gpui_component::InteractiveElementExt;
 use serde::Deserialize;
 use std::path::Path;
 use std::sync::OnceLock;
 
-use crate::pane::Pane;
 use crate::split::{Split, SplitDirection};
-use crate::widget::TerminalConfig;
+use crate::widget::{TerminalConfig, TerminalWidget};
 
 actions!(
     terminal,
@@ -59,19 +58,26 @@ pub struct PaneContainer {
     sidebar_visible: bool,
     needs_focus: bool,
     config: TerminalConfig,
+    exit_tx: flume::Sender<()>,
+    exit_task: Task<()>,
 }
 
 impl PaneContainer {
     pub fn new(config: TerminalConfig, cx: &mut Context<Self>) -> Self {
-        let tab = Self::create_tab(config.clone(), cx);
+        let (exit_tx, exit_rx) = flume::unbounded();
+        let tab = Self::create_tab(config.clone(), exit_tx.clone(), cx);
 
-        Self {
+        let mut container = Self {
             tabs: vec![tab],
             active_tab_index: 0,
             sidebar_visible: true,
             needs_focus: true,
             config,
-        }
+            exit_tx,
+            exit_task: Task::ready(()),
+        };
+        container.start_exit_task(exit_rx, cx);
+        container
     }
 
     pub fn bind_keys(cx: &mut App) {
@@ -95,9 +101,13 @@ impl PaneContainer {
         ]);
     }
 
-    fn create_tab(config: TerminalConfig, cx: &mut Context<Self>) -> Tab {
-        let pane = cx.new(|cx| Pane::new(config, cx));
-        let split = cx.new(|_cx| Split::with_pane(pane));
+    fn create_tab(
+        config: TerminalConfig,
+        exit_tx: flume::Sender<()>,
+        cx: &mut Context<Self>,
+    ) -> Tab {
+        let terminal = Self::create_terminal(config, exit_tx, cx);
+        let split = cx.new(|_cx| Split::with_terminal(terminal));
 
         Tab {
             split,
@@ -105,12 +115,22 @@ impl PaneContainer {
         }
     }
 
+    fn create_terminal(
+        config: TerminalConfig,
+        exit_tx: flume::Sender<()>,
+        cx: &mut Context<Self>,
+    ) -> Entity<TerminalWidget> {
+        let terminal = cx.new(|cx| TerminalWidget::new(config, cx));
+        terminal.update(cx, |terminal, _cx| terminal.set_exit_signal(exit_tx));
+        terminal
+    }
+
     fn active_split(&self) -> Entity<Split> {
         self.tabs[self.active_tab_index].split.clone()
     }
 
-    fn new_pane(&self, cx: &mut Context<Self>) -> Entity<Pane> {
-        cx.new(|cx| Pane::new(self.config.clone(), cx))
+    fn new_terminal(&self, cx: &mut Context<Self>) -> Entity<TerminalWidget> {
+        Self::create_terminal(self.config.clone(), self.exit_tx.clone(), cx)
     }
 
     fn split_active(
@@ -119,11 +139,11 @@ impl PaneContainer {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let new_pane = self.new_pane(cx);
+        let new_terminal = self.new_terminal(cx);
         let split = self.active_split();
 
         split.update(cx, |split, cx| {
-            split.split_active(direction, new_pane, window, cx);
+            split.split_active(direction, new_terminal, window, cx);
             split.focus_active(window, cx);
         });
 
@@ -135,7 +155,7 @@ impl PaneContainer {
             return;
         }
 
-        let tab = Self::create_tab(self.config.clone(), cx);
+        let tab = Self::create_tab(self.config.clone(), self.exit_tx.clone(), cx);
         self.tabs.push(tab);
         self.active_tab_index = self.tabs.len() - 1;
         self.needs_focus = true;
@@ -164,7 +184,7 @@ impl PaneContainer {
         if pane_count > 1 {
             let pane_to_focus = split.update(cx, |split, cx| split.remove_active_pane(window, cx));
             if let Some(pane) = pane_to_focus {
-                pane.update(cx, |pane, cx| pane.request_focus(window, cx));
+                pane.update(cx, |pane, _cx| pane.request_focus(window));
             }
             cx.notify();
             return;
@@ -189,39 +209,44 @@ impl PaneContainer {
         cx.notify();
     }
 
-    fn check_for_exits(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let mut focus_after_remove = None;
-        let active_split = self.active_split();
+    fn start_exit_task(&mut self, exit_rx: flume::Receiver<()>, cx: &mut Context<Self>) {
+        self.exit_task = cx.spawn(async move |this, cx| {
+            while exit_rx.recv_async().await.is_ok() {
+                while exit_rx.try_recv().is_ok() {}
+
+                let Some(this) = this.upgrade() else {
+                    break;
+                };
+
+                this.update(cx, |this, cx| {
+                    if this.remove_exited_panes(cx) {
+                        this.needs_focus = true;
+                        cx.notify();
+                    }
+                })
+                .ok();
+            }
+        });
+    }
+
+    fn remove_exited_panes(&mut self, cx: &mut Context<Self>) -> bool {
+        let mut removed_any = false;
 
         for tab in &self.tabs {
-            let pane_count = tab.split.read(cx).pane_count();
-            if pane_count <= 1 {
-                continue;
-            }
-
-            let panes = tab.split.read(cx).panes();
-            let exited_panes: Vec<_> = panes
-                .iter()
-                .filter_map(|pane| {
-                    let exited = pane.update(cx, |pane, cx| pane.check_exit(cx));
-                    exited.then_some(pane.entity_id())
-                })
-                .collect();
-
+            let exited_panes = tab.split.read(cx).exited_terminal_ids(cx);
             for pane_id in exited_panes {
-                let pane_to_focus = tab
-                    .split
-                    .update(cx, |split, cx| split.remove_pane_by_id(pane_id, window, cx));
-                if tab.split == active_split {
-                    focus_after_remove = pane_to_focus;
+                if tab.split.read(cx).pane_count() <= 1 {
+                    break;
                 }
+
+                let removed = tab
+                    .split
+                    .update(cx, |split, _cx| split.remove_pane_by_id(pane_id));
+                removed_any |= removed.is_some();
             }
         }
 
-        if let Some(pane) = focus_after_remove {
-            pane.update(cx, |pane, cx| pane.request_focus(window, cx));
-            cx.notify();
-        }
+        removed_any
     }
 
     fn on_split_right(
@@ -423,7 +448,6 @@ fn caption_icon_font_family() -> &'static str {
 
 impl Render for PaneContainer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.check_for_exits(window, cx);
         if self.needs_focus {
             self.needs_focus = false;
             self.focus_active_tab(window, cx);

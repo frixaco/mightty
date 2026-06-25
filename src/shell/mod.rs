@@ -29,24 +29,12 @@ pub enum PtyRead {
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
-pub use windows::PtyError;
-#[cfg(windows)]
-pub use windows::PtySession;
-#[cfg(windows)]
-pub type ConPtyError = PtyError;
-#[cfg(windows)]
-pub type ConPtyShell = PtySession;
+pub use windows::{PtyControl, PtyError, PtyInput, PtyOutput, PtyParts, is_conpty_available};
 
 #[cfg(unix)]
 mod unix;
 #[cfg(unix)]
-pub use unix::PtyError;
-#[cfg(unix)]
-pub use unix::PtySession;
-#[cfg(unix)]
-pub type ConPtyError = PtyError;
-#[cfg(unix)]
-pub type ConPtyShell = PtySession;
+pub use unix::{PtyControl, PtyError, PtyInput, PtyOutput, PtyParts, is_conpty_available};
 
 #[cfg(not(any(windows, unix)))]
 compile_error!("mightty shell bridge supports Windows and Unix targets only");

@@ -1,36 +1,38 @@
 //! Terminal Widget
 //!
-//! GPUI component that renders terminal content and handles user interaction.
-//! Combines a PTY session, libghostty Terminal, and key encoding into a complete
-//! terminal widget.
+//! GPUI component that owns terminal state and wires shell I/O, input encoding,
+//! rendering, and feedback capture together.
 
-use crate::feedback::{
-    self, CaptureCell, CaptureColors, CaptureCursor, CaptureRow, FontCapture, GridSize, RgbHex,
-    SizePx, TerminalCapture,
-};
+mod capture;
+mod input;
+mod pty;
+mod render;
+
+use crate::feedback;
 use crate::ghostty::{
     RenderState, Terminal, TerminalOptions,
-    key::{Action, Encoder, Event, Key, Mods},
-    render::{CellIterator, CellWidth, RowIterator},
-    style::{RgbColor, Underline},
+    key::{Action, Encoder, Event},
+    render::{CellIterator, RowIterator},
+    style::RgbColor,
 };
 use crate::pane_container::shortcut_action;
+use crate::shell::PtySize;
 use gpui::{
-    Context, FocusHandle, FontFallbacks, FontFeatures, FontStyle, FontWeight, InteractiveElement,
-    IntoElement, KeyDownEvent, KeyUpEvent, MouseButton, MouseDownEvent, Pixels, Render, Size,
-    StrikethroughStyle, Styled, StyledText, Task, TextRun, TextStyle, Timer, UnderlineStyle,
-    WhiteSpace, Window, canvas, div, prelude::*, px,
+    Context, FocusHandle, KeyDownEvent, KeyUpEvent, MouseDownEvent, Pixels, Size, Task, Timer,
+    Window, px,
 };
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
-use std::thread::JoinHandle;
 use std::time::Duration;
 
-use crate::shell::PtySize;
-#[cfg(windows)]
-use crate::shell::{PtyRead, PtySession};
+use pty::{OUTPUT_DRAIN_BUDGET, PtyCommand, PtyEvent, PtyWorker};
+
+pub(super) const TERMINAL_FONT_FAMILY: &str = "JetBrainsMono Nerd Font Mono";
+pub(super) const TERMINAL_FONT_SIZE_PX: f32 = 16.0;
+
+const FEEDBACK_CAPTURE_KEY: &str = "f12";
 
 /// Cursor style options
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -56,7 +58,7 @@ pub struct TerminalConfig {
 impl Default for TerminalConfig {
     fn default() -> Self {
         Self {
-            shell: "pwsh.exe".to_string(),
+            shell: default_shell(),
             initial_rows: 24,
             initial_cols: 80,
             scrollback: 1000,
@@ -67,41 +69,19 @@ impl Default for TerminalConfig {
     }
 }
 
-const TERMINAL_FONT_FAMILY: &str = "JetBrainsMono Nerd Font Mono";
-const TERMINAL_FONT_SIZE_PX: f32 = 16.0;
-const FEEDBACK_CAPTURE_KEY: &str = "f12";
-const PTY_READ_BUFFER_SIZE: usize = 32 * 1024;
-const PTY_OUTPUT_QUEUE_CAPACITY: usize = 64;
-const PTY_OUTPUT_DRAIN_BUDGET: usize = 256 * 1024;
-
-fn terminal_font_features() -> FontFeatures {
-    FontFeatures(Arc::new(vec![
-        ("calt".to_string(), 0),
-        ("liga".to_string(), 0),
-        ("kern".to_string(), 0),
-    ]))
+#[cfg(windows)]
+fn default_shell() -> String {
+    "pwsh.exe".to_string()
 }
 
-fn terminal_font_fallbacks() -> FontFallbacks {
-    FontFallbacks::from_fonts(vec![
-        TERMINAL_FONT_FAMILY.to_string(),
-        "Consolas".to_string(),
-        "Cascadia Mono".to_string(),
-        "DejaVu Sans Mono".to_string(),
-        "Noto Sans Mono".to_string(),
-        "JetBrains Mono".to_string(),
-        "Fira Mono".to_string(),
-        "Sarasa Mono SC".to_string(),
-        "Sarasa Term SC".to_string(),
-        "Sarasa Mono J".to_string(),
-        "Noto Sans Mono CJK SC".to_string(),
-        "Noto Sans Mono CJK JP".to_string(),
-        "Source Han Mono SC".to_string(),
-        "WenQuanYi Zen Hei Mono".to_string(),
-        "Apple Color Emoji".to_string(),
-        "Noto Color Emoji".to_string(),
-        "Segoe UI Emoji".to_string(),
-    ])
+#[cfg(unix)]
+fn default_shell() -> String {
+    std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
+}
+
+#[cfg(not(any(windows, unix)))]
+fn default_shell() -> String {
+    String::new()
 }
 
 pub struct TerminalWidget {
@@ -113,6 +93,7 @@ pub struct TerminalWidget {
     cell_iterator: CellIterator<'static>,
     config: TerminalConfig,
     pty_tx: Option<flume::Sender<PtyCommand>>,
+    exit_signal_tx: Option<flume::Sender<()>>,
     exit_flag: Arc<AtomicBool>,
     pty_worker: Option<PtyWorker>,
     output_task: Task<()>,
@@ -164,465 +145,6 @@ impl Default for TerminalTheme {
     }
 }
 
-fn rgb_to_rgba(rgb: RgbColor) -> gpui::Rgba {
-    gpui::rgb((rgb.r as u32) << 16 | (rgb.g as u32) << 8 | rgb.b as u32)
-}
-
-fn rgba_to_rgb(rgba: gpui::Rgba) -> RgbColor {
-    RgbColor {
-        r: (rgba.r * 255.0).round().clamp(0.0, 255.0) as u8,
-        g: (rgba.g * 255.0).round().clamp(0.0, 255.0) as u8,
-        b: (rgba.b * 255.0).round().clamp(0.0, 255.0) as u8,
-    }
-}
-
-fn terminal_palette(theme_palette: [gpui::Rgba; 16]) -> [RgbColor; 256] {
-    let mut palette = [RgbColor { r: 0, g: 0, b: 0 }; 256];
-    for (index, color) in theme_palette.into_iter().enumerate() {
-        palette[index] = rgba_to_rgb(color);
-    }
-
-    let levels = [0, 95, 135, 175, 215, 255];
-    let mut index = 16;
-    for r in levels {
-        for g in levels {
-            for b in levels {
-                palette[index] = RgbColor { r, g, b };
-                index += 1;
-            }
-        }
-    }
-
-    for gray_index in 0..24 {
-        let value = 8 + gray_index * 10;
-        palette[232 + gray_index as usize] = RgbColor {
-            r: value,
-            g: value,
-            b: value,
-        };
-    }
-
-    palette
-}
-
-trait CellWidthExt {
-    fn column_advance(self) -> u16;
-}
-
-impl CellWidthExt for CellWidth {
-    fn column_advance(self) -> u16 {
-        match self {
-            Self::Narrow => 1,
-            Self::Wide => 2,
-            Self::SpacerTail | Self::SpacerHead => 0,
-        }
-    }
-}
-
-trait RenderCellExt {
-    fn width(&self) -> crate::ghostty::Result<CellWidth>;
-}
-
-impl RenderCellExt for libghostty_vt::render::CellIteration<'_, '_> {
-    fn width(&self) -> crate::ghostty::Result<CellWidth> {
-        self.raw_cell()?.wide()
-    }
-}
-
-fn rgb_hex(rgb: RgbColor) -> RgbHex {
-    RgbHex::new(rgb.r, rgb.g, rgb.b)
-}
-
-fn underline_name(underline: Underline) -> &'static str {
-    match underline {
-        Underline::None => "none",
-        Underline::Single => "single",
-        Underline::Double => "double",
-        Underline::Curly => "curly",
-        Underline::Dotted => "dotted",
-        Underline::Dashed => "dashed",
-        _ => "unknown",
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct RowTextStyle {
-    fg: RgbColor,
-    bg: Option<RgbColor>,
-    default_bg: RgbColor,
-    bold: bool,
-    italic: bool,
-    underline: Underline,
-    strikethrough: bool,
-}
-
-struct RowSegment {
-    start_col: u16,
-    columns: u16,
-    text: String,
-    style: RowTextStyle,
-}
-
-impl RowSegment {
-    fn new(start_col: u16, columns: u16, text: String, style: RowTextStyle) -> Self {
-        Self {
-            start_col,
-            columns,
-            text,
-            style,
-        }
-    }
-}
-
-enum PtyCommand {
-    Write(Vec<u8>),
-    Resize(PtySize),
-    Shutdown,
-}
-
-enum PtyEvent {
-    Output(Vec<u8>),
-    Exited,
-}
-
-#[cfg(windows)]
-struct PtyWorker {
-    command_tx: flume::Sender<PtyCommand>,
-    control_thread: Option<JoinHandle<()>>,
-    reader_thread: Option<JoinHandle<()>>,
-}
-
-#[cfg(not(windows))]
-struct PtyWorker;
-
-#[cfg(windows)]
-impl PtyWorker {
-    fn spawn(
-        shell_cmd: String,
-        rows: u16,
-        cols: u16,
-        exit_flag: Arc<AtomicBool>,
-    ) -> Result<(Self, flume::Receiver<PtyEvent>), crate::shell::PtyError> {
-        let session = PtySession::spawn(&shell_cmd, PtySize::new(rows, cols))?;
-        let parts = session.split()?;
-        let (command_tx, command_rx) = flume::unbounded::<PtyCommand>();
-        let (event_tx, event_rx) = flume::bounded::<PtyEvent>(PTY_OUTPUT_QUEUE_CAPACITY);
-
-        let mut input = parts.input;
-        let mut control = parts.control;
-        let control_exit_flag = Arc::clone(&exit_flag);
-        let control_event_tx = event_tx.clone();
-        let control_thread = std::thread::spawn(move || {
-            while let Ok(command) = command_rx.recv() {
-                let result = match command {
-                    PtyCommand::Write(data) => input.write_all(&data),
-                    PtyCommand::Resize(size) => control.resize(size),
-                    PtyCommand::Shutdown => break,
-                };
-
-                if let Err(err) = result {
-                    eprintln!("ConPTY command failed: {err}");
-                    control_exit_flag.store(true, Ordering::Relaxed);
-                    let _ = control_event_tx.try_send(PtyEvent::Exited);
-                    break;
-                }
-            }
-
-            let _ = control.shutdown();
-        });
-
-        let mut output = parts.output;
-        let reader_exit_flag = Arc::clone(&exit_flag);
-        let reader_thread = std::thread::spawn(move || {
-            let mut buf = [0u8; PTY_READ_BUFFER_SIZE];
-
-            loop {
-                match output.read(&mut buf) {
-                    Ok(PtyRead::Data(0)) => {}
-                    Ok(PtyRead::Data(n)) => {
-                        if event_tx.send(PtyEvent::Output(buf[..n].to_vec())).is_err() {
-                            break;
-                        }
-                    }
-                    Ok(PtyRead::Eof) => break,
-                    Err(err) => {
-                        eprintln!("ConPTY output read failed: {err}");
-                        break;
-                    }
-                }
-            }
-
-            reader_exit_flag.store(true, Ordering::Relaxed);
-            let _ = event_tx.try_send(PtyEvent::Exited);
-        });
-
-        Ok((
-            Self {
-                command_tx,
-                control_thread: Some(control_thread),
-                reader_thread: Some(reader_thread),
-            },
-            event_rx,
-        ))
-    }
-
-    fn command_tx(&self) -> flume::Sender<PtyCommand> {
-        self.command_tx.clone()
-    }
-
-    fn shutdown(&mut self) {
-        let _ = self.command_tx.send(PtyCommand::Shutdown);
-
-        if let Some(handle) = self.control_thread.take() {
-            let _ = handle.join();
-        }
-
-        if let Some(handle) = self.reader_thread.take() {
-            let _ = handle.join();
-        }
-    }
-}
-
-impl Drop for PtyWorker {
-    fn drop(&mut self) {
-        #[cfg(windows)]
-        self.shutdown();
-    }
-}
-
-fn mix_rgb(a: RgbColor, b: RgbColor, ratio: f32) -> RgbColor {
-    let t = ratio.clamp(0.0, 1.0);
-    let blend = |lhs: u8, rhs: u8| -> u8 {
-        ((lhs as f32 * (1.0 - t)) + (rhs as f32 * t))
-            .round()
-            .clamp(0.0, 255.0) as u8
-    };
-
-    RgbColor {
-        r: blend(a.r, b.r),
-        g: blend(a.g, b.g),
-        b: blend(a.b, b.b),
-    }
-}
-
-fn rgb_to_hsv(rgb: RgbColor) -> (f32, f32, f32) {
-    let r = rgb.r as f32 / 255.0;
-    let g = rgb.g as f32 / 255.0;
-    let b = rgb.b as f32 / 255.0;
-    let max = r.max(g).max(b);
-    let min = r.min(g).min(b);
-    let delta = max - min;
-
-    let hue = if delta == 0.0 {
-        0.0
-    } else if max == r {
-        60.0 * (((g - b) / delta).rem_euclid(6.0))
-    } else if max == g {
-        60.0 * (((b - r) / delta) + 2.0)
-    } else {
-        60.0 * (((r - g) / delta) + 4.0)
-    };
-
-    let saturation = if max == 0.0 { 0.0 } else { delta / max };
-    (hue, saturation, max)
-}
-
-fn bold_display_palette_color(rgb: RgbColor, base_bg: RgbColor) -> RgbColor {
-    let (hue, saturation, value) = rgb_to_hsv(rgb);
-
-    if saturation < 0.16 || value < 0.2 {
-        return if relative_luminance(base_bg) < 0.35 {
-            RgbColor {
-                r: 230,
-                g: 237,
-                b: 243,
-            }
-        } else {
-            RgbColor {
-                r: 30,
-                g: 41,
-                b: 59,
-            }
-        };
-    }
-
-    match hue {
-        h if !(15.0..345.0).contains(&h) => RgbColor {
-            r: 255,
-            g: 123,
-            b: 114,
-        },
-        h if h < 45.0 => RgbColor {
-            r: 255,
-            g: 184,
-            b: 108,
-        },
-        h if h < 70.0 => RgbColor {
-            r: 229,
-            g: 192,
-            b: 123,
-        },
-        h if h < 150.0 => RgbColor {
-            r: 152,
-            g: 195,
-            b: 121,
-        },
-        h if h < 210.0 => RgbColor {
-            r: 86,
-            g: 212,
-            b: 221,
-        },
-        h if h < 270.0 => RgbColor {
-            r: 97,
-            g: 175,
-            b: 239,
-        },
-        _ => RgbColor {
-            r: 198,
-            g: 120,
-            b: 221,
-        },
-    }
-}
-
-fn relative_luminance(rgb: RgbColor) -> f32 {
-    fn channel(value: u8) -> f32 {
-        let normalized = value as f32 / 255.0;
-        if normalized <= 0.03928 {
-            normalized / 12.92
-        } else {
-            ((normalized + 0.055) / 1.055).powf(2.4)
-        }
-    }
-
-    0.2126 * channel(rgb.r) + 0.7152 * channel(rgb.g) + 0.0722 * channel(rgb.b)
-}
-
-fn contrast_ratio(a: RgbColor, b: RgbColor) -> f32 {
-    let a_lum = relative_luminance(a);
-    let b_lum = relative_luminance(b);
-    let lighter = a_lum.max(b_lum);
-    let darker = a_lum.min(b_lum);
-    (lighter + 0.05) / (darker + 0.05)
-}
-
-fn emphasized_bold_colors(style: RowTextStyle) -> (RgbColor, Option<RgbColor>) {
-    let base_bg = style.bg.unwrap_or(style.default_bg);
-    let mut fg = bold_display_palette_color(style.fg, base_bg);
-    let target = if relative_luminance(base_bg) < 0.35 {
-        RgbColor {
-            r: 255,
-            g: 255,
-            b: 255,
-        }
-    } else {
-        RgbColor { r: 0, g: 0, b: 0 }
-    };
-
-    if contrast_ratio(fg, base_bg) < 7.0 {
-        for ratio in [0.55_f32, 0.7, 0.82, 0.9] {
-            let candidate = mix_rgb(fg, target, ratio);
-            fg = candidate;
-            if contrast_ratio(fg, base_bg) >= 7.0 {
-                break;
-            }
-        }
-    }
-
-    (fg, style.bg)
-}
-
-fn resolved_render_style(style: RowTextStyle) -> (RgbColor, Option<RgbColor>, FontWeight) {
-    if style.bold {
-        let (fg, bg) = emphasized_bold_colors(style);
-        (fg, bg, FontWeight::BOLD)
-    } else {
-        (style.fg, style.bg, FontWeight::NORMAL)
-    }
-}
-
-fn text_run_for_style(base_style: &TextStyle, style: RowTextStyle, len: usize) -> TextRun {
-    let mut run_style = base_style.clone();
-    let (fg, _bg, font_weight) = resolved_render_style(style);
-    run_style.color = rgb_to_rgba(fg).into();
-    run_style.background_color = None;
-    run_style.font_weight = font_weight;
-    run_style.font_style = if style.italic {
-        FontStyle::Italic
-    } else {
-        FontStyle::Normal
-    };
-    run_style.underline = match style.underline {
-        Underline::None => None,
-        Underline::Curly => Some(UnderlineStyle {
-            thickness: px(1.0),
-            color: Some(rgb_to_rgba(fg).into()),
-            wavy: true,
-        }),
-        _ => Some(UnderlineStyle {
-            thickness: px(1.0),
-            color: Some(rgb_to_rgba(fg).into()),
-            wavy: false,
-        }),
-    };
-    run_style.strikethrough = style.strikethrough.then_some(StrikethroughStyle {
-        thickness: px(1.0),
-        color: Some(rgb_to_rgba(fg).into()),
-    });
-    run_style.to_run(len)
-}
-
-fn segment_needs_own_layout(segment: &str, columns: u16) -> bool {
-    columns != 1 || !segment.is_ascii()
-}
-
-fn push_row_segment(
-    segments: &mut Vec<RowSegment>,
-    pending: &mut Option<RowSegment>,
-    start_col: u16,
-    columns: u16,
-    style: RowTextStyle,
-    text: String,
-) {
-    if text.is_empty() {
-        return;
-    }
-
-    let isolate = segment_needs_own_layout(&text, columns);
-    if isolate {
-        if let Some(segment) = pending.take() {
-            segments.push(segment);
-        }
-        segments.push(RowSegment::new(start_col, columns, text, style));
-        return;
-    }
-
-    if let Some(segment) = pending.as_mut()
-        && segment.style == style
-        && segment.start_col + segment.columns == start_col
-    {
-        segment.columns += columns;
-        segment.text.push_str(&text);
-        return;
-    }
-
-    if let Some(segment) = pending.take() {
-        segments.push(segment);
-    }
-    *pending = Some(RowSegment::new(start_col, columns, text, style));
-}
-
-fn cell_position(row: u16, col: u16, cell_size: (Pixels, Pixels)) -> (Pixels, Pixels) {
-    (cell_size.0 * col as f32, cell_size.1 * row as f32)
-}
-
-fn pty_event_len(event: &PtyEvent) -> usize {
-    match event {
-        PtyEvent::Output(data) => data.len(),
-        PtyEvent::Exited => 0,
-    }
-}
-
 impl TerminalWidget {
     pub fn new(config: TerminalConfig, cx: &mut Context<Self>) -> Self {
         let theme = TerminalTheme::default();
@@ -635,7 +157,7 @@ impl TerminalWidget {
         })
         .expect("Failed to create terminal");
 
-        #[cfg(windows)]
+        #[cfg(any(windows, unix))]
         let (pty_worker, pty_event_rx, pty_tx) = {
             match PtyWorker::spawn(
                 config.shell.clone(),
@@ -655,7 +177,7 @@ impl TerminalWidget {
             }
         };
 
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, unix)))]
         let (pty_worker, pty_event_rx, pty_tx) = {
             exit_flag.store(true, Ordering::Relaxed);
             (None, None, None)
@@ -686,6 +208,8 @@ impl TerminalWidget {
 
         let size = (config.initial_cols, config.initial_rows);
 
+        let has_exited = exit_flag.load(Ordering::Relaxed);
+
         let mut widget = Self {
             terminal,
             key_encoder,
@@ -695,6 +219,7 @@ impl TerminalWidget {
             cell_iterator,
             config,
             pty_tx,
+            exit_signal_tx: None,
             exit_flag,
             pty_worker,
             output_task: Task::ready(()),
@@ -705,7 +230,7 @@ impl TerminalWidget {
             layout_size: None,
             cell_size: (px(9.6), px(19.2)),
             theme,
-            has_exited: false,
+            has_exited,
         };
 
         if let Some(event_rx) = pty_event_rx {
@@ -720,15 +245,13 @@ impl TerminalWidget {
     }
 
     pub fn has_exited(&self) -> bool {
-        self.has_exited
+        self.has_exited || self.exit_flag.load(Ordering::Relaxed)
     }
 
-    pub fn check_exit(&mut self) -> bool {
-        if !self.has_exited && self.exit_flag.load(Ordering::Relaxed) {
-            self.has_exited = true;
-            true
-        } else {
-            false
+    pub fn set_exit_signal(&mut self, tx: flume::Sender<()>) {
+        self.exit_signal_tx = Some(tx);
+        if self.has_exited() {
+            self.mark_exited();
         }
     }
 
@@ -772,12 +295,12 @@ impl TerminalWidget {
         self.output_task = cx.spawn(async move |this, cx| {
             while let Ok(first_event) = event_rx.recv_async().await {
                 let mut events = vec![first_event];
-                let mut drained_bytes = events.iter().map(pty_event_len).sum::<usize>();
+                let mut drained_bytes = events.iter().map(PtyEvent::len).sum::<usize>();
 
-                while drained_bytes < PTY_OUTPUT_DRAIN_BUDGET {
+                while drained_bytes < OUTPUT_DRAIN_BUDGET {
                     match event_rx.try_recv() {
                         Ok(event) => {
-                            drained_bytes += pty_event_len(&event);
+                            drained_bytes += event.len();
                             events.push(event);
                         }
                         Err(flume::TryRecvError::Empty) => break,
@@ -793,6 +316,9 @@ impl TerminalWidget {
                     for event in events {
                         this.apply_pty_event(event);
                     }
+                    if this.exit_flag.load(Ordering::Relaxed) {
+                        this.mark_exited();
+                    }
                     cx.notify();
                 })
                 .ok();
@@ -803,15 +329,27 @@ impl TerminalWidget {
     fn apply_pty_event(&mut self, event: PtyEvent) {
         match event {
             PtyEvent::Output(data) => self.terminal.vt_write(&data),
-            PtyEvent::Exited => self.exit_flag.store(true, Ordering::Relaxed),
+            PtyEvent::Exited => self.mark_exited(),
         }
     }
 
-    fn send_pty_command(&self, command: PtyCommand) {
+    fn send_pty_command(&mut self, command: PtyCommand) {
         if let Some(tx) = &self.pty_tx
             && tx.send(command).is_err()
         {
-            self.exit_flag.store(true, Ordering::Relaxed);
+            self.mark_exited();
+        }
+    }
+
+    fn mark_exited(&mut self) {
+        self.exit_flag.store(true, Ordering::Relaxed);
+        self.has_exited = true;
+        self.signal_exit();
+    }
+
+    fn signal_exit(&self) {
+        if let Some(tx) = &self.exit_signal_tx {
+            let _ = tx.send(());
         }
     }
 
@@ -915,44 +453,16 @@ impl TerminalWidget {
         keystroke: &gpui::Keystroke,
         cx: &mut Context<Self>,
     ) {
-        if let Some(vt_bytes) = self.encode_key_event(action, keystroke) {
+        if let Some(vt_bytes) = input::encode_key_event(
+            &mut self.key_encoder,
+            &mut self.key_event,
+            &self.terminal,
+            action,
+            keystroke,
+        ) {
             self.send_pty_command(PtyCommand::Write(vt_bytes));
         }
         self.reset_cursor_blink(cx);
-    }
-
-    fn encode_key_event(&mut self, action: Action, keystroke: &gpui::Keystroke) -> Option<Vec<u8>> {
-        let ghostty_key = self.convert_to_ghostty_key(keystroke);
-        let ghostty_mods = self.convert_to_ghostty_mods(keystroke);
-        let printable_text = self.printable_text(keystroke, action);
-        let unshifted_codepoint = self.unshifted_codepoint(keystroke);
-        let consumed_mods = self.consumed_mods(
-            &keystroke.key,
-            ghostty_mods,
-            printable_text,
-            unshifted_codepoint,
-        );
-
-        self.key_event
-            .set_action(action)
-            .set_key(ghostty_key)
-            .set_mods(ghostty_mods)
-            .set_consumed_mods(consumed_mods)
-            .set_unshifted_codepoint(unshifted_codepoint)
-            .set_utf8(printable_text)
-            .set_composing(false);
-
-        self.key_encoder.set_options_from_terminal(&self.terminal);
-
-        let mut response = Vec::with_capacity(64);
-        self.key_encoder
-            .encode_to_vec(&self.key_event, &mut response)
-            .ok()?;
-        if response.is_empty() {
-            None
-        } else {
-            Some(response)
-        }
     }
 
     fn is_feedback_capture_shortcut(&self, event: &KeyDownEvent) -> bool {
@@ -997,274 +507,6 @@ impl TerminalWidget {
         }
     }
 
-    fn build_feedback_capture(&mut self) -> crate::ghostty::Result<TerminalCapture> {
-        let snapshot = self.render_state.update(&self.terminal)?;
-        let colors = snapshot.colors()?;
-
-        let mut rows = Vec::new();
-        let mut row_it = self.row_iterator.update(&snapshot)?;
-        let mut row_idx = 0u16;
-        while let Some(row) = row_it.next() {
-            let mut row_text = String::new();
-            let mut cells = Vec::new();
-            let mut cell_it = self.cell_iterator.update(row)?;
-            let mut col_idx = 0u16;
-            while let Some(cell) = cell_it.next() {
-                let width = cell.width()?;
-                let advance = width.column_advance();
-                let graphemes_len = cell.graphemes_len()?;
-                if graphemes_len == 0
-                    || matches!(width, CellWidth::SpacerTail | CellWidth::SpacerHead)
-                {
-                    col_idx += advance;
-                    continue;
-                }
-
-                let text: String = cell.graphemes()?.into_iter().collect();
-                row_text.push_str(&text);
-
-                let fg = cell.fg_color()?.unwrap_or(colors.foreground);
-                let bg = cell.bg_color()?;
-                let style = cell.style()?;
-                cells.push(CaptureCell {
-                    col: col_idx,
-                    text,
-                    fg: rgb_hex(fg),
-                    bg: bg.map(rgb_hex),
-                    bold: style.bold,
-                    italic: style.italic,
-                    underline: underline_name(style.underline).to_string(),
-                    inverse: style.inverse,
-                    strikethrough: style.strikethrough,
-                });
-                col_idx += advance;
-            }
-
-            rows.push(CaptureRow {
-                index: row_idx,
-                text: row_text,
-                cells,
-            });
-            row_idx += 1;
-        }
-
-        Ok(TerminalCapture {
-            captured_unix_ms: feedback::unix_timestamp_ms(),
-            terminal_size: GridSize {
-                cols: self.size.0,
-                rows: self.size.1,
-            },
-            cell_size_px: SizePx {
-                width: self.cell_size.0.into(),
-                height: self.cell_size.1.into(),
-            },
-            font: FontCapture {
-                family: TERMINAL_FONT_FAMILY.to_string(),
-                size_px: TERMINAL_FONT_SIZE_PX,
-            },
-            colors: CaptureColors {
-                foreground: rgb_hex(colors.foreground),
-                background: rgb_hex(colors.background),
-                cursor: colors.cursor.map(rgb_hex),
-            },
-            cursor: snapshot.cursor_viewport()?.map(|cursor| CaptureCursor {
-                x: cursor.x,
-                y: cursor.y,
-            }),
-            rows,
-        })
-    }
-
-    fn printable_text<'a>(
-        &self,
-        keystroke: &'a gpui::Keystroke,
-        action: Action,
-    ) -> Option<&'a str> {
-        if action == Action::Release {
-            return None;
-        }
-        keystroke
-            .key_char
-            .as_deref()
-            .filter(|t| !t.is_empty())
-            .or_else(|| {
-                if keystroke.key == "space" {
-                    Some(" ")
-                } else if keystroke.key.chars().count() == 1 {
-                    Some(keystroke.key.as_str())
-                } else {
-                    None
-                }
-            })
-    }
-
-    fn unshifted_codepoint(&self, keystroke: &gpui::Keystroke) -> char {
-        if keystroke.key == "space" {
-            return ' ';
-        }
-        let mut chars = keystroke.key.chars();
-        let Some(c) = chars.next() else { return '\0' };
-        if chars.next().is_some() {
-            return '\0';
-        }
-        match c {
-            'A'..='Z' => c.to_ascii_lowercase(),
-            '!' => '1',
-            '@' => '2',
-            '#' => '3',
-            '$' => '4',
-            '%' => '5',
-            '^' => '6',
-            '&' => '7',
-            '*' => '8',
-            '(' => '9',
-            ')' => '0',
-            '_' => '-',
-            '+' => '=',
-            '{' => '[',
-            '}' => ']',
-            '|' => '\\',
-            ':' => ';',
-            '"' => '\'',
-            '<' => ',',
-            '>' => '.',
-            '?' => '/',
-            '~' => '`',
-            _ => c,
-        }
-    }
-
-    fn consumed_mods(&self, key: &str, mods: Mods, text: Option<&str>, ucp: char) -> Mods {
-        let Some(t) = text else { return Mods::empty() };
-        let mut chars = t.chars();
-        let Some(tc) = chars.next() else {
-            return Mods::empty();
-        };
-        if chars.next().is_some() {
-            return Mods::empty();
-        }
-        if (mods.contains(Mods::SHIFT) && tc != ucp) || self.key_implies_shift(key, ucp) {
-            Mods::SHIFT
-        } else {
-            Mods::empty()
-        }
-    }
-
-    fn key_implies_shift(&self, key: &str, ucp: char) -> bool {
-        let mut chars = key.chars();
-        let Some(kc) = chars.next() else { return false };
-        if chars.next().is_some() {
-            return false;
-        }
-        ucp != '\0' && kc != ucp
-    }
-
-    fn convert_to_ghostty_key(&self, keystroke: &gpui::Keystroke) -> Key {
-        match keystroke.key.as_str() {
-            "up" => Key::ArrowUp,
-            "down" => Key::ArrowDown,
-            "left" => Key::ArrowLeft,
-            "right" => Key::ArrowRight,
-            "home" => Key::Home,
-            "end" => Key::End,
-            "insert" => Key::Insert,
-            "delete" => Key::Delete,
-            "pageup" => Key::PageUp,
-            "pagedown" => Key::PageDown,
-            "escape" => Key::Escape,
-            "enter" => Key::Enter,
-            "backspace" => Key::Backspace,
-            "tab" => Key::Tab,
-            "space" => Key::Space,
-            "f1" => Key::F1,
-            "f2" => Key::F2,
-            "f3" => Key::F3,
-            "f4" => Key::F4,
-            "f5" => Key::F5,
-            "f6" => Key::F6,
-            "f7" => Key::F7,
-            "f8" => Key::F8,
-            "f9" => Key::F9,
-            "f10" => Key::F10,
-            "f11" => Key::F11,
-            "f12" => Key::F12,
-            _ if keystroke.key.len() == 1 => {
-                let c = keystroke.key.chars().next().unwrap_or('?');
-                match c.to_ascii_lowercase() {
-                    'a'..='z' => match c {
-                        'a' => Key::A,
-                        'b' => Key::B,
-                        'c' => Key::C,
-                        'd' => Key::D,
-                        'e' => Key::E,
-                        'f' => Key::F,
-                        'g' => Key::G,
-                        'h' => Key::H,
-                        'i' => Key::I,
-                        'j' => Key::J,
-                        'k' => Key::K,
-                        'l' => Key::L,
-                        'm' => Key::M,
-                        'n' => Key::N,
-                        'o' => Key::O,
-                        'p' => Key::P,
-                        'q' => Key::Q,
-                        'r' => Key::R,
-                        's' => Key::S,
-                        't' => Key::T,
-                        'u' => Key::U,
-                        'v' => Key::V,
-                        'w' => Key::W,
-                        'x' => Key::X,
-                        'y' => Key::Y,
-                        'z' => Key::Z,
-                        _ => Key::Unidentified,
-                    },
-                    '0' => Key::Digit0,
-                    '1' => Key::Digit1,
-                    '2' => Key::Digit2,
-                    '3' => Key::Digit3,
-                    '4' => Key::Digit4,
-                    '5' => Key::Digit5,
-                    '6' => Key::Digit6,
-                    '7' => Key::Digit7,
-                    '8' => Key::Digit8,
-                    '9' => Key::Digit9,
-                    '-' => Key::Minus,
-                    '=' => Key::Equal,
-                    '[' => Key::BracketLeft,
-                    ']' => Key::BracketRight,
-                    ';' => Key::Semicolon,
-                    '\'' => Key::Quote,
-                    ',' => Key::Comma,
-                    '.' => Key::Period,
-                    '/' => Key::Slash,
-                    '\\' => Key::Backslash,
-                    '`' => Key::Backquote,
-                    _ => Key::Unidentified,
-                }
-            }
-            _ => Key::Unidentified,
-        }
-    }
-
-    fn convert_to_ghostty_mods(&self, keystroke: &gpui::Keystroke) -> Mods {
-        let mut mods = Mods::empty();
-        if keystroke.modifiers.shift {
-            mods |= Mods::SHIFT;
-        }
-        if keystroke.modifiers.alt {
-            mods |= Mods::ALT;
-        }
-        if keystroke.modifiers.control {
-            mods |= Mods::CTRL;
-        }
-        if keystroke.modifiers.platform {
-            mods |= Mods::SUPER;
-        }
-        mods
-    }
-
     fn handle_mouse_down(
         &mut self,
         _event: &MouseDownEvent,
@@ -1272,249 +514,6 @@ impl TerminalWidget {
         _cx: &mut Context<Self>,
     ) {
         self.focus_handle.focus(window);
-    }
-}
-
-impl Render for TerminalWidget {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let layout_size = self.layout_size.unwrap_or_else(|| window.viewport_size());
-        self.resize_to_size(layout_size, cx);
-
-        let snapshot = match self.render_state.update(&self.terminal) {
-            Ok(s) => s,
-            Err(_) => {
-                return div()
-                    .size_full()
-                    .bg(self.theme.background)
-                    .child("Failed to update render state");
-            }
-        };
-
-        let colors = match snapshot.colors() {
-            Ok(c) => c,
-            Err(_) => return div().size_full().bg(self.theme.background),
-        };
-
-        let cell_size = self.cell_size;
-        let mut elements: Vec<gpui::AnyElement> = Vec::new();
-        let mut base_text_style = window.text_style();
-        base_text_style.font_family = TERMINAL_FONT_FAMILY.into();
-        base_text_style.font_features = terminal_font_features();
-        base_text_style.font_fallbacks = Some(terminal_font_fallbacks());
-        base_text_style.font_size = px(TERMINAL_FONT_SIZE_PX).into();
-        base_text_style.line_height = cell_size.1.into();
-        base_text_style.white_space = WhiteSpace::Nowrap;
-
-        let mut row_it = match self.row_iterator.update(&snapshot) {
-            Ok(it) => it,
-            Err(_) => return div().size_full().bg(self.theme.background),
-        };
-
-        let mut row_idx: u16 = 0;
-        while let Some(row) = row_it.next() {
-            let mut cell_it = match self.cell_iterator.update(row) {
-                Ok(it) => it,
-                Err(_) => continue,
-            };
-
-            let mut row_segments = Vec::new();
-            let mut pending_segment = None;
-            let mut col_idx = 0u16;
-            while let Some(cell) = cell_it.next() {
-                let width = match cell.width() {
-                    Ok(width) => width,
-                    Err(_) => continue,
-                };
-                let advance = width.column_advance();
-                let start_col = col_idx;
-                col_idx += advance;
-                let graphemes_len = match cell.graphemes_len() {
-                    Ok(n) => n,
-                    Err(_) => {
-                        if advance > 0 {
-                            push_row_segment(
-                                &mut row_segments,
-                                &mut pending_segment,
-                                start_col,
-                                advance,
-                                RowTextStyle {
-                                    fg: colors.foreground,
-                                    bg: None,
-                                    default_bg: colors.background,
-                                    bold: false,
-                                    italic: false,
-                                    underline: Underline::None,
-                                    strikethrough: false,
-                                },
-                                " ".repeat(advance as usize),
-                            );
-                        }
-                        continue;
-                    }
-                };
-
-                if matches!(width, CellWidth::SpacerTail | CellWidth::SpacerHead) {
-                    continue;
-                }
-
-                let fg = cell.fg_color().ok().flatten().unwrap_or(colors.foreground);
-                let bg = cell.bg_color().ok().flatten();
-                let style = match cell.style() {
-                    Ok(s) => s,
-                    Err(_) => {
-                        push_row_segment(
-                            &mut row_segments,
-                            &mut pending_segment,
-                            start_col,
-                            advance.max(1),
-                            RowTextStyle {
-                                fg,
-                                bg,
-                                default_bg: colors.background,
-                                bold: false,
-                                italic: false,
-                                underline: Underline::None,
-                                strikethrough: false,
-                            },
-                            " ".repeat(advance.max(1) as usize),
-                        );
-                        continue;
-                    }
-                };
-
-                let (fg_color, bg_color, has_bg) = if style.inverse {
-                    (fg, bg.unwrap_or(colors.background), true)
-                } else {
-                    (fg, bg.unwrap_or(colors.background), bg.is_some())
-                };
-
-                let segment = if graphemes_len == 0 {
-                    " ".repeat(advance.max(1) as usize)
-                } else {
-                    match cell.graphemes() {
-                        Ok(g) => g.into_iter().collect(),
-                        Err(_) => " ".repeat(advance.max(1) as usize),
-                    }
-                };
-                push_row_segment(
-                    &mut row_segments,
-                    &mut pending_segment,
-                    start_col,
-                    advance.max(1),
-                    RowTextStyle {
-                        fg: fg_color,
-                        bg: (has_bg || style.inverse).then_some(bg_color),
-                        default_bg: colors.background,
-                        bold: style.bold,
-                        italic: style.italic,
-                        underline: style.underline,
-                        strikethrough: style.strikethrough,
-                    },
-                    segment,
-                );
-            }
-
-            if let Some(segment) = pending_segment.take() {
-                row_segments.push(segment);
-            }
-
-            for segment in row_segments {
-                let (x, y) = cell_position(row_idx, segment.start_col, cell_size);
-                let segment_width = cell_size.0 * segment.columns as f32;
-                let segment_len = segment.text.len();
-                let (_, segment_bg, _) = resolved_render_style(segment.style);
-                let segment_div = div()
-                    .absolute()
-                    .left(x)
-                    .top(y)
-                    .w(segment_width)
-                    .h(cell_size.1)
-                    .overflow_hidden()
-                    .whitespace_nowrap()
-                    .text_size(px(TERMINAL_FONT_SIZE_PX))
-                    .font_family(TERMINAL_FONT_FAMILY)
-                    .line_height(cell_size.1)
-                    .when_some(segment_bg, |div, bg| div.bg(rgb_to_rgba(bg)))
-                    .child(
-                        StyledText::new(segment.text).with_runs(vec![text_run_for_style(
-                            &base_text_style,
-                            segment.style,
-                            segment_len,
-                        )]),
-                    );
-                elements.push(segment_div.into_any_element());
-            }
-            let _ = row.set_dirty(false);
-            row_idx += 1;
-        }
-
-        let is_focused = self.focus_handle.is_focused(window);
-        let cursor_visible = is_focused && (self.cursor_blink_phase || !self.config.cursor_blink);
-
-        if cursor_visible && let Ok(Some(cursor_pos)) = snapshot.cursor_viewport() {
-            let cursor_color = colors.cursor.unwrap_or(colors.foreground);
-            let (x, y) = cell_position(cursor_pos.y, cursor_pos.x, cell_size);
-            let cursor_rgba = rgb_to_rgba(cursor_color);
-
-            let cursor_div = match self.config.cursor_style {
-                CursorStyle::Block => div()
-                    .absolute()
-                    .left(x)
-                    .top(y)
-                    .w(cell_size.0)
-                    .h(cell_size.1)
-                    .bg(cursor_rgba),
-                CursorStyle::Line => div()
-                    .absolute()
-                    .left(x)
-                    .top(y)
-                    .w(px(2.0))
-                    .h(cell_size.1)
-                    .bg(cursor_rgba),
-                CursorStyle::Underline => div()
-                    .absolute()
-                    .left(x)
-                    .top(y + cell_size.1 - px(2.0))
-                    .w(cell_size.0)
-                    .h(px(2.0))
-                    .bg(cursor_rgba),
-            };
-            elements.push(cursor_div.into_any_element());
-        }
-
-        let entity = cx.entity();
-
-        div()
-            .size_full()
-            .bg(rgb_to_rgba(colors.background))
-            .relative()
-            .overflow_hidden()
-            .track_focus(&self.focus_handle)
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-                this.handle_key_down(event, window, cx)
-            }))
-            .on_key_up(cx.listener(|this, event: &KeyUpEvent, window, cx| {
-                this.handle_key_up(event, window, cx)
-            }))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, event: &MouseDownEvent, window, cx| {
-                    this.handle_mouse_down(event, window, cx)
-                }),
-            )
-            .children(elements)
-            .child(
-                canvas(
-                    move |bounds, _window, cx| {
-                        entity.update(cx, |this, cx| {
-                            this.update_layout_size(bounds.size, cx);
-                        });
-                    },
-                    |_, _, _, _| {},
-                )
-                .absolute()
-                .size_full(),
-            )
     }
 }
 
@@ -1530,94 +529,43 @@ impl Drop for TerminalWidget {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+pub(super) fn rgb_to_rgba(rgb: RgbColor) -> gpui::Rgba {
+    gpui::rgb((rgb.r as u32) << 16 | (rgb.g as u32) << 8 | rgb.b as u32)
+}
 
-    #[test]
-    fn bold_style_survives_box_emoji_prompt_segment() {
-        let mut terminal = Terminal::new(TerminalOptions {
-            cols: 32,
-            rows: 4,
-            max_scrollback: 100,
-        })
-        .expect("terminal");
-        terminal.resize(32, 4, 10, 20).expect("resize");
-        terminal.vt_write("📦 \u{1b}[1mrepo\u{1b}[0m".as_bytes());
+fn rgba_to_rgb(rgba: gpui::Rgba) -> RgbColor {
+    RgbColor {
+        r: (rgba.r * 255.0).round().clamp(0.0, 255.0) as u8,
+        g: (rgba.g * 255.0).round().clamp(0.0, 255.0) as u8,
+        b: (rgba.b * 255.0).round().clamp(0.0, 255.0) as u8,
+    }
+}
 
-        let mut render_state = RenderState::new().expect("render state");
-        let snapshot = render_state.update(&terminal).expect("snapshot");
-        let mut row_iterator = RowIterator::new().expect("row iterator");
-        let mut cell_iterator = CellIterator::new().expect("cell iterator");
-
-        let mut rows = row_iterator.update(&snapshot).expect("rows");
-        let row = rows.next().expect("first row");
-        let mut cells = cell_iterator.update(row).expect("cells");
-
-        let mut letters = Vec::new();
-        while let Some(cell) = cells.next() {
-            let text: String = cell.graphemes().expect("graphemes").into_iter().collect();
-            if text.is_empty() {
-                continue;
-            }
-
-            if matches!(text.as_str(), "r" | "e" | "p" | "o") {
-                letters.push((text, cell.style().expect("style").bold));
-            }
-        }
-
-        assert_eq!(
-            letters,
-            vec![
-                ("r".to_string(), true),
-                ("e".to_string(), true),
-                ("p".to_string(), true),
-                ("o".to_string(), true),
-            ]
-        );
+fn terminal_palette(theme_palette: [gpui::Rgba; 16]) -> [RgbColor; 256] {
+    let mut palette = [RgbColor { r: 0, g: 0, b: 0 }; 256];
+    for (index, color) in theme_palette.into_iter().enumerate() {
+        palette[index] = rgba_to_rgb(color);
     }
 
-    #[test]
-    fn box_emoji_advances_two_columns() {
-        let mut terminal = Terminal::new(TerminalOptions {
-            cols: 32,
-            rows: 4,
-            max_scrollback: 100,
-        })
-        .expect("terminal");
-        terminal.resize(32, 4, 10, 20).expect("resize");
-        terminal.vt_write("x📦y".as_bytes());
-
-        let mut render_state = RenderState::new().expect("render state");
-        let snapshot = render_state.update(&terminal).expect("snapshot");
-        let mut row_iterator = RowIterator::new().expect("row iterator");
-        let mut cell_iterator = CellIterator::new().expect("cell iterator");
-
-        let mut rows = row_iterator.update(&snapshot).expect("rows");
-        let row = rows.next().expect("first row");
-        let mut cells = cell_iterator.update(row).expect("cells");
-
-        let mut positions = Vec::new();
-        let mut col_idx = 0u16;
-        while let Some(cell) = cells.next() {
-            let width = cell.width().expect("width");
-            let advance = width.column_advance();
-            let text: String = cell.graphemes().expect("graphemes").into_iter().collect();
-
-            if !text.is_empty() && !matches!(width, CellWidth::SpacerTail | CellWidth::SpacerHead) {
-                positions.push((text, col_idx, width));
+    let levels = [0, 95, 135, 175, 215, 255];
+    let mut index = 16;
+    for r in levels {
+        for g in levels {
+            for b in levels {
+                palette[index] = RgbColor { r, g, b };
+                index += 1;
             }
-
-            col_idx += advance;
         }
-
-        assert_eq!(
-            positions,
-            vec![
-                ("x".to_string(), 0, CellWidth::Narrow),
-                ("📦".to_string(), 1, CellWidth::Wide),
-                ("y".to_string(), 3, CellWidth::Narrow),
-            ]
-        );
     }
+
+    for gray_index in 0..24 {
+        let value = 8 + gray_index * 10;
+        palette[232 + gray_index as usize] = RgbColor {
+            r: value,
+            g: value,
+            b: value,
+        };
+    }
+
+    palette
 }

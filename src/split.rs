@@ -2,7 +2,7 @@ use gpui::{
     AnyElement, Context, Entity, EntityId, IntoElement, Render, Window, div, prelude::*, px,
 };
 
-use crate::pane::Pane;
+use crate::widget::TerminalWidget;
 
 const SEPARATOR_COLOR: u32 = 0x00c853;
 const SEPARATOR_SIZE_PX: f32 = 1.0;
@@ -14,7 +14,7 @@ pub enum SplitDirection {
 }
 
 enum SplitNode {
-    Pane(Entity<Pane>),
+    Terminal(Entity<TerminalWidget>),
     Split {
         direction: SplitDirection,
         children: Vec<SplitNode>,
@@ -27,10 +27,10 @@ pub struct Split {
 }
 
 impl Split {
-    pub fn with_pane(pane: Entity<Pane>) -> Self {
+    pub fn with_terminal(terminal: Entity<TerminalWidget>) -> Self {
         Self {
-            active_pane_id: pane.entity_id(),
-            root: SplitNode::Pane(pane),
+            active_pane_id: terminal.entity_id(),
+            root: SplitNode::Terminal(terminal),
         }
     }
 
@@ -38,25 +38,25 @@ impl Split {
         self.root.pane_count()
     }
 
-    pub fn panes(&self) -> Vec<Entity<Pane>> {
-        let mut panes = Vec::new();
-        self.root.collect_panes(&mut panes);
-        panes
+    pub fn exited_terminal_ids(&self, cx: &gpui::App) -> Vec<EntityId> {
+        let mut terminal_ids = Vec::new();
+        self.root.collect_exited_terminal_ids(cx, &mut terminal_ids);
+        terminal_ids
     }
 
     pub fn split_active(
         &mut self,
         direction: SplitDirection,
-        pane: Entity<Pane>,
+        terminal: Entity<TerminalWidget>,
         window: &Window,
         cx: &mut Context<Self>,
     ) {
         self.update_active_from_focus(window, cx);
 
         let target_id = self.active_pane_id;
-        let new_pane_id = pane.entity_id();
-        if self.root.split_pane(target_id, direction, pane) {
-            self.active_pane_id = new_pane_id;
+        let new_terminal_id = terminal.entity_id();
+        if self.root.split_terminal(target_id, direction, terminal) {
+            self.active_pane_id = new_terminal_id;
         }
     }
 
@@ -64,58 +64,47 @@ impl Split {
         &mut self,
         window: &Window,
         cx: &mut Context<Self>,
-    ) -> Option<Entity<Pane>> {
+    ) -> Option<Entity<TerminalWidget>> {
         self.update_active_from_focus(window, cx);
-        self.remove_pane_and_select_next(self.active_pane_id)
+        self.remove_terminal_and_select_next(self.active_pane_id)
     }
 
-    pub fn remove_pane_by_id(
+    pub fn remove_pane_by_id(&mut self, pane_id: EntityId) -> Option<Entity<TerminalWidget>> {
+        self.remove_terminal_and_select_next(pane_id)
+    }
+
+    fn remove_terminal_and_select_next(
         &mut self,
         pane_id: EntityId,
-        window: &Window,
-        cx: &mut Context<Self>,
-    ) -> Option<Entity<Pane>> {
-        self.update_active_from_focus(window, cx);
-        self.remove_pane_and_select_next(pane_id)
-    }
-
-    fn remove_pane_and_select_next(&mut self, pane_id: EntityId) -> Option<Entity<Pane>> {
+    ) -> Option<Entity<TerminalWidget>> {
         if self.pane_count() <= 1 {
             return None;
         }
 
-        let panes_before = self.panes();
-        let target_index = panes_before
-            .iter()
-            .position(|pane| pane.entity_id() == pane_id)
-            .unwrap_or(0);
+        let target_index = self.root.terminal_index(pane_id).unwrap_or(0);
 
-        if !self.root.remove_pane(pane_id) {
+        if !self.root.remove_terminal(pane_id) {
             return None;
         }
         self.root.collapse_single_child_splits();
 
-        let panes_after = self.panes();
-        let focus_index = target_index.min(panes_after.len().saturating_sub(1));
-        let pane_to_focus = panes_after.get(focus_index).cloned();
-        if let Some(pane) = &pane_to_focus {
-            self.active_pane_id = pane.entity_id();
+        let terminal_to_focus = self.root.terminal_at(target_index);
+        if let Some(terminal) = &terminal_to_focus {
+            self.active_pane_id = terminal.entity_id();
         }
 
-        pane_to_focus
+        terminal_to_focus
     }
 
     pub fn focus_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let panes = self.panes();
-        let pane = panes
-            .iter()
-            .find(|pane| pane.entity_id() == self.active_pane_id)
-            .cloned()
-            .or_else(|| panes.first().cloned());
+        let terminal = self
+            .root
+            .terminal_by_id(self.active_pane_id)
+            .or_else(|| self.root.terminal_at(0));
 
-        if let Some(pane) = pane {
-            self.active_pane_id = pane.entity_id();
-            pane.update(cx, |pane, cx| pane.request_focus(window, cx));
+        if let Some(terminal) = terminal {
+            self.active_pane_id = terminal.entity_id();
+            terminal.update(cx, |terminal, _cx| terminal.request_focus(window));
         }
     }
 
@@ -129,17 +118,21 @@ impl Split {
 impl SplitNode {
     fn pane_count(&self) -> usize {
         match self {
-            Self::Pane(_) => 1,
+            Self::Terminal(_) => 1,
             Self::Split { children, .. } => children.iter().map(Self::pane_count).sum(),
         }
     }
 
-    fn collect_panes(&self, panes: &mut Vec<Entity<Pane>>) {
+    fn collect_exited_terminal_ids(&self, cx: &gpui::App, terminal_ids: &mut Vec<EntityId>) {
         match self {
-            Self::Pane(pane) => panes.push(pane.clone()),
+            Self::Terminal(terminal) => {
+                if terminal.read(cx).has_exited() {
+                    terminal_ids.push(terminal.entity_id());
+                }
+            }
             Self::Split { children, .. } => {
                 for child in children {
-                    child.collect_panes(panes);
+                    child.collect_exited_terminal_ids(cx, terminal_ids);
                 }
             }
         }
@@ -147,35 +140,36 @@ impl SplitNode {
 
     fn focused_pane_id(&self, window: &Window, cx: &Context<Split>) -> Option<EntityId> {
         match self {
-            Self::Pane(pane) => pane
+            Self::Terminal(terminal) => terminal
                 .read(cx)
-                .is_focused(window, cx)
-                .then_some(pane.entity_id()),
+                .focus_handle()
+                .is_focused(window)
+                .then_some(terminal.entity_id()),
             Self::Split { children, .. } => children
                 .iter()
                 .find_map(|child| child.focused_pane_id(window, cx)),
         }
     }
 
-    fn split_pane(
+    fn split_terminal(
         &mut self,
         target_id: EntityId,
         direction: SplitDirection,
-        pane: Entity<Pane>,
+        terminal: Entity<TerminalWidget>,
     ) -> bool {
         match self {
-            Self::Pane(existing_pane) if existing_pane.entity_id() == target_id => {
-                let existing_pane = existing_pane.clone();
+            Self::Terminal(existing_terminal) if existing_terminal.entity_id() == target_id => {
+                let existing_terminal = existing_terminal.clone();
                 *self = Self::Split {
                     direction,
-                    children: vec![Self::Pane(existing_pane), Self::Pane(pane)],
+                    children: vec![Self::Terminal(existing_terminal), Self::Terminal(terminal)],
                 };
                 true
             }
-            Self::Pane(_) => false,
+            Self::Terminal(_) => false,
             Self::Split { children, .. } => {
                 for child in children {
-                    if child.split_pane(target_id, direction, pane.clone()) {
+                    if child.split_terminal(target_id, direction, terminal.clone()) {
                         return true;
                     }
                 }
@@ -184,15 +178,15 @@ impl SplitNode {
         }
     }
 
-    fn remove_pane(&mut self, target_id: EntityId) -> bool {
+    fn remove_terminal(&mut self, target_id: EntityId) -> bool {
         match self {
-            Self::Pane(_) => false,
+            Self::Terminal(_) => false,
             Self::Split { children, .. } => {
                 let Some(index) = children.iter().position(
-                    |child| matches!(child, Self::Pane(pane) if pane.entity_id() == target_id),
+                    |child| matches!(child, Self::Terminal(terminal) if terminal.entity_id() == target_id),
                 ) else {
                     for child in children {
-                        if child.remove_pane(target_id) {
+                        if child.remove_terminal(target_id) {
                             return true;
                         }
                     }
@@ -202,6 +196,57 @@ impl SplitNode {
                 children.remove(index);
                 true
             }
+        }
+    }
+
+    fn terminal_by_id(&self, target_id: EntityId) -> Option<Entity<TerminalWidget>> {
+        match self {
+            Self::Terminal(terminal) => {
+                (terminal.entity_id() == target_id).then(|| terminal.clone())
+            }
+            Self::Split { children, .. } => children
+                .iter()
+                .find_map(|child| child.terminal_by_id(target_id)),
+        }
+    }
+
+    fn terminal_index(&self, target_id: EntityId) -> Option<usize> {
+        let mut index = 0;
+        self.find_terminal_index(target_id, &mut index)
+    }
+
+    fn find_terminal_index(&self, target_id: EntityId, index: &mut usize) -> Option<usize> {
+        match self {
+            Self::Terminal(terminal) => {
+                let current = *index;
+                *index += 1;
+                (terminal.entity_id() == target_id).then_some(current)
+            }
+            Self::Split { children, .. } => children
+                .iter()
+                .find_map(|child| child.find_terminal_index(target_id, index)),
+        }
+    }
+
+    fn terminal_at(&self, target_index: usize) -> Option<Entity<TerminalWidget>> {
+        let mut index = 0;
+        self.find_terminal_at(target_index, &mut index)
+    }
+
+    fn find_terminal_at(
+        &self,
+        target_index: usize,
+        index: &mut usize,
+    ) -> Option<Entity<TerminalWidget>> {
+        match self {
+            Self::Terminal(terminal) => {
+                let current = *index;
+                *index += 1;
+                (current == target_index).then(|| terminal.clone())
+            }
+            Self::Split { children, .. } => children
+                .iter()
+                .find_map(|child| child.find_terminal_at(target_index, index)),
         }
     }
 
@@ -219,13 +264,16 @@ impl SplitNode {
 
     fn render(&self) -> AnyElement {
         match self {
-            Self::Pane(pane) => div()
+            Self::Terminal(terminal) => div()
                 .size_full()
                 .flex()
                 .flex_1()
                 .min_w_0()
                 .min_h_0()
-                .child(pane.clone())
+                .rounded(px(4.0))
+                .overflow_hidden()
+                .bg(gpui::rgb(0x000000))
+                .child(terminal.clone())
                 .into_any_element(),
             Self::Split {
                 direction,

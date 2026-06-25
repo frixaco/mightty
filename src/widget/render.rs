@@ -1,0 +1,660 @@
+use crate::ghostty::{
+    render::CellWidth,
+    style::{RgbColor, Underline},
+};
+use gpui::{
+    Context, FontFallbacks, FontFeatures, FontStyle, FontWeight, IntoElement, KeyDownEvent,
+    KeyUpEvent, MouseButton, MouseDownEvent, Pixels, Render, StrikethroughStyle, Styled,
+    StyledText, TextRun, TextStyle, UnderlineStyle, WhiteSpace, Window, canvas, div, prelude::*,
+    px,
+};
+use std::sync::Arc;
+
+use super::{
+    CursorStyle, TERMINAL_FONT_FAMILY, TERMINAL_FONT_SIZE_PX, TerminalWidget, rgb_to_rgba,
+};
+
+pub(super) trait CellWidthExt {
+    fn column_advance(self) -> u16;
+}
+
+impl CellWidthExt for CellWidth {
+    fn column_advance(self) -> u16 {
+        match self {
+            Self::Narrow => 1,
+            Self::Wide => 2,
+            Self::SpacerTail | Self::SpacerHead => 0,
+        }
+    }
+}
+
+pub(super) trait RenderCellExt {
+    fn width(&self) -> crate::ghostty::Result<CellWidth>;
+}
+
+impl RenderCellExt for libghostty_vt::render::CellIteration<'_, '_> {
+    fn width(&self) -> crate::ghostty::Result<CellWidth> {
+        self.raw_cell()?.wide()
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct RowTextStyle {
+    fg: RgbColor,
+    bg: Option<RgbColor>,
+    default_bg: RgbColor,
+    bold: bool,
+    italic: bool,
+    underline: Underline,
+    strikethrough: bool,
+}
+
+struct RowSegment {
+    start_col: u16,
+    columns: u16,
+    text: String,
+    style: RowTextStyle,
+}
+
+impl RowSegment {
+    fn new(start_col: u16, columns: u16, text: String, style: RowTextStyle) -> Self {
+        Self {
+            start_col,
+            columns,
+            text,
+            style,
+        }
+    }
+}
+
+impl Render for TerminalWidget {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let layout_size = self.layout_size.unwrap_or_else(|| window.viewport_size());
+        self.resize_to_size(layout_size, cx);
+
+        let snapshot = match self.render_state.update(&self.terminal) {
+            Ok(s) => s,
+            Err(_) => {
+                return div()
+                    .size_full()
+                    .bg(self.theme.background)
+                    .child("Failed to update render state");
+            }
+        };
+
+        let colors = match snapshot.colors() {
+            Ok(c) => c,
+            Err(_) => return div().size_full().bg(self.theme.background),
+        };
+
+        let cell_size = self.cell_size;
+        let mut elements: Vec<gpui::AnyElement> = Vec::new();
+        let mut base_text_style = window.text_style();
+        base_text_style.font_family = TERMINAL_FONT_FAMILY.into();
+        base_text_style.font_features = terminal_font_features();
+        base_text_style.font_fallbacks = Some(terminal_font_fallbacks());
+        base_text_style.font_size = px(TERMINAL_FONT_SIZE_PX).into();
+        base_text_style.line_height = cell_size.1.into();
+        base_text_style.white_space = WhiteSpace::Nowrap;
+
+        let mut row_it = match self.row_iterator.update(&snapshot) {
+            Ok(it) => it,
+            Err(_) => return div().size_full().bg(self.theme.background),
+        };
+
+        let mut row_idx: u16 = 0;
+        while let Some(row) = row_it.next() {
+            let mut cell_it = match self.cell_iterator.update(row) {
+                Ok(it) => it,
+                Err(_) => continue,
+            };
+
+            let mut row_segments = Vec::new();
+            let mut pending_segment = None;
+            let mut col_idx = 0u16;
+            while let Some(cell) = cell_it.next() {
+                let width = match cell.width() {
+                    Ok(width) => width,
+                    Err(_) => continue,
+                };
+                let advance = width.column_advance();
+                let start_col = col_idx;
+                col_idx += advance;
+                let graphemes_len = match cell.graphemes_len() {
+                    Ok(n) => n,
+                    Err(_) => {
+                        if advance > 0 {
+                            push_row_segment(
+                                &mut row_segments,
+                                &mut pending_segment,
+                                start_col,
+                                advance,
+                                RowTextStyle {
+                                    fg: colors.foreground,
+                                    bg: None,
+                                    default_bg: colors.background,
+                                    bold: false,
+                                    italic: false,
+                                    underline: Underline::None,
+                                    strikethrough: false,
+                                },
+                                " ".repeat(advance as usize),
+                            );
+                        }
+                        continue;
+                    }
+                };
+
+                if matches!(width, CellWidth::SpacerTail | CellWidth::SpacerHead) {
+                    continue;
+                }
+
+                let fg = cell.fg_color().ok().flatten().unwrap_or(colors.foreground);
+                let bg = cell.bg_color().ok().flatten();
+                let style = match cell.style() {
+                    Ok(s) => s,
+                    Err(_) => {
+                        push_row_segment(
+                            &mut row_segments,
+                            &mut pending_segment,
+                            start_col,
+                            advance.max(1),
+                            RowTextStyle {
+                                fg,
+                                bg,
+                                default_bg: colors.background,
+                                bold: false,
+                                italic: false,
+                                underline: Underline::None,
+                                strikethrough: false,
+                            },
+                            " ".repeat(advance.max(1) as usize),
+                        );
+                        continue;
+                    }
+                };
+
+                let (fg_color, bg_color, has_bg) = if style.inverse {
+                    (fg, bg.unwrap_or(colors.background), true)
+                } else {
+                    (fg, bg.unwrap_or(colors.background), bg.is_some())
+                };
+
+                let segment = if graphemes_len == 0 {
+                    " ".repeat(advance.max(1) as usize)
+                } else {
+                    match cell.graphemes() {
+                        Ok(g) => g.into_iter().collect(),
+                        Err(_) => " ".repeat(advance.max(1) as usize),
+                    }
+                };
+                push_row_segment(
+                    &mut row_segments,
+                    &mut pending_segment,
+                    start_col,
+                    advance.max(1),
+                    RowTextStyle {
+                        fg: fg_color,
+                        bg: (has_bg || style.inverse).then_some(bg_color),
+                        default_bg: colors.background,
+                        bold: style.bold,
+                        italic: style.italic,
+                        underline: style.underline,
+                        strikethrough: style.strikethrough,
+                    },
+                    segment,
+                );
+            }
+
+            if let Some(segment) = pending_segment.take() {
+                row_segments.push(segment);
+            }
+
+            for segment in row_segments {
+                let (x, y) = cell_position(row_idx, segment.start_col, cell_size);
+                let segment_width = cell_size.0 * segment.columns as f32;
+                let segment_len = segment.text.len();
+                let (_, segment_bg, _) = resolved_render_style(segment.style);
+                let segment_div = div()
+                    .absolute()
+                    .left(x)
+                    .top(y)
+                    .w(segment_width)
+                    .h(cell_size.1)
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_size(px(TERMINAL_FONT_SIZE_PX))
+                    .font_family(TERMINAL_FONT_FAMILY)
+                    .line_height(cell_size.1)
+                    .when_some(segment_bg, |div, bg| div.bg(rgb_to_rgba(bg)))
+                    .child(
+                        StyledText::new(segment.text).with_runs(vec![text_run_for_style(
+                            &base_text_style,
+                            segment.style,
+                            segment_len,
+                        )]),
+                    );
+                elements.push(segment_div.into_any_element());
+            }
+            let _ = row.set_dirty(false);
+            row_idx += 1;
+        }
+
+        let is_focused = self.focus_handle.is_focused(window);
+        let cursor_visible = is_focused && (self.cursor_blink_phase || !self.config.cursor_blink);
+
+        if cursor_visible && let Ok(Some(cursor_pos)) = snapshot.cursor_viewport() {
+            let cursor_color = colors.cursor.unwrap_or(colors.foreground);
+            let (x, y) = cell_position(cursor_pos.y, cursor_pos.x, cell_size);
+            let cursor_rgba = rgb_to_rgba(cursor_color);
+
+            let cursor_div = match self.config.cursor_style {
+                CursorStyle::Block => div()
+                    .absolute()
+                    .left(x)
+                    .top(y)
+                    .w(cell_size.0)
+                    .h(cell_size.1)
+                    .bg(cursor_rgba),
+                CursorStyle::Line => div()
+                    .absolute()
+                    .left(x)
+                    .top(y)
+                    .w(px(2.0))
+                    .h(cell_size.1)
+                    .bg(cursor_rgba),
+                CursorStyle::Underline => div()
+                    .absolute()
+                    .left(x)
+                    .top(y + cell_size.1 - px(2.0))
+                    .w(cell_size.0)
+                    .h(px(2.0))
+                    .bg(cursor_rgba),
+            };
+            elements.push(cursor_div.into_any_element());
+        }
+
+        let entity = cx.entity();
+
+        div()
+            .size_full()
+            .bg(rgb_to_rgba(colors.background))
+            .relative()
+            .overflow_hidden()
+            .track_focus(&self.focus_handle)
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                this.handle_key_down(event, window, cx)
+            }))
+            .on_key_up(cx.listener(|this, event: &KeyUpEvent, window, cx| {
+                this.handle_key_up(event, window, cx)
+            }))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                    this.handle_mouse_down(event, window, cx)
+                }),
+            )
+            .children(elements)
+            .child(
+                canvas(
+                    move |bounds, _window, cx| {
+                        entity.update(cx, |this, cx| {
+                            this.update_layout_size(bounds.size, cx);
+                        });
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full(),
+            )
+    }
+}
+
+fn terminal_font_features() -> FontFeatures {
+    FontFeatures(Arc::new(vec![
+        ("calt".to_string(), 0),
+        ("liga".to_string(), 0),
+        ("kern".to_string(), 0),
+    ]))
+}
+
+fn terminal_font_fallbacks() -> FontFallbacks {
+    FontFallbacks::from_fonts(vec![
+        TERMINAL_FONT_FAMILY.to_string(),
+        "Consolas".to_string(),
+        "Cascadia Mono".to_string(),
+        "DejaVu Sans Mono".to_string(),
+        "Noto Sans Mono".to_string(),
+        "JetBrains Mono".to_string(),
+        "Fira Mono".to_string(),
+        "Sarasa Mono SC".to_string(),
+        "Sarasa Term SC".to_string(),
+        "Sarasa Mono J".to_string(),
+        "Noto Sans Mono CJK SC".to_string(),
+        "Noto Sans Mono CJK JP".to_string(),
+        "Source Han Mono SC".to_string(),
+        "WenQuanYi Zen Hei Mono".to_string(),
+        "Apple Color Emoji".to_string(),
+        "Noto Color Emoji".to_string(),
+        "Segoe UI Emoji".to_string(),
+    ])
+}
+
+fn mix_rgb(a: RgbColor, b: RgbColor, ratio: f32) -> RgbColor {
+    let t = ratio.clamp(0.0, 1.0);
+    let blend = |lhs: u8, rhs: u8| -> u8 {
+        ((lhs as f32 * (1.0 - t)) + (rhs as f32 * t))
+            .round()
+            .clamp(0.0, 255.0) as u8
+    };
+
+    RgbColor {
+        r: blend(a.r, b.r),
+        g: blend(a.g, b.g),
+        b: blend(a.b, b.b),
+    }
+}
+
+fn rgb_to_hsv(rgb: RgbColor) -> (f32, f32, f32) {
+    let r = rgb.r as f32 / 255.0;
+    let g = rgb.g as f32 / 255.0;
+    let b = rgb.b as f32 / 255.0;
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let delta = max - min;
+
+    let hue = if delta == 0.0 {
+        0.0
+    } else if max == r {
+        60.0 * (((g - b) / delta).rem_euclid(6.0))
+    } else if max == g {
+        60.0 * (((b - r) / delta) + 2.0)
+    } else {
+        60.0 * (((r - g) / delta) + 4.0)
+    };
+
+    let saturation = if max == 0.0 { 0.0 } else { delta / max };
+    (hue, saturation, max)
+}
+
+fn bold_display_palette_color(rgb: RgbColor, base_bg: RgbColor) -> RgbColor {
+    let (hue, saturation, value) = rgb_to_hsv(rgb);
+
+    if saturation < 0.16 || value < 0.2 {
+        return if relative_luminance(base_bg) < 0.35 {
+            RgbColor {
+                r: 230,
+                g: 237,
+                b: 243,
+            }
+        } else {
+            RgbColor {
+                r: 30,
+                g: 41,
+                b: 59,
+            }
+        };
+    }
+
+    match hue {
+        h if !(15.0..345.0).contains(&h) => RgbColor {
+            r: 255,
+            g: 123,
+            b: 114,
+        },
+        h if h < 45.0 => RgbColor {
+            r: 255,
+            g: 184,
+            b: 108,
+        },
+        h if h < 70.0 => RgbColor {
+            r: 229,
+            g: 192,
+            b: 123,
+        },
+        h if h < 150.0 => RgbColor {
+            r: 152,
+            g: 195,
+            b: 121,
+        },
+        h if h < 210.0 => RgbColor {
+            r: 86,
+            g: 212,
+            b: 221,
+        },
+        h if h < 270.0 => RgbColor {
+            r: 97,
+            g: 175,
+            b: 239,
+        },
+        _ => RgbColor {
+            r: 198,
+            g: 120,
+            b: 221,
+        },
+    }
+}
+
+fn relative_luminance(rgb: RgbColor) -> f32 {
+    fn channel(value: u8) -> f32 {
+        let normalized = value as f32 / 255.0;
+        if normalized <= 0.03928 {
+            normalized / 12.92
+        } else {
+            ((normalized + 0.055) / 1.055).powf(2.4)
+        }
+    }
+
+    0.2126 * channel(rgb.r) + 0.7152 * channel(rgb.g) + 0.0722 * channel(rgb.b)
+}
+
+fn contrast_ratio(a: RgbColor, b: RgbColor) -> f32 {
+    let a_lum = relative_luminance(a);
+    let b_lum = relative_luminance(b);
+    let lighter = a_lum.max(b_lum);
+    let darker = a_lum.min(b_lum);
+    (lighter + 0.05) / (darker + 0.05)
+}
+
+fn emphasized_bold_colors(style: RowTextStyle) -> (RgbColor, Option<RgbColor>) {
+    let base_bg = style.bg.unwrap_or(style.default_bg);
+    let mut fg = bold_display_palette_color(style.fg, base_bg);
+    let target = if relative_luminance(base_bg) < 0.35 {
+        RgbColor {
+            r: 255,
+            g: 255,
+            b: 255,
+        }
+    } else {
+        RgbColor { r: 0, g: 0, b: 0 }
+    };
+
+    if contrast_ratio(fg, base_bg) < 7.0 {
+        for ratio in [0.55_f32, 0.7, 0.82, 0.9] {
+            let candidate = mix_rgb(fg, target, ratio);
+            fg = candidate;
+            if contrast_ratio(fg, base_bg) >= 7.0 {
+                break;
+            }
+        }
+    }
+
+    (fg, style.bg)
+}
+
+fn resolved_render_style(style: RowTextStyle) -> (RgbColor, Option<RgbColor>, FontWeight) {
+    if style.bold {
+        let (fg, bg) = emphasized_bold_colors(style);
+        (fg, bg, FontWeight::BOLD)
+    } else {
+        (style.fg, style.bg, FontWeight::NORMAL)
+    }
+}
+
+fn text_run_for_style(base_style: &TextStyle, style: RowTextStyle, len: usize) -> TextRun {
+    let mut run_style = base_style.clone();
+    let (fg, _bg, font_weight) = resolved_render_style(style);
+    run_style.color = rgb_to_rgba(fg).into();
+    run_style.background_color = None;
+    run_style.font_weight = font_weight;
+    run_style.font_style = if style.italic {
+        FontStyle::Italic
+    } else {
+        FontStyle::Normal
+    };
+    run_style.underline = match style.underline {
+        Underline::None => None,
+        Underline::Curly => Some(UnderlineStyle {
+            thickness: px(1.0),
+            color: Some(rgb_to_rgba(fg).into()),
+            wavy: true,
+        }),
+        _ => Some(UnderlineStyle {
+            thickness: px(1.0),
+            color: Some(rgb_to_rgba(fg).into()),
+            wavy: false,
+        }),
+    };
+    run_style.strikethrough = style.strikethrough.then_some(StrikethroughStyle {
+        thickness: px(1.0),
+        color: Some(rgb_to_rgba(fg).into()),
+    });
+    run_style.to_run(len)
+}
+
+fn segment_needs_own_layout(segment: &str, columns: u16) -> bool {
+    columns != 1 || !segment.is_ascii()
+}
+
+fn push_row_segment(
+    segments: &mut Vec<RowSegment>,
+    pending: &mut Option<RowSegment>,
+    start_col: u16,
+    columns: u16,
+    style: RowTextStyle,
+    text: String,
+) {
+    if text.is_empty() {
+        return;
+    }
+
+    let isolate = segment_needs_own_layout(&text, columns);
+    if isolate {
+        if let Some(segment) = pending.take() {
+            segments.push(segment);
+        }
+        segments.push(RowSegment::new(start_col, columns, text, style));
+        return;
+    }
+
+    if let Some(segment) = pending.as_mut()
+        && segment.style == style
+        && segment.start_col + segment.columns == start_col
+    {
+        segment.columns += columns;
+        segment.text.push_str(&text);
+        return;
+    }
+
+    if let Some(segment) = pending.take() {
+        segments.push(segment);
+    }
+    *pending = Some(RowSegment::new(start_col, columns, text, style));
+}
+
+fn cell_position(row: u16, col: u16, cell_size: (Pixels, Pixels)) -> (Pixels, Pixels) {
+    (cell_size.0 * col as f32, cell_size.1 * row as f32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ghostty::{RenderState, Terminal, TerminalOptions, render::RowIterator};
+
+    #[test]
+    fn bold_style_survives_box_emoji_prompt_segment() {
+        let mut terminal = Terminal::new(TerminalOptions {
+            cols: 32,
+            rows: 4,
+            max_scrollback: 100,
+        })
+        .expect("terminal");
+        terminal.resize(32, 4, 10, 20).expect("resize");
+        terminal.vt_write("📦 \u{1b}[1mrepo\u{1b}[0m".as_bytes());
+
+        let mut render_state = RenderState::new().expect("render state");
+        let snapshot = render_state.update(&terminal).expect("snapshot");
+        let mut row_iterator = RowIterator::new().expect("row iterator");
+        let mut cell_iterator = crate::ghostty::render::CellIterator::new().expect("cell iterator");
+
+        let mut rows = row_iterator.update(&snapshot).expect("rows");
+        let row = rows.next().expect("first row");
+        let mut cells = cell_iterator.update(row).expect("cells");
+
+        let mut letters = Vec::new();
+        while let Some(cell) = cells.next() {
+            let text: String = cell.graphemes().expect("graphemes").into_iter().collect();
+            if text.is_empty() {
+                continue;
+            }
+
+            if matches!(text.as_str(), "r" | "e" | "p" | "o") {
+                letters.push((text, cell.style().expect("style").bold));
+            }
+        }
+
+        assert_eq!(
+            letters,
+            vec![
+                ("r".to_string(), true),
+                ("e".to_string(), true),
+                ("p".to_string(), true),
+                ("o".to_string(), true),
+            ]
+        );
+    }
+
+    #[test]
+    fn box_emoji_advances_two_columns() {
+        let mut terminal = Terminal::new(TerminalOptions {
+            cols: 32,
+            rows: 4,
+            max_scrollback: 100,
+        })
+        .expect("terminal");
+        terminal.resize(32, 4, 10, 20).expect("resize");
+        terminal.vt_write("x📦y".as_bytes());
+
+        let mut render_state = RenderState::new().expect("render state");
+        let snapshot = render_state.update(&terminal).expect("snapshot");
+        let mut row_iterator = RowIterator::new().expect("row iterator");
+        let mut cell_iterator = crate::ghostty::render::CellIterator::new().expect("cell iterator");
+
+        let mut rows = row_iterator.update(&snapshot).expect("rows");
+        let row = rows.next().expect("first row");
+        let mut cells = cell_iterator.update(row).expect("cells");
+
+        let mut positions = Vec::new();
+        let mut col_idx = 0u16;
+        while let Some(cell) = cells.next() {
+            let width = cell.width().expect("width");
+            let advance = width.column_advance();
+            let text: String = cell.graphemes().expect("graphemes").into_iter().collect();
+
+            if !text.is_empty() && !matches!(width, CellWidth::SpacerTail | CellWidth::SpacerHead) {
+                positions.push((text, col_idx, width));
+            }
+
+            col_idx += advance;
+        }
+
+        assert_eq!(
+            positions,
+            vec![
+                ("x".to_string(), 0, CellWidth::Narrow),
+                ("📦".to_string(), 1, CellWidth::Wide),
+                ("y".to_string(), 3, CellWidth::Narrow),
+            ]
+        );
+    }
+}
