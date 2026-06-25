@@ -3401,6 +3401,7 @@ dependencies = [
  "gpui",
  "gpui-component",
  "image",
+ "libc",
  "libghostty-vt",
  "raw-window-handle",
  "serde",
