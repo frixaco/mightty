@@ -36,7 +36,7 @@ src/
 ```
 
 Important non-source paths:
-- `ghostty/`: local Ghostty checkout used by `.cargo/config.toml` as `GHOSTTY_SOURCE_DIR`.
+- `ghostty/`: Ghostty submodule checkout used by `.cargo/config.toml` as `GHOSTTY_SOURCE_DIR`.
 - `fonts/JetBrainsMono/`: local font files embedded by `src/main.rs`.
 - `captures/`: generated at runtime by feedback capture and intentionally not part of source.
 
@@ -44,11 +44,12 @@ Important non-source paths:
 
 The `libghostty-vt-sys` dependency builds Ghostty's VT library through Cargo.
 The repo's `.cargo/config.toml` sets `GHOSTTY_SOURCE_DIR` to the local `ghostty/`
-checkout so normal Cargo commands do not need to fetch Ghostty.
+submodule checkout so normal Cargo commands do not need to fetch Ghostty.
 
-The repo includes `.mise.toml` pinning Zig `0.15.2`. `ZIG=/path/to/zig` can override discovery.
+Ghostty's build requires Zig. The repo includes `.mise.toml` pinning Zig
+`0.15.2`; `ZIG=/path/to/zig` can override discovery.
 
-## Current Behavior
+## Behavior
 
 - Default shell command is `pwsh.exe` on Windows and `$SHELL` on Unix.
 - `Ctrl+T` creates a new tab.
@@ -88,12 +89,13 @@ The row and cell iterations are lending iterators, so drive them with `while let
 - Keep `src/ghostty/mod.rs` as a small facade over `libghostty-vt`; do not reintroduce manual FFI bindings.
 - Be careful with Windows handles in `src/shell/windows.rs`; every failure path must close owned handles.
 - Avoid broad UI rewrites unless the task explicitly asks for product design work.
-- Keep docs accurate to implemented behavior.
-- Run formatting and checks before handing off.
+- Keep docs accurate to actual behavior.
+- Run formatting and checks prior to handoff.
 
 ## Common Commands
 
 ```bash
+git submodule update --init ghostty
 mise install
 cargo fmt
 cargo check

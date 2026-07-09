@@ -1,8 +1,8 @@
-# UI Tabs and Pane Management PRD
+# UI Tabs and Pane Management
 
 ## Goal
 
-Add lightweight tab management, vertical pane splitting, pane closing, and pane chrome refinements to mightty while preserving the existing custom black title bar and terminal rendering behavior.
+Define mightty's lightweight tab management, pane splitting, pane closing, and pane chrome behavior.
 
 ## Scope
 
@@ -27,14 +27,14 @@ Add lightweight tab management, vertical pane splitting, pane closing, and pane 
 - A newly created tab becomes the active tab.
 - Clicking a tab in the sidebar should switch to that tab.
 - `Ctrl+1` through `Ctrl+9` switch to the matching tab when it exists.
-- The visible tab number is based on the current tab order and should renumber after tabs close.
-- The app must always keep at least one tab open.
+- The visible tab number is based on tab order and should renumber after tabs close.
+- The running app keeps at least one tab open; closing the final remaining pane exits the app.
 
 ### Sidebar
 
 - The left sidebar should be persistent whenever the main window is open.
 - The sidebar should use the same black background as the rest of the window.
-- The sidebar width should be fixed at `160px` for now so each tab can show its number and short title without looking like a square icon.
+- The sidebar width is fixed at `160px` so each tab can show its number and short title without looking like a square icon.
 - `Ctrl+B` toggles the sidebar between visible and hidden.
 - When hidden, the sidebar should completely disappear and the terminal area should reclaim the full width.
 - Hiding the sidebar must not lose tab state, active tab state, pane state, or terminal state.
@@ -61,65 +61,32 @@ Add lightweight tab management, vertical pane splitting, pane closing, and pane 
 - `Ctrl+D` closes the active pane if the active tab contains multiple panes.
 - `Ctrl+D` closes the active tab if the active tab contains exactly one pane.
 - `Ctrl+D` is owned by mightty for pane and tab closing and should not be sent to the shell.
-- If there is only one tab with one pane, `Ctrl+D` should not leave the app empty. The preferred behavior is to ignore the shortcut in that state.
+- If there is only one tab with one pane, `Ctrl+D` exits the app.
 - After closing a pane, focus should move to a sensible remaining pane.
 - After closing a tab, focus should move to the previous tab when possible, otherwise the next tab.
 
-## Implementation Plan
+## Implementation Notes
 
-1. Inspect the current `PaneContainer`, `Split`, and `Pane` ownership model.
-   - Confirm how key bindings are dispatched.
-   - Confirm how terminal focus and resize are currently tracked.
-   - Decide whether `Split` should become orientation-aware directly or whether a split tree is needed.
+- `PaneContainer` owns tabs, sidebar state, top-level actions, and key bindings.
+- Each tab owns one root `Split`.
+- `Split` owns `Entity<TerminalWidget>` leaves directly; there is no separate `Pane` wrapper.
+- `SplitDirection::Row` creates right splits and `SplitDirection::Column` creates downward splits.
+- Exited terminal panes signal `PaneContainer` through a GPUI task and are removed only when the tab still has another pane.
+- Tab titles use the app process current directory with `~` as a home-directory fallback.
 
-2. Add a tab model above `Split`.
-   - Each tab owns its own root split.
-   - `PaneContainer` tracks the active tab index.
-   - Numeric tab labels are derived from tab order.
-   - Tab titles are derived from the active terminal context when available, with a stable fallback.
+## Verification Checklist
 
-3. Add left sidebar rendering.
-   - Render numeric tab items as a vertical list.
-   - Render each tab with its number and a short title.
-   - Use a fixed `52px` width while visible.
-   - Add collapsed state so `Ctrl+B` can remove the sidebar from layout without destroying tab state.
-   - Keep the sidebar background black.
-   - Make tab items clickable.
-   - Keep the title bar free of tab UI.
-   - Preserve the right-side Windows control buttons and draggable title bar behavior.
-
-4. Add key bindings.
-   - `Ctrl+T` creates a tab.
-   - `Ctrl+B` toggles sidebar visibility.
-   - `Ctrl+1` through `Ctrl+9` switch tabs.
-   - `Alt+Shift+Enter` splits the active pane downward.
-   - `Ctrl+D` closes the active pane or tab according to pane count.
-
-5. Extend split layout.
-   - Preserve right splits for `Alt+Enter`.
-   - Add downward splits for `Alt+Shift+Enter`.
-   - Start new splits at a fixed `50/50` ratio.
-   - Prefer a minimal orientation-aware split tree if needed:
-     - `Pane(Entity<Pane>)`
-     - `Split { direction, children }`
-
-6. Add pane and separator styling.
-   - Add `4px` pane rounding.
-   - Draw green separator lines between panes.
-   - Keep all background surfaces black.
-
-7. Verify behavior.
-   - New tabs render and switch correctly.
-   - `Ctrl+B` hides and restores the sidebar without losing tab or pane state.
-   - `Ctrl+1` through `Ctrl+9` switch to existing tabs.
-   - Splits resize correctly.
-   - Focus follows new panes and survives close operations.
-   - Closing never leaves zero tabs or zero panes.
-   - Run:
-     - `cargo fmt`
-     - `cargo check`
-     - `cargo clippy --all-targets -- -D warnings`
-     - `cargo test`
+- New tabs render and switch correctly.
+- `Ctrl+B` hides and restores the sidebar without losing tab or pane state.
+- `Ctrl+1` through `Ctrl+9` switch to existing tabs.
+- Right and downward splits resize correctly.
+- Focus follows new panes and survives close operations.
+- `Ctrl+D` removes a pane, removes a tab, or exits the app according to the active pane/tab count.
+- Run:
+  - `cargo fmt`
+  - `cargo check`
+  - `cargo clippy --all-targets -- -D warnings`
+  - `cargo test`
 
 ## Non-Goals
 
@@ -134,8 +101,8 @@ Add lightweight tab management, vertical pane splitting, pane closing, and pane 
 
 ## Risks and Open Questions
 
-- Active pane tracking is the main implementation risk. The split structure needs a reliable active pane id so `Alt+Shift+Enter` and `Ctrl+D` affect the intended pane.
-- Tab title derivation may be limited by what terminal or shell state is currently available. If the active directory cannot be detected reliably, use a simple stable fallback title.
-- If `Split` becomes a tree, pane removal needs careful cleanup so nested splits do not leave empty containers.
+- Active pane tracking remains important because `Alt+Shift+Enter` and `Ctrl+D` affect the intended pane.
+- Tab title derivation uses a stable app-current-directory fallback.
+- Pane removal must keep nested splits normalized so empty containers do not remain.
 - Sidebar layout must preserve terminal resize correctness so each terminal still receives its actual local bounds.
-- Title bar hit regions must remain simple because tabs no longer live there; Windows control buttons and drag behavior should continue unchanged.
+- Title bar hit regions must remain simple; Windows control buttons and drag behavior must remain intact.

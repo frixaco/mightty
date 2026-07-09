@@ -2,12 +2,8 @@
 
 ## Purpose
 
-This note records the current Windows text-rendering constraints in `mightty` and
-the renderer policy that exists to work around them.
-
-The original user-visible problem was that bold prompt segments after mixed
-emoji/Nerd Font content, such as `📦 v0.1.0`, could become too dim or disappear
-in the GPUI-rendered output even though the terminal state was correct.
+This note records Windows text-rendering constraints in `mightty` and the
+renderer policy for mixed terminal text.
 
 ## Render Path
 
@@ -15,31 +11,29 @@ Terminal text follows this path:
 
 1. shell output bytes are written into Ghostty with `Terminal::vt_write`
 2. Ghostty render state is read through the `libghostty-vt` facade in `src/ghostty/mod.rs`
-3. `src/widget/mod.rs` converts Ghostty cells into positioned GPUI text segments
+3. `src/widget/render.rs` converts Ghostty cells into positioned GPUI text segments
 4. GPUI and DirectWrite shape those segments into pixels on Windows
 
 Ghostty owns terminal parsing, cell state, Unicode width, and style state.
 GPUI/DirectWrite owns the final font fallback and pixel output.
 
-## What The Captures Proved
+## Feedback Capture Contract
 
 Feedback captures pair a semantic `capture.json` with a visual `capture.png`.
-For the prompt rendering issue, the captures showed:
+For text rendering diagnosis, captures compare terminal state with rendered
+pixels:
 
-- JSON contained the expected row text
-- cells after `📦` existed at the expected columns
-- those cells were marked `bold=true`
-- PNG output was missing or visually muting that same text
+- JSON records row text, cell columns, style flags, and terminal colors.
+- PNG records the final GPUI/DirectWrite output.
+- Differences between JSON state and PNG pixels point to app-side rendering,
+  font fallback, shaping, or color policy.
 
-That ruled out Ghostty's VT/parser/buffer state for this case and narrowed the
-problem to the app-side rendering path.
+## Renderer Policy
 
-## Current Renderer Policy
-
-`src/widget/mod.rs` now treats terminal bold/intense text as display policy, not
+`src/widget/render.rs` treats terminal bold/intense text as display policy, not
 only as a heavier font request.
 
-Current behavior:
+Behavior:
 
 - terminal rows are rendered as positioned segments, not one large row string
 - non-ASCII and multi-column cells are isolated into their own layout segments

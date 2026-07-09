@@ -2,7 +2,7 @@
 
 mightty is a small GPU-powered terminal emulator prototype built with Rust, GPUI, platform PTYs, and Ghostty's `libghostty-vt`.
 
-It is currently Windows-first, with Windows shell I/O through ConPTY and Unix shell I/O through a forkpty-backed bridge.
+mightty targets Windows first, with Windows shell I/O through ConPTY and Unix shell I/O through a forkpty-backed bridge.
 
 ## Features
 
@@ -26,14 +26,15 @@ It is currently Windows-first, with Windows shell I/O through ConPTY and Unix sh
 ## Requirements
 
 - Rust with edition 2024 support.
-- Zig `0.15.2`.
-- The Ghostty checkout at `ghostty/`, used by `.cargo/config.toml` as `GHOSTTY_SOURCE_DIR`.
+- Zig `0.15.2`, used indirectly by `libghostty-vt-sys` when it builds Ghostty's VT library.
+- The Ghostty submodule checkout at `ghostty/`, used by `.cargo/config.toml` as `GHOSTTY_SOURCE_DIR`.
 - Local JetBrainsMono Nerd Font Mono files under `fonts/JetBrainsMono/`.
 - Windows for the primary shell bridge target, or a Unix platform for the forkpty bridge.
 
 This repo includes a `.mise.toml` pin for Zig:
 
 ```bash
+git submodule update --init ghostty
 mise install
 ```
 
@@ -48,7 +49,7 @@ cargo build --release
 
 The `libghostty-vt-sys` dependency builds Ghostty's VT library during Cargo builds.
 This repo's `.cargo/config.toml` points `GHOSTTY_SOURCE_DIR` at the local
-`ghostty/` checkout so normal Cargo commands do not need to fetch Ghostty.
+`ghostty/` submodule so normal Cargo commands do not need to fetch Ghostty.
 
 ```powershell
 cargo build
@@ -61,6 +62,24 @@ cargo run
 ```
 
 The default shell is `pwsh.exe` on Windows and `$SHELL` on Unix.
+
+## Shell I/O
+
+Terminal I/O is wake-driven. `TerminalWidget` owns a `PtyWorker`; the platform
+shell modules own the raw PTY handles.
+
+On Windows, `PtyParts::spawn` creates split ConPTY handles:
+
+- `PtyInput::write_all(&[u8])` sends command input and terminal responses.
+- `PtyOutput::read(&mut [u8])` blocks in `ReadFile` and returns `Data(usize)` or `Eof`.
+- `PtyControl::resize(PtySize)` resizes the pseudoconsole.
+- `PtyControl::shutdown()` closes the pseudoconsole and cleans up the child process.
+
+The worker uses one command/control thread and one blocking output reader thread.
+Output events wake a retained GPUI foreground task, which applies data to
+`libghostty-vt`, drains ready chunks up to a fixed budget, and then notifies the
+UI. The Windows backend exposes blocking reads as `PtyRead::Data(usize)` or
+`PtyRead::Eof`.
 
 ## Development
 
@@ -100,6 +119,7 @@ src/
 │   └── capture.rs       # Terminal-state feedback snapshot
 ├── ghostty/mod.rs       # Project facade over the libghostty-vt crate
 └── shell/
+    ├── mod.rs           # Platform shell bridge exports
     ├── windows.rs       # Windows ConPTY implementation
     └── unix.rs          # Unix forkpty implementation
 ```
