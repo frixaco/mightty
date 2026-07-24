@@ -1,2 +1,0 @@
-[env]
-GHOSTTY_SOURCE_DIR = { value = "ghostty", relative = true }

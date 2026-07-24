@@ -28,16 +28,6 @@ impl CellWidthExt for CellWidth {
     }
 }
 
-pub(super) trait RenderCellExt {
-    fn width(&self) -> crate::ghostty::Result<CellWidth>;
-}
-
-impl RenderCellExt for libghostty_vt::render::CellIteration<'_, '_> {
-    fn width(&self) -> crate::ghostty::Result<CellWidth> {
-        self.raw_cell()?.wide()
-    }
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct RowTextStyle {
     fg: RgbColor,
@@ -120,8 +110,8 @@ impl Render for TerminalWidget {
                 let advance = width.column_advance();
                 let start_col = col_idx;
                 col_idx += advance;
-                let graphemes_len = match cell.graphemes_len() {
-                    Ok(n) => n,
+                let text = match cell.text() {
+                    Ok(text) => text,
                     Err(_) => {
                         if advance > 0 {
                             push_row_segment(
@@ -180,13 +170,10 @@ impl Render for TerminalWidget {
                     (fg, bg.unwrap_or(colors.background), bg.is_some())
                 };
 
-                let segment = if graphemes_len == 0 {
+                let segment = if text.is_empty() {
                     " ".repeat(advance.max(1) as usize)
                 } else {
-                    match cell.graphemes() {
-                        Ok(g) => g.into_iter().collect(),
-                        Err(_) => " ".repeat(advance.max(1) as usize),
-                    }
+                    text
                 };
                 push_row_segment(
                     &mut row_segments,
@@ -593,7 +580,7 @@ mod tests {
 
         let mut letters = Vec::new();
         while let Some(cell) = cells.next() {
-            let text: String = cell.graphemes().expect("graphemes").into_iter().collect();
+            let text = cell.text().expect("text");
             if text.is_empty() {
                 continue;
             }
@@ -639,7 +626,7 @@ mod tests {
         while let Some(cell) = cells.next() {
             let width = cell.width().expect("width");
             let advance = width.column_advance();
-            let text: String = cell.graphemes().expect("graphemes").into_iter().collect();
+            let text = cell.text().expect("text");
 
             if !text.is_empty() && !matches!(width, CellWidth::SpacerTail | CellWidth::SpacerHead) {
                 positions.push((text, col_idx, width));

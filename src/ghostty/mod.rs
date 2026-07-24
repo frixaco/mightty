@@ -1,19 +1,32 @@
-//! Project-local facade over the published libghostty-vt crate.
+//! Safe, project-owned Rust interface to Ghostty's `libghostty-vt`.
+//!
+//! The raw C interface is generated from the pinned Ghostty submodule and kept
+//! private. Callers use terminal concepts and never handle C pointers.
 
-pub use libghostty_vt::{
-    RenderState, Terminal, TerminalOptions,
-    error::{Error, Result},
-};
+mod error;
+mod terminal;
 
-pub mod key {
-    pub use libghostty_vt::key::{Action, Encoder, Event, Key, Mods};
-}
+#[cfg(test)]
+mod abi;
 
-pub mod render {
-    pub use libghostty_vt::render::{CellIterator, RowIterator};
-    pub use libghostty_vt::screen::CellWide as CellWidth;
-}
+pub mod key;
+pub mod render;
+pub mod style;
 
-pub mod style {
-    pub use libghostty_vt::style::{RgbColor, Underline};
-}
+#[allow(
+    dead_code,
+    non_camel_case_types,
+    non_snake_case,
+    non_upper_case_globals,
+    clippy::all,
+    rustdoc::all
+)]
+#[rustfmt::skip]
+mod ffi;
+
+pub use error::{Error, Result};
+pub use render::RenderState;
+pub use terminal::{Terminal, TerminalOptions};
+
+/// Exact Ghostty source revision compiled into this build.
+pub const SOURCE_REVISION: &str = env!("MIGHTTY_GHOSTTY_REVISION");

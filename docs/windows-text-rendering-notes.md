@@ -10,7 +10,7 @@ renderer policy for mixed terminal text.
 Terminal text follows this path:
 
 1. shell output bytes are written into Ghostty with `Terminal::vt_write`
-2. Ghostty render state is read through the `libghostty-vt` facade in `src/ghostty/mod.rs`
+2. Ghostty render state is read through the project-owned safe module in `src/ghostty/`
 3. `src/widget/render.rs` converts Ghostty cells into positioned GPUI text segments
 4. GPUI and DirectWrite shape those segments into pixels on Windows
 
@@ -19,9 +19,12 @@ GPUI/DirectWrite owns the final font fallback and pixel output.
 
 ## Feedback Capture Contract
 
-Feedback captures pair a semantic `capture.json` with a visual `capture.png`.
-For text rendering diagnosis, captures compare terminal state with rendered
-pixels:
+Every feedback capture writes a semantic `capture.json`. On Windows it also
+attempts to write a visual `capture.png` of the window client area; a PNG
+failure is reported without discarding the JSON. Non-Windows captures are JSON
+only.
+
+When both files exist, they compare terminal state with rendered pixels:
 
 - JSON records row text, cell columns, style flags, and terminal colors.
 - PNG records the final GPUI/DirectWrite output.

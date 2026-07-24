@@ -1,13 +1,16 @@
 # mightty
 
-mightty is a small GPU-powered terminal emulator prototype built with Rust, GPUI, platform PTYs, and Ghostty's `libghostty-vt`.
+mightty is a GPU-powered terminal emulator built with Rust, GPUI, platform
+PTYs, and Ghostty's `libghostty-vt`.
 
-mightty targets Windows first, with Windows shell I/O through ConPTY and Unix shell I/O through a forkpty-backed bridge.
+mightty targets Windows first, with Windows shell I/O through ConPTY and Unix
+shell I/O through a forkpty-backed bridge.
 
 ## Features
 
 - GPU-rendered terminal UI through GPUI.
-- Terminal emulation through `libghostty-vt`.
+- Terminal emulation through Ghostty's `libghostty-vt`, built directly from the
+  pinned Ghostty source submodule.
 - Windows shell I/O through ConPTY.
 - Unix shell I/O through forkpty.
 - Tabs in a compact left sidebar.
@@ -20,16 +23,22 @@ mightty targets Windows first, with Windows shell I/O through ConPTY and Unix sh
 
 - [GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui) for UI rendering.
 - [gpui-component](https://crates.io/crates/gpui-component) for the root component wrapper.
-- [libghostty-vt](https://crates.io/crates/libghostty-vt) for the Ghostty VT engine.
+- [Ghostty](https://github.com/ghostty-org/ghostty) for the VT engine.
+- A project-owned Rust module over Ghostty's public C interface.
 - Windows ConPTY and Unix forkpty for shell process integration.
 
 ## Requirements
 
 - Rust with edition 2024 support.
-- Zig `0.15.2`, used indirectly by `libghostty-vt-sys` when it builds Ghostty's VT library.
-- The Ghostty submodule checkout at `ghostty/`, used by `.cargo/config.toml` as `GHOSTTY_SOURCE_DIR`.
-- Local JetBrainsMono Nerd Font Mono files under `fonts/JetBrainsMono/`.
-- Windows for the primary shell bridge target, or a Unix platform for the forkpty bridge.
+- Git, used to initialize and validate the pinned Ghostty submodule.
+- Zig `0.16.0`, used directly by `build.rs` to compile Ghostty's VT library.
+- The initialized Ghostty source submodule at `ghostty/`.
+- Four local JetBrainsMono Nerd Font Mono files under `fonts/JetBrainsMono/`:
+  `JetBrainsMonoNerdFontMono-Regular.ttf`,
+  `JetBrainsMonoNerdFontMono-Bold.ttf`,
+  `JetBrainsMonoNerdFontMono-Italic.ttf`, and
+  `JetBrainsMonoNerdFontMono-BoldItalic.ttf`. Fonts are not vendored.
+- Windows 10 version 1809 or newer for ConPTY, or a Unix platform for forkpty.
 
 This repo includes a `.mise.toml` pin for Zig:
 
@@ -38,30 +47,36 @@ git submodule update --init ghostty
 mise install
 ```
 
-You can also set `ZIG` to a specific Zig executable.
+The commands below use `mise exec --` so Cargo sees the pinned Zig executable.
+You can instead put Zig on `PATH` or set `ZIG` to a specific executable and run
+Cargo directly. Normal builds do not require Clang. Regenerating the private
+Rust C bindings after a Ghostty update additionally requires `libclang`.
 
 ## Build
 
 ```bash
-cargo build
-cargo build --release
+mise exec -- cargo build
+mise exec -- cargo build --release
 ```
 
-The `libghostty-vt-sys` dependency builds Ghostty's VT library during Cargo builds.
-This repo's `.cargo/config.toml` points `GHOSTTY_SOURCE_DIR` at the local
-`ghostty/` submodule so normal Cargo commands do not need to fetch Ghostty.
+The root `build.rs` runs Zig against the local `ghostty/` submodule and links
+the resulting static `libghostty-vt` archive. It never fetches a separate
+Ghostty checkout and there are no `libghostty-vt` Rust crate dependencies.
 
-```powershell
-cargo build
-```
+The binding generator records the Ghostty commit and public-header fingerprint
+in `src/ghostty/bindings.version`. Every build verifies the submodule against
+that record before compiling or linking. See
+[`docs/ghostty-integration.md`](docs/ghostty-integration.md) for ownership,
+safety invariants, and the update procedure.
 
 ## Run
 
 ```bash
-cargo run
+mise exec -- cargo run
 ```
 
-The default shell is `pwsh.exe` on Windows and `$SHELL` on Unix.
+The default shell is `pwsh.exe` on Windows. Unix uses `$SHELL`, falling back to
+`/bin/sh` when the variable is unset.
 
 ## Shell I/O
 
@@ -75,31 +90,39 @@ On Windows, `PtyParts::spawn` creates split ConPTY handles:
 - `PtyControl::resize(PtySize)` resizes the pseudoconsole.
 - `PtyControl::shutdown()` closes the pseudoconsole and cleans up the child process.
 
-The worker uses one command/control thread and one blocking output reader thread.
-Output events wake a retained GPUI foreground task, which applies data to
-`libghostty-vt`, drains ready chunks up to a fixed budget, and then notifies the
-UI. The Windows backend exposes blocking reads as `PtyRead::Data(usize)` or
-`PtyRead::Eof`.
+The worker uses one command/control thread and one blocking output reader
+thread. Output events wake a retained GPUI foreground task, which applies data
+to the local Ghostty terminal module, drains ready chunks up to a fixed budget,
+and then notifies the UI. Both platform backends expose blocking reads as
+`PtyRead::Data(usize)` or `PtyRead::Eof`.
 
 ## Development
 
 Useful checks:
 
 ```bash
-cargo fmt
-cargo check
-cargo clippy --all-targets -- -D warnings
-cargo test
+mise exec -- cargo fmt --all -- --check
+mise exec -- cargo check
+mise exec -- cargo clippy --all-targets -- -D warnings
+mise exec -- cargo test
+```
+
+After changing the Ghostty submodule revision or public C headers, regenerate
+the private bindings. This command requires `libclang`:
+
+```bash
+mise exec -- cargo run --manifest-path tools/ghostty-bindings/Cargo.toml
 ```
 
 Useful runtime shortcuts:
 
-- `Ctrl+T`: open a new tab.
+- `Ctrl+T` (`Cmd+T` on macOS): open a new tab, up to nine tabs.
 - `Ctrl+B`: hide or show the tab sidebar.
 - `Ctrl+1` through `Ctrl+9`: switch to an existing tab.
 - `Alt+Enter`: split the active pane to the right.
 - `Alt+Shift+Enter`: split the active pane downward.
 - `Ctrl+D`: close the active pane, or close the active tab when it has one pane.
+- `Cmd+Q` on macOS: quit.
 - `Ctrl+Shift+F12`: write a terminal feedback capture to `captures/`.
 
 ## Project Layout
@@ -114,16 +137,28 @@ src/
 ├── widget/
 │   ├── mod.rs           # Terminal widget lifecycle and GPUI task wiring
 │   ├── pty.rs           # Wake-driven PTY worker bridge
-│   ├── input.rs         # GPUI key event to libghostty-vt key encoding
+│   ├── input.rs         # GPUI key event to Ghostty key encoding
 │   ├── render.rs        # Terminal cell rendering
 │   └── capture.rs       # Terminal-state feedback snapshot
-├── ghostty/mod.rs       # Project facade over the libghostty-vt crate
+├── ghostty/
+│   ├── mod.rs           # Public local Ghostty interface
+│   ├── terminal.rs      # Terminal ownership and PTY callback
+│   ├── render.rs        # Snapshot and lending render iterators
+│   ├── key.rs           # Key event and encoder ownership
+│   ├── style.rs         # Renderer-facing colors and styles
+│   ├── error.rs         # C result conversion
+│   ├── abi.rs           # Target-native Rust/Zig layout audit
+│   ├── bindings.version # Expected Ghostty revision/header fingerprint
+│   └── ffi.rs           # Generated private C bindings
 └── shell/
     ├── mod.rs           # Platform shell bridge exports
     ├── windows.rs       # Windows ConPTY implementation
     └── unix.rs          # Unix forkpty implementation
+tools/
+└── ghostty-bindings/    # Reproducible binding generator
 ```
 
 ## License
 
-MIT
+Project code is MIT-licensed. Adapted code and third-party attribution are
+recorded in [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).

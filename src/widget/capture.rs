@@ -7,7 +7,7 @@ use crate::ghostty::{
     style::{RgbColor, Underline},
 };
 
-use super::render::{CellWidthExt, RenderCellExt};
+use super::render::CellWidthExt;
 use super::{TERMINAL_FONT_FAMILY, TERMINAL_FONT_SIZE_PX, TerminalWidget};
 
 impl TerminalWidget {
@@ -26,15 +26,13 @@ impl TerminalWidget {
             while let Some(cell) = cell_it.next() {
                 let width = cell.width()?;
                 let advance = width.column_advance();
-                let graphemes_len = cell.graphemes_len()?;
-                if graphemes_len == 0
-                    || matches!(width, CellWidth::SpacerTail | CellWidth::SpacerHead)
+                let text = cell.text()?;
+                if text.is_empty() || matches!(width, CellWidth::SpacerTail | CellWidth::SpacerHead)
                 {
                     col_idx += advance;
                     continue;
                 }
 
-                let text: String = cell.graphemes()?.into_iter().collect();
                 row_text.push_str(&text);
 
                 let fg = cell.fg_color()?.unwrap_or(colors.foreground);
@@ -102,6 +100,5 @@ fn underline_name(underline: Underline) -> &'static str {
         Underline::Curly => "curly",
         Underline::Dotted => "dotted",
         Underline::Dashed => "dashed",
-        _ => "unknown",
     }
 }

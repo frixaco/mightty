@@ -14,9 +14,8 @@ path = "src/main.rs"
 [dependencies]
 gpui = "0.2"
 gpui-component = "0.5"
-flume = "0.11"
+flume = "0.12"
 image = { version = "0.25", default-features = false, features = ["png"] }
-libghostty-vt = { version = "0.2.0", default-features = false }
 raw-window-handle = "0.6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -25,7 +24,7 @@ serde_json = "1"
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = [
+windows-sys = { version = "0.61", features = [
     "Win32_Graphics_Gdi",
     "Win32_System_Console",
     "Win32_System_Threading",

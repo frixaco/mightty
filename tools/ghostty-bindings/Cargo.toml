@@ -1,0 +1,11 @@
+[package]
+name = "mightty-ghostty-bindings"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+bindgen = "0.72.1"
+heck = "0.5"

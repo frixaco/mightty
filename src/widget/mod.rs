@@ -13,7 +13,7 @@ use crate::ghostty::{
     RenderState, Terminal, TerminalOptions,
     key::{Action, Encoder, Event},
     render::{CellIterator, RowIterator},
-    style::RgbColor,
+    style::{Palette, RgbColor},
 };
 use crate::pane_container::shortcut_action;
 use crate::shell::PtySize;
@@ -85,12 +85,12 @@ fn default_shell() -> String {
 }
 
 pub struct TerminalWidget {
-    terminal: Terminal<'static, 'static>,
-    key_encoder: Encoder<'static>,
-    key_event: Event<'static>,
-    render_state: RenderState<'static>,
-    row_iterator: RowIterator<'static>,
-    cell_iterator: CellIterator<'static>,
+    terminal: Terminal,
+    key_encoder: Encoder,
+    key_event: Event,
+    render_state: RenderState,
+    row_iterator: RowIterator,
+    cell_iterator: CellIterator,
     config: TerminalConfig,
     pty_tx: Option<flume::Sender<PtyCommand>>,
     exit_signal_tx: Option<flume::Sender<()>>,
@@ -185,7 +185,7 @@ impl TerminalWidget {
 
         let pty_response_tx = pty_tx.clone();
         terminal
-            .on_pty_write(move |_terminal, data| {
+            .on_pty_write(move |data| {
                 if let Some(tx) = &pty_response_tx {
                     let _ = tx.send(PtyCommand::Write(data.to_vec()));
                 }
@@ -541,7 +541,7 @@ fn rgba_to_rgb(rgba: gpui::Rgba) -> RgbColor {
     }
 }
 
-fn terminal_palette(theme_palette: [gpui::Rgba; 16]) -> [RgbColor; 256] {
+fn terminal_palette(theme_palette: [gpui::Rgba; 16]) -> Palette {
     let mut palette = [RgbColor { r: 0, g: 0, b: 0 }; 256];
     for (index, color) in theme_palette.into_iter().enumerate() {
         palette[index] = rgba_to_rgb(color);
@@ -567,5 +567,5 @@ fn terminal_palette(theme_palette: [gpui::Rgba; 16]) -> [RgbColor; 256] {
         };
     }
 
-    palette
+    Palette(palette)
 }

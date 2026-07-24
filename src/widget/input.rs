@@ -4,9 +4,9 @@ use crate::ghostty::{
 };
 
 pub(super) fn encode_key_event(
-    key_encoder: &mut Encoder<'static>,
-    key_event: &mut Event<'static>,
-    terminal: &Terminal<'static, 'static>,
+    key_encoder: &mut Encoder,
+    key_event: &mut Event,
+    terminal: &Terminal,
     action: Action,
     keystroke: &gpui::Keystroke,
 ) -> Option<Vec<u8>> {
