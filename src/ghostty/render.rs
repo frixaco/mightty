@@ -157,6 +157,32 @@ impl RowIteration<'_, '_> {
         };
         from_result(result)
     }
+
+    pub fn selection(&self) -> Result<Option<RowSelection>> {
+        let mut raw = ffi::RenderStateRowSelection {
+            size: size_of::<ffi::RenderStateRowSelection>(),
+            start_x: 0,
+            end_x: 0,
+        };
+        let result = unsafe {
+            ffi::ghostty_render_state_row_get(
+                self.iterator.raw.as_ptr(),
+                ffi::RenderStateRowData::SELECTION,
+                std::ptr::from_mut(&mut raw).cast(),
+            )
+        };
+        match result {
+            ffi::Result::SUCCESS => Ok(Some(RowSelection {
+                start: raw.start_x,
+                end: raw.end_x,
+            })),
+            ffi::Result::NO_VALUE => Ok(None),
+            other => {
+                from_result(other)?;
+                unreachable!("successful Ghostty result handled above")
+            }
+        }
+    }
 }
 
 impl CellIterator {
@@ -343,6 +369,12 @@ pub struct CursorViewport {
     pub x: u16,
     pub y: u16,
     pub at_wide_tail: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RowSelection {
+    pub start: u16,
+    pub end: u16,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

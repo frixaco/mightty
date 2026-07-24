@@ -16,6 +16,8 @@ shell I/O through a forkpty-backed bridge.
 - Tabs in a compact left sidebar.
 - Right and down pane splits.
 - Active pane and tab closing.
+- Mouse-wheel scrollback and Ghostty-backed text selection.
+- Selection copy through `Ctrl+Shift+C` (`Cmd+C` on macOS).
 - Embedded JetBrainsMono Nerd Font Mono for terminal text.
 - Feedback capture with `Ctrl+Shift+F12`.
 
@@ -68,6 +70,9 @@ in `src/ghostty/bindings.version`. Every build verifies the submodule against
 that record before compiling or linking. See
 [`docs/ghostty-integration.md`](docs/ghostty-integration.md) for ownership,
 safety invariants, and the update procedure.
+
+The ordered product feature list and implementation research are in
+[`docs/feature-roadmap.md`](docs/feature-roadmap.md).
 
 ## Run
 
@@ -122,8 +127,13 @@ Useful runtime shortcuts:
 - `Alt+Enter`: split the active pane to the right.
 - `Alt+Shift+Enter`: split the active pane downward.
 - `Ctrl+D`: close the active pane, or close the active tab when it has one pane.
+- `Ctrl+Shift+C` (`Cmd+C` on macOS): copy the active terminal selection.
 - `Cmd+Q` on macOS: quit.
 - `Ctrl+Shift+F12`: write a terminal feedback capture to `captures/`.
+
+Drag with the left mouse button to select text. Double-click selects a word and
+triple-click selects a line using Ghostty's selection rules. Hold `Ctrl+Alt`
+while dragging for rectangular selection (`Option` on macOS).
 
 ## Project Layout
 
@@ -143,6 +153,7 @@ src/
 ├── ghostty/
 │   ├── mod.rs           # Public local Ghostty interface
 │   ├── terminal.rs      # Terminal ownership and PTY callback
+│   ├── selection.rs     # Ghostty selection gesture state and event bridge
 │   ├── render.rs        # Snapshot and lending render iterators
 │   ├── key.rs           # Key event and encoder ownership
 │   ├── style.rs         # Renderer-facing colors and styles

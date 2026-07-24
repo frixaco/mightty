@@ -10,22 +10,25 @@ mod render;
 
 use crate::feedback;
 use crate::ghostty::{
-    RenderState, Terminal, TerminalOptions,
+    RenderState, SelectionDrag, SelectionGeometry, SelectionPoint, SelectionPress, Terminal,
+    TerminalOptions, ViewportScroll,
     key::{Action, Encoder, Event},
     render::{CellIterator, RowIterator},
     style::{Palette, RgbColor},
 };
-use crate::pane_container::shortcut_action;
+use crate::pane_container::{CopySelection, shortcut_action};
 use crate::shell::PtySize;
 use gpui::{
-    Context, FocusHandle, KeyDownEvent, KeyUpEvent, MouseDownEvent, Pixels, Size, Task, Timer,
-    Window, px,
+    Bounds, ClipboardItem, Context, FocusHandle, KeyDownEvent, KeyUpEvent, Modifiers,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollWheelEvent, Size, Task,
+    Timer, Window, px,
 };
+use std::sync::OnceLock;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use pty::{OUTPUT_DRAIN_BUDGET, PtyCommand, PtyEvent, PtyWorker};
 
@@ -33,6 +36,7 @@ pub(super) const TERMINAL_FONT_FAMILY: &str = "JetBrainsMono Nerd Font Mono";
 pub(super) const TERMINAL_FONT_SIZE_PX: f32 = 16.0;
 
 const FEEDBACK_CAPTURE_KEY: &str = "f12";
+const CLICK_REPEAT_INTERVAL_NS: u64 = 500_000_000;
 
 /// Cursor style options
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -101,8 +105,10 @@ pub struct TerminalWidget {
     focus_handle: FocusHandle,
     cursor_blink_phase: bool,
     size: (u16, u16),
-    layout_size: Option<Size<Pixels>>,
+    layout_bounds: Option<Bounds<Pixels>>,
     cell_size: (Pixels, Pixels),
+    pending_scroll_y: f32,
+    selecting: bool,
     theme: TerminalTheme,
     has_exited: bool,
 }
@@ -227,8 +233,10 @@ impl TerminalWidget {
             focus_handle: cx.focus_handle(),
             cursor_blink_phase: true,
             size,
-            layout_size: None,
+            layout_bounds: None,
             cell_size: (px(9.6), px(19.2)),
+            pending_scroll_y: 0.0,
+            selecting: false,
             theme,
             has_exited,
         };
@@ -384,13 +392,13 @@ impl TerminalWidget {
         }
     }
 
-    fn update_layout_size(&mut self, size: Size<Pixels>, cx: &mut Context<Self>) {
-        if self.layout_size == Some(size) {
+    fn update_layout_bounds(&mut self, bounds: Bounds<Pixels>, cx: &mut Context<Self>) {
+        if self.layout_bounds == Some(bounds) {
             return;
         }
 
-        self.layout_size = Some(size);
-        self.resize_to_size(size, cx);
+        self.layout_bounds = Some(bounds);
+        self.resize_to_size(bounds.size, cx);
         cx.notify();
     }
 
@@ -460,6 +468,10 @@ impl TerminalWidget {
             action,
             keystroke,
         ) {
+            self.terminal.scroll_viewport(ViewportScroll::Bottom);
+            if let Err(error) = self.terminal.clear_selection() {
+                eprintln!("Failed to clear terminal selection after typing: {error}");
+            }
             self.send_pty_command(PtyCommand::Write(vt_bytes));
         }
         self.reset_cursor_blink(cx);
@@ -509,11 +521,116 @@ impl TerminalWidget {
 
     fn handle_mouse_down(
         &mut self,
-        _event: &MouseDownEvent,
+        event: &MouseDownEvent,
         window: &mut Window,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) {
         self.focus_handle.focus(window);
+        let Some(point) = self.selection_point(event.position) else {
+            return;
+        };
+
+        let press = SelectionPress {
+            point,
+            time_ns: monotonic_time_ns(),
+            repeat_interval_ns: CLICK_REPEAT_INTERVAL_NS,
+            repeat_distance: f64::from(f32::from(self.cell_size.0)),
+        };
+        match self.terminal.selection_press(press) {
+            Ok(()) => {
+                self.selecting = true;
+                cx.notify();
+            }
+            Err(error) => {
+                self.selecting = false;
+                eprintln!("Failed to begin terminal selection: {error}");
+            }
+        }
+    }
+
+    fn handle_mouse_move(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        if !self.selecting || !event.dragging() {
+            return;
+        }
+        let Some(point) = self.selection_point(event.position) else {
+            return;
+        };
+        let drag = SelectionDrag {
+            point,
+            geometry: self.selection_geometry(),
+            rectangle: rectangle_selection(&event.modifiers),
+        };
+        if let Err(error) = self.terminal.selection_drag(drag) {
+            eprintln!("Failed to update terminal selection: {error}");
+            return;
+        }
+        cx.notify();
+    }
+
+    fn handle_mouse_up(&mut self, event: &MouseUpEvent, cx: &mut Context<Self>) {
+        if !self.selecting {
+            return;
+        }
+
+        let point = self.selection_point(event.position);
+        if let Err(error) = self.terminal.selection_release(point) {
+            eprintln!("Failed to finish terminal selection: {error}");
+        }
+        self.selecting = false;
+        cx.notify();
+    }
+
+    fn handle_scroll_wheel(
+        &mut self,
+        event: &ScrollWheelEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let pixel_delta = event.delta.pixel_delta(self.cell_size.1);
+        let delta_y: f32 = pixel_delta.y.into();
+        let cell_height: f32 = self.cell_size.1.into();
+        let wheel_rows = accumulated_scroll_rows(&mut self.pending_scroll_y, delta_y, cell_height);
+        if wheel_rows != 0 {
+            self.terminal
+                .scroll_viewport(wheel_rows_to_viewport_scroll(wheel_rows));
+            cx.notify();
+        }
+        window.prevent_default();
+        cx.stop_propagation();
+    }
+
+    fn on_copy_selection(
+        &mut self,
+        _action: &CopySelection,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match self.terminal.selected_text() {
+            Ok(Some(text)) if !text.is_empty() => {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+            }
+            Ok(_) => {}
+            Err(error) => eprintln!("Failed to copy terminal selection: {error}"),
+        }
+    }
+
+    fn selection_point(&self, position: Point<Pixels>) -> Option<SelectionPoint> {
+        terminal_selection_point(position, self.layout_bounds?, self.cell_size, self.size)
+    }
+
+    fn selection_geometry(&self) -> SelectionGeometry {
+        let cell_width: f32 = self.cell_size.0.into();
+        let screen_height: f32 = self
+            .layout_bounds
+            .map_or(self.cell_size.1 * self.size.1 as f32, |bounds| {
+                bounds.size.height
+            })
+            .into();
+        SelectionGeometry {
+            columns: u32::from(self.size.0),
+            cell_width: cell_width.round().max(1.0) as u32,
+            screen_height: screen_height.round().max(1.0) as u32,
+        }
     }
 }
 
@@ -568,4 +685,130 @@ fn terminal_palette(theme_palette: [gpui::Rgba; 16]) -> Palette {
     }
 
     Palette(palette)
+}
+
+fn terminal_selection_point(
+    position: Point<Pixels>,
+    bounds: Bounds<Pixels>,
+    cell_size: (Pixels, Pixels),
+    grid_size: (u16, u16),
+) -> Option<SelectionPoint> {
+    if !bounds.contains(&position) || grid_size.0 == 0 || grid_size.1 == 0 {
+        return None;
+    }
+
+    let local = position - bounds.origin;
+    let surface_x: f32 = local.x.into();
+    let surface_y: f32 = local.y.into();
+    let cell_width: f32 = cell_size.0.into();
+    let cell_height: f32 = cell_size.1.into();
+    let column = (surface_x / cell_width).floor() as u16;
+    let row = (surface_y / cell_height).floor() as u32;
+
+    Some(SelectionPoint {
+        column: column.min(grid_size.0 - 1),
+        row: row.min(u32::from(grid_size.1 - 1)),
+        surface_x: f64::from(surface_x),
+        surface_y: f64::from(surface_y),
+    })
+}
+
+fn accumulated_scroll_rows(pending: &mut f32, delta: f32, cell_height: f32) -> isize {
+    if !delta.is_finite() || !cell_height.is_finite() || cell_height <= 0.0 {
+        return 0;
+    }
+
+    *pending += delta;
+    if !pending.is_finite() {
+        *pending = 0.0;
+        return 0;
+    }
+    let rows = (*pending / cell_height).trunc() as isize;
+    *pending -= rows as f32 * cell_height;
+    rows
+}
+
+fn wheel_rows_to_viewport_scroll(wheel_rows: isize) -> ViewportScroll {
+    ViewportScroll::Delta(wheel_rows.saturating_neg())
+}
+
+fn monotonic_time_ns() -> u64 {
+    static START: OnceLock<Instant> = OnceLock::new();
+    START
+        .get_or_init(Instant::now)
+        .elapsed()
+        .as_nanos()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+fn rectangle_selection(modifiers: &Modifiers) -> bool {
+    if cfg!(target_os = "macos") {
+        modifiers.alt
+    } else {
+        modifiers.alt && (modifiers.control || modifiers.platform)
+    }
+}
+
+#[cfg(test)]
+mod interaction_tests {
+    use gpui::{point, size};
+
+    use super::*;
+
+    #[test]
+    fn maps_window_position_to_clamped_viewport_cell() {
+        let bounds = Bounds::new(point(px(10.0), px(20.0)), size(px(100.0), px(60.0)));
+        let cell_size = (px(10.0), px(20.0));
+
+        let selected_point =
+            terminal_selection_point(point(px(109.0), px(79.0)), bounds, cell_size, (8, 3))
+                .unwrap();
+
+        assert_eq!(selected_point.column, 7);
+        assert_eq!(selected_point.row, 2);
+        assert_eq!(selected_point.surface_x, 99.0);
+        assert_eq!(selected_point.surface_y, 59.0);
+        assert!(
+            terminal_selection_point(point(px(9.0), px(20.0)), bounds, cell_size, (8, 3)).is_none()
+        );
+    }
+
+    #[test]
+    fn accumulates_precise_wheel_motion_by_terminal_row() {
+        let mut pending = 0.0;
+
+        assert_eq!(accumulated_scroll_rows(&mut pending, 9.0, 20.0), 0);
+        assert_eq!(pending, 9.0);
+        assert_eq!(accumulated_scroll_rows(&mut pending, 31.0, 20.0), 2);
+        assert_eq!(pending, 0.0);
+        assert_eq!(accumulated_scroll_rows(&mut pending, -21.0, 20.0), -1);
+        assert_eq!(pending, -1.0);
+    }
+
+    #[test]
+    fn translates_wheel_direction_to_ghostty_viewport_direction() {
+        assert_eq!(wheel_rows_to_viewport_scroll(2), ViewportScroll::Delta(-2));
+        assert_eq!(wheel_rows_to_viewport_scroll(-3), ViewportScroll::Delta(3));
+        assert_eq!(
+            wheel_rows_to_viewport_scroll(isize::MIN),
+            ViewportScroll::Delta(isize::MAX)
+        );
+    }
+
+    #[test]
+    fn uses_ghostty_rectangle_selection_modifiers() {
+        let alt = Modifiers {
+            alt: true,
+            ..Default::default()
+        };
+        assert_eq!(rectangle_selection(&alt), cfg!(target_os = "macos"));
+
+        let control_alt = Modifiers {
+            control: true,
+            alt: true,
+            ..Default::default()
+        };
+        assert!(rectangle_selection(&control_alt));
+    }
 }

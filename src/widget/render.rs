@@ -4,9 +4,9 @@ use crate::ghostty::{
 };
 use gpui::{
     Context, FontFallbacks, FontFeatures, FontStyle, FontWeight, IntoElement, KeyDownEvent,
-    KeyUpEvent, MouseButton, MouseDownEvent, Pixels, Render, StrikethroughStyle, Styled,
-    StyledText, TextRun, TextStyle, UnderlineStyle, WhiteSpace, Window, canvas, div, prelude::*,
-    px,
+    KeyUpEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Render,
+    ScrollWheelEvent, StrikethroughStyle, Styled, StyledText, TextRun, TextStyle, UnderlineStyle,
+    WhiteSpace, Window, canvas, div, prelude::*, px,
 };
 use std::sync::Arc;
 
@@ -59,7 +59,9 @@ impl RowSegment {
 
 impl Render for TerminalWidget {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let layout_size = self.layout_size.unwrap_or_else(|| window.viewport_size());
+        let layout_size = self
+            .layout_bounds
+            .map_or_else(|| window.viewport_size(), |bounds| bounds.size);
         self.resize_to_size(layout_size, cx);
 
         let snapshot = match self.render_state.update(&self.terminal) {
@@ -78,6 +80,7 @@ impl Render for TerminalWidget {
         };
 
         let cell_size = self.cell_size;
+        let selection_color = super::rgba_to_rgb(self.theme.selection);
         let mut elements: Vec<gpui::AnyElement> = Vec::new();
         let mut base_text_style = window.text_style();
         base_text_style.font_family = TERMINAL_FONT_FAMILY.into();
@@ -94,6 +97,7 @@ impl Render for TerminalWidget {
 
         let mut row_idx: u16 = 0;
         while let Some(row) = row_it.next() {
+            let row_selection = row.selection().ok().flatten();
             let mut cell_it = match self.cell_iterator.update(row) {
                 Ok(it) => it,
                 Err(_) => continue,
@@ -121,7 +125,13 @@ impl Render for TerminalWidget {
                                 advance,
                                 RowTextStyle {
                                     fg: colors.foreground,
-                                    bg: None,
+                                    bg: selected_background(
+                                        row_selection,
+                                        start_col,
+                                        advance,
+                                        None,
+                                        selection_color,
+                                    ),
                                     default_bg: colors.background,
                                     bold: false,
                                     italic: false,
@@ -151,7 +161,13 @@ impl Render for TerminalWidget {
                             advance.max(1),
                             RowTextStyle {
                                 fg,
-                                bg,
+                                bg: selected_background(
+                                    row_selection,
+                                    start_col,
+                                    advance.max(1),
+                                    bg,
+                                    selection_color,
+                                ),
                                 default_bg: colors.background,
                                 bold: false,
                                 italic: false,
@@ -175,6 +191,13 @@ impl Render for TerminalWidget {
                 } else {
                     text
                 };
+                let background = selected_background(
+                    row_selection,
+                    start_col,
+                    advance.max(1),
+                    (has_bg || style.inverse).then_some(bg_color),
+                    selection_color,
+                );
                 push_row_segment(
                     &mut row_segments,
                     &mut pending_segment,
@@ -182,7 +205,7 @@ impl Render for TerminalWidget {
                     advance.max(1),
                     RowTextStyle {
                         fg: fg_color,
-                        bg: (has_bg || style.inverse).then_some(bg_color),
+                        bg: background,
                         default_bg: colors.background,
                         bold: style.bold,
                         italic: style.italic,
@@ -269,6 +292,7 @@ impl Render for TerminalWidget {
             .relative()
             .overflow_hidden()
             .track_focus(&self.focus_handle)
+            .on_action(cx.listener(TerminalWidget::on_copy_selection))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 this.handle_key_down(event, window, cx)
             }))
@@ -281,12 +305,30 @@ impl Render for TerminalWidget {
                     this.handle_mouse_down(event, window, cx)
                 }),
             )
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _window, cx| {
+                this.handle_mouse_move(event, cx)
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseUpEvent, _window, cx| {
+                    this.handle_mouse_up(event, cx)
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseUpEvent, _window, cx| {
+                    this.handle_mouse_up(event, cx)
+                }),
+            )
+            .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, window, cx| {
+                this.handle_scroll_wheel(event, window, cx)
+            }))
             .children(elements)
             .child(
                 canvas(
                     move |bounds, _window, cx| {
                         entity.update(cx, |this, cx| {
-                            this.update_layout_size(bounds.size, cx);
+                            this.update_layout_bounds(bounds, cx);
                         });
                     },
                     |_, _, _, _| {},
@@ -294,6 +336,24 @@ impl Render for TerminalWidget {
                 .absolute()
                 .size_full(),
             )
+    }
+}
+
+fn selected_background(
+    selection: Option<crate::ghostty::render::RowSelection>,
+    start_col: u16,
+    columns: u16,
+    background: Option<RgbColor>,
+    selection_color: RgbColor,
+) -> Option<RgbColor> {
+    let Some(selection) = selection else {
+        return background;
+    };
+    let end_col = start_col.saturating_add(columns.saturating_sub(1));
+    if start_col <= selection.end && end_col >= selection.start {
+        Some(selection_color)
+    } else {
+        background
     }
 }
 
@@ -556,7 +616,10 @@ fn cell_position(row: u16, col: u16, cell_size: (Pixels, Pixels)) -> (Pixels, Pi
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ghostty::{RenderState, Terminal, TerminalOptions, render::RowIterator};
+    use crate::ghostty::{
+        RenderState, SelectionDrag, SelectionGeometry, SelectionPoint, SelectionPress, Terminal,
+        TerminalOptions, render::RowIterator,
+    };
 
     #[test]
     fn bold_style_survives_box_emoji_prompt_segment() {
@@ -643,5 +706,84 @@ mod tests {
                 ("y".to_string(), 3, CellWidth::Narrow),
             ]
         );
+    }
+
+    #[test]
+    fn render_row_exposes_one_selection_span() {
+        let mut terminal = Terminal::new(TerminalOptions {
+            cols: 12,
+            rows: 2,
+            max_scrollback: 100,
+        })
+        .expect("terminal");
+        terminal.resize(12, 2, 10, 20).expect("resize");
+        terminal.vt_write(b"hello world");
+        terminal
+            .selection_press(SelectionPress {
+                point: selection_test_point(0),
+                time_ns: 1,
+                repeat_interval_ns: 500_000_000,
+                repeat_distance: 10.0,
+            })
+            .expect("press");
+        let mut drag_point = selection_test_point(4);
+        drag_point.surface_x = 49.0;
+        terminal
+            .selection_drag(SelectionDrag {
+                point: drag_point,
+                geometry: SelectionGeometry {
+                    columns: 12,
+                    cell_width: 10,
+                    screen_height: 40,
+                },
+                rectangle: false,
+            })
+            .expect("drag");
+
+        let mut render_state = RenderState::new().expect("render state");
+        let snapshot = render_state.update(&terminal).expect("snapshot");
+        let mut row_iterator = RowIterator::new().expect("row iterator");
+        let mut rows = row_iterator.update(&snapshot).expect("rows");
+
+        assert_eq!(
+            rows.next()
+                .expect("first row")
+                .selection()
+                .expect("selection"),
+            Some(crate::ghostty::render::RowSelection { start: 0, end: 4 })
+        );
+        assert_eq!(
+            rows.next()
+                .expect("second row")
+                .selection()
+                .expect("selection"),
+            None
+        );
+    }
+
+    #[test]
+    fn selected_background_only_overrides_intersecting_cells() {
+        let selection = Some(crate::ghostty::render::RowSelection { start: 2, end: 4 });
+        let normal = RgbColor { r: 1, g: 2, b: 3 };
+        let selected = RgbColor { r: 4, g: 5, b: 6 };
+
+        assert_eq!(
+            selected_background(selection, 0, 2, Some(normal), selected),
+            Some(normal)
+        );
+        assert_eq!(
+            selected_background(selection, 1, 2, Some(normal), selected),
+            Some(selected)
+        );
+        assert_eq!(selected_background(selection, 5, 1, None, selected), None);
+    }
+
+    fn selection_test_point(column: u16) -> SelectionPoint {
+        SelectionPoint {
+            column,
+            row: 0,
+            surface_x: f64::from(column) * 10.0 + 1.0,
+            surface_y: 1.0,
+        }
     }
 }

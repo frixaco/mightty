@@ -37,6 +37,7 @@ Every developer and CI build then uses the same source.
 
 - `build.rs` validates and builds the submodule, then links the static library.
 - `src/ghostty/terminal.rs` owns the terminal handle and PTY reply callback.
+- `src/ghostty/selection.rs` owns reusable selection gesture state and events.
 - `src/ghostty/render.rs` owns render state and lending row/cell iterators.
 - `src/ghostty/key.rs` owns reusable key events and key encoding.
 - `src/ghostty/style.rs` translates only the color/style data mightty renders.
@@ -62,6 +63,11 @@ or support dynamic linking.
 - The PTY callback context is allocated once at terminal creation, so the
   pointer registered with C remains stable even if the Rust `Terminal` moves.
 - Callback panics are caught before they can unwind across the C interface.
+- Selection snapshots never escape the safe layer: they are installed as
+  terminal-owned tracked state before another terminal mutation can invalidate
+  their borrowed grid references.
+- Selection gesture state is released against its terminal before the terminal
+  handle is freed.
 - A render `Snapshot` mutably borrows its `RenderState`.
 - Row and cell iterations are lending iterators. Their returned views cannot
   outlive the snapshot, row, or reusable iterator storage that C references.

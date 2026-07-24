@@ -1,10 +1,12 @@
 use std::ffi::c_void;
 use std::marker::PhantomData;
+use std::mem::{MaybeUninit, size_of};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr::NonNull;
 use std::rc::Rc;
 
-use crate::ghostty::error::from_result;
+use crate::ghostty::error::{from_result, from_result_with_len};
+use crate::ghostty::selection::{SelectionDrag, SelectionGesture, SelectionPress, SelectionUpdate};
 use crate::ghostty::style::{Palette, RgbColor};
 use crate::ghostty::{Error, Result, ffi};
 
@@ -14,6 +16,7 @@ use crate::ghostty::{Error, Result, ffi};
 /// all render/input helpers that observe it must stay on their creating thread.
 pub struct Terminal {
     raw: NonNull<ffi::TerminalImpl>,
+    selection_gesture: SelectionGesture,
     callbacks: Box<CallbackState>,
     _not_send_or_sync: PhantomData<Rc<()>>,
 }
@@ -24,6 +27,23 @@ pub struct TerminalOptions {
     pub cols: u16,
     pub rows: u16,
     pub max_scrollback: usize,
+}
+
+/// A terminal viewport movement in Ghostty's scrollback row space.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ViewportScroll {
+    Top,
+    Bottom,
+    Delta(isize),
+    Row(usize),
+}
+
+/// Dimensions and current position of the terminal viewport.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Scrollbar {
+    pub total: u64,
+    pub offset: u64,
+    pub len: u64,
 }
 
 impl Terminal {
@@ -42,8 +62,19 @@ impl Terminal {
             unsafe { ffi::ghostty_terminal_new(std::ptr::null(), &raw mut raw, raw_options) };
         from_result(result)?;
 
+        let raw = NonNull::new(raw).ok_or(Error::InvalidValue)?;
+        let selection_gesture = match SelectionGesture::new() {
+            Ok(gesture) => gesture,
+            Err(error) => {
+                unsafe {
+                    ffi::ghostty_terminal_free(raw.as_ptr());
+                }
+                return Err(error);
+            }
+        };
         let mut terminal = Self {
-            raw: NonNull::new(raw).ok_or(Error::InvalidValue)?,
+            raw,
+            selection_gesture,
             callbacks: Box::new(CallbackState::default()),
             _not_send_or_sync: PhantomData,
         };
@@ -72,6 +103,113 @@ impl Terminal {
             ffi::ghostty_terminal_resize(self.as_raw(), cols, rows, cell_width_px, cell_height_px)
         };
         from_result(result)
+    }
+
+    pub fn scroll_viewport(&mut self, scroll: ViewportScroll) {
+        let (tag, value) = match scroll {
+            ViewportScroll::Top => (
+                ffi::TerminalScrollViewportTag::TOP,
+                ffi::TerminalScrollViewportValue::default(),
+            ),
+            ViewportScroll::Bottom => (
+                ffi::TerminalScrollViewportTag::BOTTOM,
+                ffi::TerminalScrollViewportValue::default(),
+            ),
+            ViewportScroll::Delta(delta) => (
+                ffi::TerminalScrollViewportTag::DELTA,
+                ffi::TerminalScrollViewportValue { delta },
+            ),
+            ViewportScroll::Row(row) => (
+                ffi::TerminalScrollViewportTag::ROW,
+                ffi::TerminalScrollViewportValue { row },
+            ),
+        };
+        unsafe {
+            ffi::ghostty_terminal_scroll_viewport(
+                self.as_raw(),
+                ffi::TerminalScrollViewport { tag, value },
+            );
+        }
+    }
+
+    pub fn scrollbar(&self) -> Result<Scrollbar> {
+        let raw =
+            unsafe { self.get_unchecked::<ffi::TerminalScrollbar>(ffi::TerminalData::SCROLLBAR)? };
+        Ok(Scrollbar {
+            total: raw.total,
+            offset: raw.offset,
+            len: raw.len,
+        })
+    }
+
+    pub fn selection_press(&mut self, input: SelectionPress) -> Result<()> {
+        let update = self.selection_gesture.press(self.as_raw(), input)?;
+        self.apply_selection_update(update)
+    }
+
+    pub fn selection_drag(&mut self, input: SelectionDrag) -> Result<()> {
+        let update = self.selection_gesture.drag(self.as_raw(), input)?;
+        self.apply_selection_update(update)
+    }
+
+    pub fn selection_release(
+        &mut self,
+        point: Option<crate::ghostty::SelectionPoint>,
+    ) -> Result<()> {
+        self.selection_gesture.release(self.as_raw(), point)
+    }
+
+    pub fn clear_selection(&mut self) -> Result<()> {
+        self.set_raw_pointer(ffi::TerminalOption::SELECTION, std::ptr::null())
+    }
+
+    pub fn selected_text(&self) -> Result<Option<String>> {
+        let options = ffi::TerminalSelectionFormatOptions {
+            size: size_of::<ffi::TerminalSelectionFormatOptions>(),
+            emit: ffi::FormatterFormat::PLAIN,
+            unwrap: true,
+            trim: true,
+            selection: std::ptr::null(),
+        };
+        let mut required = 0_usize;
+        let result = unsafe {
+            ffi::ghostty_terminal_selection_format_buf(
+                self.as_raw(),
+                options,
+                std::ptr::null_mut(),
+                0,
+                &raw mut required,
+            )
+        };
+        match result {
+            ffi::Result::NO_VALUE => return Ok(None),
+            ffi::Result::SUCCESS if required == 0 => return Ok(Some(String::new())),
+            ffi::Result::OUT_OF_SPACE => {}
+            other => {
+                from_result_with_len(other, required)?;
+                return Err(Error::InvalidValue);
+            }
+        }
+
+        let mut bytes = vec![0_u8; required];
+        let mut written = 0_usize;
+        let result = unsafe {
+            ffi::ghostty_terminal_selection_format_buf(
+                self.as_raw(),
+                options,
+                bytes.as_mut_ptr(),
+                bytes.len(),
+                &raw mut written,
+            )
+        };
+        let written = from_result_with_len(result, written)?;
+        if written > bytes.len() {
+            return Err(Error::InvalidValue);
+        }
+        bytes.truncate(written);
+        String::from_utf8(bytes)
+            .map(Some)
+            .map_err(|_| Error::InvalidValue)
     }
 
     /// Register the sink for terminal-generated replies sent back to the PTY.
@@ -113,6 +251,17 @@ impl Terminal {
         self.raw.as_ptr()
     }
 
+    fn apply_selection_update(&mut self, update: SelectionUpdate) -> Result<()> {
+        match update {
+            SelectionUpdate::Set(selection) => self.set_raw_pointer(
+                ffi::TerminalOption::SELECTION,
+                std::ptr::from_ref(&selection).cast(),
+            ),
+            SelectionUpdate::Clear => self.clear_selection(),
+            SelectionUpdate::Unchanged => Ok(()),
+        }
+    }
+
     fn set_optional_color(
         &self,
         option: ffi::TerminalOption::Type,
@@ -133,10 +282,20 @@ impl Terminal {
         let result = unsafe { ffi::ghostty_terminal_set(self.as_raw(), option, pointer) };
         from_result(result)
     }
+
+    /// `T` must be the output type documented for `data`.
+    unsafe fn get_unchecked<T>(&self, data: ffi::TerminalData::Type) -> Result<T> {
+        let mut value = MaybeUninit::<T>::uninit();
+        let result =
+            unsafe { ffi::ghostty_terminal_get(self.as_raw(), data, value.as_mut_ptr().cast()) };
+        from_result(result)?;
+        Ok(unsafe { value.assume_init() })
+    }
 }
 
 impl Drop for Terminal {
     fn drop(&mut self) {
+        self.selection_gesture.deinit(self.raw.as_ptr());
         unsafe {
             ffi::ghostty_terminal_free(self.as_raw());
         }
@@ -186,6 +345,11 @@ mod tests {
     use std::cell::RefCell;
 
     use super::*;
+    use crate::ghostty::{SelectionGeometry, SelectionPoint};
+
+    const CELL_WIDTH: u32 = 10;
+    const CELL_HEIGHT: u32 = 20;
+    const REPEAT_INTERVAL_NS: u64 = 500_000_000;
 
     #[test]
     fn rejects_zero_sized_terminal() {
@@ -233,5 +397,130 @@ mod tests {
             .unwrap();
 
         terminal.vt_write(b"\x1b[5n");
+    }
+
+    #[test]
+    fn scrolls_viewport_in_ghostty_row_space() {
+        let mut terminal = Terminal::new(TerminalOptions {
+            cols: 12,
+            rows: 2,
+            max_scrollback: 100,
+        })
+        .unwrap();
+        terminal.vt_write(b"one\r\ntwo\r\nthree\r\nfour");
+
+        let at_bottom = terminal.scrollbar().unwrap();
+        assert!(at_bottom.total > at_bottom.len);
+        assert_eq!(at_bottom.offset, at_bottom.total - at_bottom.len);
+
+        terminal.scroll_viewport(ViewportScroll::Delta(-1));
+
+        let scrolled = terminal.scrollbar().unwrap();
+        assert_eq!(scrolled.offset + 1, at_bottom.offset);
+        assert_eq!(scrolled.total, at_bottom.total);
+        assert_eq!(scrolled.len, at_bottom.len);
+    }
+
+    #[test]
+    fn gesture_selects_and_formats_text_with_ghostty_rules() {
+        let mut terminal = selection_terminal(20, 3);
+        terminal.vt_write(b"hello world");
+
+        terminal.selection_press(selection_press(0, 0, 1)).unwrap();
+        terminal
+            .selection_drag(selection_drag(4, 0, 20, 3))
+            .unwrap();
+        terminal
+            .selection_release(Some(selection_point(4, 0)))
+            .unwrap();
+
+        assert_eq!(terminal.selected_text().unwrap().as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn tracked_selection_survives_output_entering_scrollback() {
+        let mut terminal = selection_terminal(12, 2);
+        terminal.vt_write(b"one\r\ntwo");
+
+        terminal.selection_press(selection_press(0, 0, 1)).unwrap();
+        terminal
+            .selection_drag(selection_drag(2, 0, 12, 2))
+            .unwrap();
+        terminal
+            .selection_release(Some(selection_point(2, 0)))
+            .unwrap();
+        terminal.vt_write(b"\r\nthree");
+
+        assert_eq!(terminal.selected_text().unwrap().as_deref(), Some("one"));
+    }
+
+    #[test]
+    fn repeated_clicks_use_ghostty_word_and_line_selection() {
+        let mut terminal = selection_terminal(20, 2);
+        terminal.vt_write(b"hello world");
+        let point = selection_point(1, 0);
+
+        terminal.selection_press(selection_press(1, 0, 1)).unwrap();
+        terminal.selection_release(Some(point)).unwrap();
+        terminal
+            .selection_press(selection_press(1, 0, 100_000_001))
+            .unwrap();
+
+        assert_eq!(terminal.selected_text().unwrap().as_deref(), Some("hello"));
+
+        terminal.selection_release(Some(point)).unwrap();
+        terminal
+            .selection_press(selection_press(1, 0, 200_000_001))
+            .unwrap();
+
+        assert_eq!(
+            terminal.selected_text().unwrap().as_deref(),
+            Some("hello world")
+        );
+    }
+
+    fn selection_terminal(cols: u16, rows: u16) -> Terminal {
+        let mut terminal = Terminal::new(TerminalOptions {
+            cols,
+            rows,
+            max_scrollback: 100,
+        })
+        .unwrap();
+        terminal
+            .resize(cols, rows, CELL_WIDTH, CELL_HEIGHT)
+            .unwrap();
+        terminal
+    }
+
+    fn selection_press(column: u16, row: u32, time_ns: u64) -> SelectionPress {
+        SelectionPress {
+            point: selection_point(column, row),
+            time_ns,
+            repeat_interval_ns: REPEAT_INTERVAL_NS,
+            repeat_distance: CELL_WIDTH as f64,
+        }
+    }
+
+    fn selection_drag(column: u16, row: u32, columns: u32, rows: u32) -> SelectionDrag {
+        let mut point = selection_point(column, row);
+        point.surface_x += f64::from(CELL_WIDTH - 2);
+        SelectionDrag {
+            point,
+            geometry: SelectionGeometry {
+                columns,
+                cell_width: CELL_WIDTH,
+                screen_height: rows * CELL_HEIGHT,
+            },
+            rectangle: false,
+        }
+    }
+
+    fn selection_point(column: u16, row: u32) -> SelectionPoint {
+        SelectionPoint {
+            column,
+            row,
+            surface_x: f64::from(column) * f64::from(CELL_WIDTH) + 1.0,
+            surface_y: f64::from(row) * f64::from(CELL_HEIGHT) + 1.0,
+        }
     }
 }

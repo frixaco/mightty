@@ -34,6 +34,7 @@ src/
 ├── ghostty/
 │   ├── mod.rs           # Public local Ghostty interface
 │   ├── terminal.rs      # Terminal ownership and PTY callback
+│   ├── selection.rs     # Ghostty selection gesture state and event bridge
 │   ├── render.rs        # Snapshot and lending render iterators
 │   ├── key.rs           # Key event and encoder ownership
 │   ├── style.rs         # Renderer-facing colors and styles
@@ -78,6 +79,11 @@ requirement because `build.rs` validates the submodule revision.
 - `Alt+Enter` splits the active pane to the right.
 - `Alt+Shift+Enter` splits the active pane downward.
 - `Ctrl+D` closes the active pane, or closes the active tab when it has one pane.
+- The mouse wheel scrolls terminal history.
+- Left-button drag selects text; double-click selects a word and triple-click
+  selects a line using Ghostty's selection rules.
+- `Ctrl+Alt` drag selects a rectangle (`Option` on macOS).
+- `Ctrl+Shift+C` copies the active selection; `Cmd+C` does the same on macOS.
 - `Cmd+Q` quits on macOS.
 - Exited panes are removed when more than one pane exists.
 - `Ctrl+Shift+F12` writes a feedback capture under `captures/`.

@@ -4,6 +4,7 @@
 //! private. Callers use terminal concepts and never handle C pointers.
 
 mod error;
+mod selection;
 mod terminal;
 
 #[cfg(test)]
@@ -26,7 +27,8 @@ mod ffi;
 
 pub use error::{Error, Result};
 pub use render::RenderState;
-pub use terminal::{Terminal, TerminalOptions};
+pub use selection::{SelectionDrag, SelectionGeometry, SelectionPoint, SelectionPress};
+pub use terminal::{Scrollbar, Terminal, TerminalOptions, ViewportScroll};
 
 /// Exact Ghostty source revision compiled into this build.
 pub const SOURCE_REVISION: &str = env!("MIGHTTY_GHOSTTY_REVISION");
