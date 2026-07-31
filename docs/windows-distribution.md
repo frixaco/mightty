@@ -73,6 +73,13 @@ Configure these repository secrets:
 `WINDOWS_PACKAGE_PUBLISHER` must equal the certificate subject. Encode the PFX
 file as one base64 string before you store it in the repository secret.
 
+The workflow pins each external action to an immutable commit. It removes the
+signing certificate before it verifies or uploads release artifacts.
+
+`verify-windows-release.ps1` verifies the signature, package identity,
+default-terminal registrations, required payloads, and updater metadata. The
+script does not require a private certificate. It also writes `SHA256SUMS.txt`.
+
 ## Test an upgrade
 
 Use a clean local or virtual Windows user. The test stops if mightty user data

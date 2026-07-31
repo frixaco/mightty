@@ -14,17 +14,17 @@ jobs:
 
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           submodules: recursive
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable as of 2026-07-16
         with:
           targets: x86_64-pc-windows-msvc
 
       - name: Install pinned tools
-        uses: jdx/mise-action@v3
+        uses: jdx/mise-action@5228313ee0372e111a38da051671ca30fc5a96db # v3.6.3
 
       - name: Check release version
         shell: pwsh
@@ -73,18 +73,32 @@ jobs:
             -CertificateThumbprint "${{ steps.certificate.outputs.thumbprint }}" `
             -ReleaseBaseUri "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}"
 
-      - name: Publish Windows release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: artifacts/windows/*
-
       - name: Remove signing certificate
         if: always()
         shell: pwsh
         run: |
           $thumbprint = "${{ steps.certificate.outputs.thumbprint }}"
           if ($thumbprint -match "^[0-9A-Fa-f]{40}$") {
-            Remove-Item -LiteralPath "Cert:\CurrentUser\My\$thumbprint" `
-              -Force `
-              -ErrorAction SilentlyContinue
+            $certificatePath = "Cert:\CurrentUser\My\$thumbprint"
+            if (Test-Path -LiteralPath $certificatePath) {
+              Remove-Item -LiteralPath $certificatePath -Force
+            }
+            if (Test-Path -LiteralPath $certificatePath) {
+              throw "The signing certificate remains installed."
+            }
           }
+
+      - name: Verify release artifacts without the private certificate
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}".Substring(1)
+          .\tools\verify-windows-release.ps1 `
+            -ArtifactsDirectory .\artifacts\windows `
+            -Publisher "${{ secrets.WINDOWS_PACKAGE_PUBLISHER }}" `
+            -Version $version `
+            -Architecture x64
+
+      - name: Publish Windows release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        with:
+          files: artifacts/windows/*
