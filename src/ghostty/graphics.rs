@@ -1,8 +1,8 @@
 use std::ffi::c_void;
 use std::io::Cursor;
 use std::marker::PhantomData;
-use std::mem::{MaybeUninit, size_of};
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::mem::size_of;
 use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::OnceLock;
@@ -253,16 +253,16 @@ fn decode_png_inner(
 impl<'terminal> Graphics<'terminal> {
     /// Returns the storage-wide content generation.
     pub fn generation(&self) -> Result<u64> {
-        let mut generation = MaybeUninit::<u64>::uninit();
+        let mut generation = 0_u64;
         let result = unsafe {
             ffi::ghostty_kitty_graphics_get(
                 self.raw.as_ptr(),
                 ffi::KittyGraphicsData::GENERATION,
-                generation.as_mut_ptr().cast(),
+                std::ptr::from_mut(&mut generation).cast(),
             )
         };
         from_result(result)?;
-        Ok(unsafe { generation.assume_init() })
+        Ok(generation)
     }
 
     /// Populates an iterator and applies one z-layer filter.
@@ -467,14 +467,10 @@ impl Image<'_> {
         }
 
         let format = PixelFormat::from_raw(format)?;
-        let expected_len = usize::try_from(width)
-            .ok()
-            .and_then(|width| {
-                usize::try_from(height)
-                    .ok()
-                    .and_then(|height| width.checked_mul(height))
-            })
-            .and_then(|pixels| pixels.checked_mul(format.bytes_per_pixel()))
+        let expected_len = u64::from(width)
+            .checked_mul(u64::from(height))
+            .and_then(|pixels| pixels.checked_mul(format.bytes_per_pixel() as u64))
+            .and_then(|length| usize::try_from(length).ok())
             .ok_or(Error::InvalidValue)?;
         if expected_len == 0 || data_len != expected_len || data_ptr.is_null() {
             return Err(Error::InvalidValue);

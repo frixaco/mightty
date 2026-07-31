@@ -74,14 +74,10 @@ struct HotKeySpec {
 impl HotKeySpec {
     fn parse(chord: &str) -> io::Result<Self> {
         let chord = normalize_chord(chord).map_err(invalid_chord)?;
-        let mut parts = chord.split('-').peekable();
+        let mut parts = chord.split('-');
+        let key = parts.next_back().unwrap_or_default();
         let mut modifiers = MOD_NOREPEAT;
-        let mut key = None;
-        while let Some(part) = parts.next() {
-            if parts.peek().is_none() {
-                key = Some(part);
-                break;
-            }
+        for part in parts {
             modifiers |= match part {
                 "ctrl" => MOD_CONTROL,
                 "alt" => MOD_ALT,
@@ -95,7 +91,7 @@ impl HotKeySpec {
         if modifiers == MOD_NOREPEAT {
             return Err(invalid_chord("a global hotkey must contain a modifier key"));
         }
-        let virtual_key = virtual_key(key.unwrap_or_default())
+        let virtual_key = virtual_key(key)
             .ok_or_else(|| invalid_chord("the key is not supported as a Windows global hotkey"))?;
         Ok(Self {
             modifiers,

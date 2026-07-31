@@ -11,7 +11,7 @@ use windows_sys::Win32::Graphics::Gdi::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     GA_ROOTOWNER, GetAncestor, GetCursorPos, GetForegroundWindow, HWND_TOPMOST, IsWindowVisible,
-    SW_HIDE, SW_SHOW, SWP_SHOWWINDOW, SetForegroundWindow, SetWindowPos, ShowWindow,
+    SW_HIDE, SWP_SHOWWINDOW, SetForegroundWindow, SetWindowPos, ShowWindow,
 };
 
 use crate::settings::QuickTerminalSettings;
@@ -98,10 +98,7 @@ fn show(hwnd: HWND, settings: &QuickTerminalSettings) -> io::Result<()> {
     {
         return Err(io::Error::last_os_error());
     }
-    unsafe {
-        ShowWindow(hwnd, SW_SHOW);
-        SetForegroundWindow(hwnd);
-    }
+    unsafe { SetForegroundWindow(hwnd) };
     Ok(())
 }
 

@@ -90,7 +90,7 @@ impl PrimaryInstance {
 
         let identity = ProcessIdentity::current()?;
         let security = PipeSecurity::for_user(&identity.sid)?;
-        let first_pipe = create_server_pipe(&self.pipe_name, security.attributes())?;
+        let first_pipe = create_server_pipe(&self.pipe_name, &security.attributes)?;
         let pipe_name = Arc::clone(&self.pipe_name);
         let stop = Arc::clone(&self.stop);
         self.server_thread = Some(
@@ -159,7 +159,7 @@ fn serve_activation_requests(
             Ok(security) => security,
             Err(_) => break,
         };
-        pipe = match create_server_pipe(pipe_name, security.attributes()) {
+        pipe = match create_server_pipe(pipe_name, &security.attributes) {
             Ok(pipe) => pipe,
             Err(_) => break,
         };
@@ -383,10 +383,6 @@ impl PipeSecurity {
                 bInheritHandle: 0,
             },
         })
-    }
-
-    fn attributes(&self) -> &SECURITY_ATTRIBUTES {
-        &self.attributes
     }
 }
 
