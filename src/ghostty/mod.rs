@@ -11,6 +11,7 @@ mod terminal;
 #[cfg(test)]
 mod abi;
 
+pub mod graphics;
 pub mod key;
 pub mod mouse;
 pub mod paste;
