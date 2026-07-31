@@ -8,6 +8,7 @@ use std::ptr::{null, null_mut};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_ALREADY_EXISTS, ERROR_INSUFFICIENT_BUFFER, ERROR_PIPE_CONNECTED,
@@ -198,24 +199,31 @@ fn create_server_pipe(
 }
 
 fn connect_pipe(pipe_name: &[u16]) -> io::Result<OwnedHandle> {
-    unsafe {
-        WaitNamedPipeW(pipe_name.as_ptr(), ACTIVATION_CONNECT_TIMEOUT_MS);
-    }
-    let pipe = unsafe {
-        CreateFileW(
-            pipe_name.as_ptr(),
-            GENERIC_WRITE,
-            0,
-            null(),
-            OPEN_EXISTING,
-            FILE_ATTRIBUTE_NORMAL,
-            null_mut(),
-        )
-    };
-    if pipe == INVALID_HANDLE_VALUE {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(OwnedHandle::new(pipe))
+    let deadline = Instant::now() + Duration::from_millis(ACTIVATION_CONNECT_TIMEOUT_MS.into());
+    loop {
+        let pipe = unsafe {
+            CreateFileW(
+                pipe_name.as_ptr(),
+                GENERIC_WRITE,
+                0,
+                null(),
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                null_mut(),
+            )
+        };
+        if pipe != INVALID_HANDLE_VALUE {
+            return Ok(OwnedHandle::new(pipe));
+        }
+
+        let error = io::Error::last_os_error();
+        if Instant::now() >= deadline {
+            return Err(error);
+        }
+        unsafe {
+            WaitNamedPipeW(pipe_name.as_ptr(), 50);
+        }
+        thread::sleep(Duration::from_millis(10));
     }
 }
 

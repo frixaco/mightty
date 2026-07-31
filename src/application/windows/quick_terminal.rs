@@ -34,10 +34,22 @@ pub fn toggle_quick_terminal(
     }
 }
 
+/// Place, show, and focus the persistent quick-terminal window.
+pub fn show_quick_terminal(window: &Window, settings: &QuickTerminalSettings) -> io::Result<()> {
+    show(native_window(window)?, settings)?;
+    window.activate_window();
+    Ok(())
+}
+
 /// Hide the persistent quick-terminal window.
 pub fn hide_quick_terminal(window: &Window) -> io::Result<()> {
     hide(native_window(window)?);
     Ok(())
+}
+
+/// Return whether the persistent quick-terminal window is visible.
+pub fn quick_terminal_is_visible(window: &Window) -> io::Result<bool> {
+    Ok(unsafe { IsWindowVisible(native_window(window)?) } != 0)
 }
 
 /// Return whether the foreground window belongs to the quick terminal.

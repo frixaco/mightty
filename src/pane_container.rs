@@ -540,6 +540,10 @@ impl PaneContainer {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if action.action == AppAction::ToggleQuickTerminal {
+            cx.propagate();
+            return;
+        }
         self.dispatch_app_action(action.action.clone(), window, cx);
     }
 
@@ -636,7 +640,15 @@ impl PaneContainer {
                 self.restore_workspace(&workspace_id, cx);
             }
             AppAction::Quit => cx.quit(),
-            AppAction::Search | AppAction::ToggleQuickTerminal => {}
+            AppAction::ToggleQuickTerminal => {
+                window.dispatch_action(
+                    Box::new(DispatchAppAction {
+                        action: AppAction::ToggleQuickTerminal,
+                    }),
+                    cx,
+                );
+            }
+            AppAction::Search => {}
         }
     }
 
@@ -673,7 +685,8 @@ impl PaneContainer {
             semantic_commands_available,
             pane_management_available: true,
             search_available: false,
-            quick_terminal_available: false,
+            quick_terminal_available: cfg!(windows)
+                && self.settings.current().app.quick_terminal.enabled,
         }
     }
 
