@@ -9,12 +9,12 @@ mod pty;
 mod render;
 
 use crate::action::{
-    ActionBinding, AppAction, DispatchAppAction, chord_for_keystroke, default_action_bindings,
+    ActionBinding, AppAction, DispatchAppAction, PromptDirection, chord_for_keystroke,
+    default_action_bindings,
 };
 use crate::feedback;
 use crate::ghostty::{
-    ClipboardLocation, ClipboardWrite, ClipboardWriteResult,
-    PromptDirection as GhosttyPromptDirection, RenderState, Scrollbar, SelectionDrag,
+    ClipboardLocation, ClipboardWrite, ClipboardWriteResult, RenderState, Scrollbar, SelectionDrag,
     SelectionGeometry, SelectionPoint, SelectionPress, Terminal, TerminalOptions, ViewportScroll,
     key::{Action, Encoder, Event},
     mouse::{Action as MouseAction, Button as MouseButton, Encoder as MouseEncoder},
@@ -134,7 +134,7 @@ pub struct TerminalWidget {
     pending_paste: Option<String>,
     terminal_clipboard_writes: Rc<RefCell<Vec<String>>>,
     terminal_effects: Rc<RefCell<PendingTerminalEffects>>,
-    reported_title: Option<Option<String>>,
+    reported_title: Option<String>,
     reported_working_directory: Option<Option<String>>,
     semantic_commands_available: bool,
     theme: TerminalTheme,
@@ -388,18 +388,14 @@ impl TerminalWidget {
     }
 
     pub(crate) fn reported_title(&self) -> Option<&str> {
-        self.reported_title.as_ref().and_then(Option::as_deref)
+        self.reported_title.as_deref()
     }
 
     pub(crate) fn semantic_commands_available(&self) -> bool {
         self.semantic_commands_available
     }
 
-    pub(crate) fn jump_to_prompt(
-        &mut self,
-        direction: GhosttyPromptDirection,
-        cx: &mut Context<Self>,
-    ) {
+    pub(crate) fn jump_to_prompt(&mut self, direction: PromptDirection, cx: &mut Context<Self>) {
         match self.terminal.jump_to_prompt(direction) {
             Ok(true) => cx.notify(),
             Ok(false) => {}
@@ -508,7 +504,7 @@ impl TerminalWidget {
         if let Some(title) = effects.title {
             match title {
                 Ok(title) => {
-                    self.reported_title = Some(title.clone());
+                    self.reported_title = title.clone();
                     cx.emit(TerminalEvent::TitleChanged(title));
                 }
                 Err(error) => eprintln!("Ignored invalid terminal title: {error}"),

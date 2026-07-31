@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+pub use crate::ghostty::PromptDirection;
 use crate::profile::ProfileId;
 use crate::workspace::WorkspaceId;
 
@@ -350,13 +351,6 @@ pub enum Direction {
     Down,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PromptDirection {
-    Previous,
-    Next,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ActionCategory {
     Application,
@@ -492,6 +486,14 @@ mod tests {
             r#"{"type":"split","direction":"right","profile_id":"powershell"}"#
         );
         assert_eq!(serde_json::from_str::<AppAction>(&json).unwrap(), action);
+
+        let action = AppAction::JumpToPrompt {
+            direction: PromptDirection::Previous,
+        };
+        assert_eq!(
+            serde_json::to_string(&action).unwrap(),
+            r#"{"type":"jump_to_prompt","direction":"previous"}"#
+        );
     }
 
     #[test]

@@ -2,10 +2,13 @@
 
 use std::mem::{MaybeUninit, size_of};
 
+use serde::{Deserialize, Serialize};
+
 use crate::ghostty::error::from_result;
 use crate::ghostty::{Error, Result, Terminal, ViewportScroll, ffi};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PromptDirection {
     Previous,
     Next,

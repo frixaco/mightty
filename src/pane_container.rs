@@ -10,11 +10,9 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use crate::action::{
-    ActionContext, AppAction, DispatchAppAction, PromptDirection as ActionPromptDirection,
-    SplitDirection as ActionSplitDirection,
+    ActionContext, AppAction, DispatchAppAction, SplitDirection as ActionSplitDirection,
 };
 use crate::command_palette::{PaletteCommand, commands, filtered_command_indices};
-use crate::ghostty::PromptDirection as GhosttyPromptDirection;
 use crate::profile::ProfileId;
 use crate::settings::{ReloadOutcome, SettingsStore};
 use crate::split::{Split, SplitAxis};
@@ -591,10 +589,6 @@ impl PaneContainer {
             }
             AppAction::JumpToPrompt { direction } => {
                 if let Some(terminal) = self.active_terminal(window, cx) {
-                    let direction = match direction {
-                        ActionPromptDirection::Previous => GhosttyPromptDirection::Previous,
-                        ActionPromptDirection::Next => GhosttyPromptDirection::Next,
-                    };
                     terminal.update(cx, |terminal, cx| terminal.jump_to_prompt(direction, cx));
                 }
             }
