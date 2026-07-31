@@ -27,6 +27,8 @@ use crate::ghostty::{
     style::{Palette, RgbColor},
 };
 use crate::profile::LaunchSpec;
+#[cfg(windows)]
+use crate::shell::PtyParts;
 use crate::shell::PtySize;
 use gpui::{
     Bounds, ClipboardItem, Context, EventEmitter, FocusHandle, KeyDownEvent, KeyUpEvent, Modifiers,
@@ -203,20 +205,7 @@ impl Default for TerminalTheme {
 
 impl TerminalWidget {
     pub fn new(config: TerminalConfig, cx: &mut Context<Self>) -> Self {
-        let theme = config.theme.clone();
         let exit_flag = Arc::new(AtomicBool::new(false));
-
-        let mut terminal = Terminal::new(TerminalOptions {
-            cols: config.initial_cols,
-            rows: config.initial_rows,
-            max_scrollback: config.scrollback,
-        })
-        .expect("Failed to create terminal");
-        terminal
-            .enable_direct_graphics(graphics::DIRECT_GRAPHICS_STORAGE_LIMIT)
-            .expect("Failed to enable direct terminal graphics");
-        let terminal_clipboard_writes = Rc::new(RefCell::new(Vec::new()));
-        let terminal_effects = Rc::new(RefCell::new(PendingTerminalEffects::default()));
 
         #[cfg(any(windows, unix))]
         let (pty_worker, pty_event_rx, pty_tx) = {
@@ -250,6 +239,46 @@ impl TerminalWidget {
             exit_flag.store(true, Ordering::Relaxed);
             (None, None, None)
         };
+
+        Self::with_pty(config, exit_flag, pty_worker, pty_event_rx, pty_tx, cx)
+    }
+
+    /// Create a terminal from handles supplied by Windows terminal handoff.
+    #[cfg(windows)]
+    pub fn from_pty_parts(config: TerminalConfig, parts: PtyParts, cx: &mut Context<Self>) -> Self {
+        let exit_flag = Arc::new(AtomicBool::new(false));
+        let (worker, event_rx) = PtyWorker::from_parts(parts, Arc::clone(&exit_flag));
+        let pty_tx = worker.command_tx();
+        Self::with_pty(
+            config,
+            exit_flag,
+            Some(worker),
+            Some(event_rx),
+            Some(pty_tx),
+            cx,
+        )
+    }
+
+    fn with_pty(
+        config: TerminalConfig,
+        exit_flag: Arc<AtomicBool>,
+        pty_worker: Option<PtyWorker>,
+        pty_event_rx: Option<flume::Receiver<PtyEvent>>,
+        pty_tx: Option<flume::Sender<PtyCommand>>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let theme = config.theme.clone();
+        let mut terminal = Terminal::new(TerminalOptions {
+            cols: config.initial_cols,
+            rows: config.initial_rows,
+            max_scrollback: config.scrollback,
+        })
+        .expect("Failed to create terminal");
+        terminal
+            .enable_direct_graphics(graphics::DIRECT_GRAPHICS_STORAGE_LIMIT)
+            .expect("Failed to enable direct terminal graphics");
+        let terminal_clipboard_writes = Rc::new(RefCell::new(Vec::new()));
+        let terminal_effects = Rc::new(RefCell::new(PendingTerminalEffects::default()));
 
         let pty_response_tx = pty_tx.clone();
         terminal

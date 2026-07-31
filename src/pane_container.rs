@@ -15,6 +15,8 @@ use crate::action::{
 use crate::command_palette::{PaletteCommand, commands, filtered_command_indices};
 use crate::profile::ProfileId;
 use crate::settings::{ReloadOutcome, SettingsStore};
+#[cfg(windows)]
+use crate::shell::PtyParts;
 use crate::split::{Split, SplitAxis};
 use crate::widget::{TerminalConfig, TerminalEvent, TerminalWidget};
 use crate::workspace::{
@@ -140,6 +142,65 @@ impl PaneContainer {
         terminal.update(cx, |terminal, _cx| terminal.set_exit_signal(exit_tx));
         cx.subscribe(&terminal, Self::on_terminal_event).detach();
         terminal
+    }
+
+    /// Open a Windows terminal handoff as an active tab.
+    ///
+    /// The first handoff can replace the one tab created for a hidden COM start.
+    /// Later handoffs add a tab without removing user sessions.
+    #[cfg(windows)]
+    pub fn open_handoff(
+        &mut self,
+        parts: PtyParts,
+        startup_title: Option<String>,
+        replace_existing: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let replace_initial_tab = replace_existing && self.tabs.len() == 1;
+        if !replace_initial_tab && self.tabs.len() >= MAX_SELECTABLE_TABS {
+            return;
+        }
+
+        let (config, profile_id, profile_title) = {
+            let settings = self.settings.current();
+            let profile_id = settings.default_profile.clone();
+            let config = settings
+                .terminal_config(Some(&profile_id))
+                .expect("resolved settings contain their default profile");
+            let profile_title = settings
+                .profiles
+                .get(&profile_id)
+                .expect("resolved settings contain their default profile")
+                .label
+                .clone();
+            (config, profile_id, profile_title)
+        };
+        let title = startup_title
+            .filter(|title| !title.trim().is_empty())
+            .unwrap_or(profile_title);
+        let terminal = cx.new(|cx| TerminalWidget::from_pty_parts(config, parts, cx));
+        terminal.update(cx, |terminal, _cx| {
+            terminal.set_exit_signal(self.exit_tx.clone())
+        });
+        cx.subscribe(&terminal, Self::on_terminal_event).detach();
+        let split = cx.new(|_cx| Split::with_terminal(terminal, profile_id));
+        let tab = Tab {
+            id: TabId::fresh(),
+            split,
+            title: title.clone(),
+            default_title: title,
+            bell_pending: false,
+        };
+
+        if replace_initial_tab {
+            self.tabs[0] = tab;
+            self.active_tab_index = 0;
+        } else {
+            self.tabs.push(tab);
+            self.active_tab_index = self.tabs.len() - 1;
+        }
+        self.needs_focus = true;
+        cx.notify();
     }
 
     fn on_terminal_event(
