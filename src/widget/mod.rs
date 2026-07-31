@@ -4,6 +4,7 @@
 //! rendering, and feedback capture together.
 
 mod capture;
+mod graphics;
 mod input;
 mod pty;
 mod render;
@@ -115,6 +116,7 @@ pub struct TerminalWidget {
     render_state: RenderState,
     row_iterator: RowIterator,
     cell_iterator: CellIterator,
+    graphics_renderer: graphics::GraphicsRenderer,
     config: TerminalConfig,
     pty_tx: Option<flume::Sender<PtyCommand>>,
     exit_signal_tx: Option<flume::Sender<()>>,
@@ -206,6 +208,9 @@ impl TerminalWidget {
             max_scrollback: config.scrollback,
         })
         .expect("Failed to create terminal");
+        terminal
+            .enable_direct_graphics(graphics::DIRECT_GRAPHICS_STORAGE_LIMIT)
+            .expect("Failed to enable direct terminal graphics");
         let terminal_clipboard_writes = Rc::new(RefCell::new(Vec::new()));
         let terminal_effects = Rc::new(RefCell::new(PendingTerminalEffects::default()));
 
@@ -288,6 +293,8 @@ impl TerminalWidget {
         let render_state = RenderState::new().expect("Failed to create render state");
         let row_iterator = RowIterator::new().expect("Failed to create row iterator");
         let cell_iterator = CellIterator::new().expect("Failed to create cell iterator");
+        let graphics_renderer =
+            graphics::GraphicsRenderer::new().expect("Failed to create graphics renderer");
         let key_encoder = Encoder::new().expect("Failed to create key encoder");
         let key_event = Event::new().expect("Failed to create key event");
         let mouse_encoder = MouseEncoder::new().expect("Failed to create mouse encoder");
@@ -306,6 +313,7 @@ impl TerminalWidget {
             render_state,
             row_iterator,
             cell_iterator,
+            graphics_renderer,
             config,
             pty_tx,
             exit_signal_tx: None,

@@ -79,7 +79,20 @@ impl Render for TerminalWidget {
 
         let cell_size = self.cell_size;
         let selection_color = super::rgba_to_rgb(self.theme.selection);
-        let mut elements: Vec<gpui::AnyElement> = Vec::new();
+        let graphics = match self.graphics_renderer.frame(&self.terminal, cell_size) {
+            Ok(frame) => frame,
+            Err(error) => {
+                eprintln!("Failed to update terminal graphics: {error}");
+                Default::default()
+            }
+        };
+        let mut elements: Vec<gpui::AnyElement> = graphics
+            .below_background
+            .into_iter()
+            .map(|placement| placement.into_element())
+            .collect();
+        let mut background_elements = Vec::new();
+        let mut text_elements = Vec::new();
         let mut base_text_style = window.text_style();
         base_text_style.font_family = self.config.font_family.clone().into();
         base_text_style.font_features = terminal_font_features();
@@ -223,7 +236,19 @@ impl Render for TerminalWidget {
                 let segment_width = cell_size.0 * segment.columns as f32;
                 let segment_len = segment.text.len();
                 let (_, segment_bg, _) = resolved_render_style(segment.style);
-                let segment_div = div()
+                if let Some(background) = segment_bg {
+                    background_elements.push(
+                        div()
+                            .absolute()
+                            .left(x)
+                            .top(y)
+                            .w(segment_width)
+                            .h(cell_size.1)
+                            .bg(rgb_to_rgba(background))
+                            .into_any_element(),
+                    );
+                }
+                let segment_text = div()
                     .absolute()
                     .left(x)
                     .top(y)
@@ -234,7 +259,6 @@ impl Render for TerminalWidget {
                     .text_size(px(self.config.font_size_px))
                     .font_family(self.config.font_family.clone())
                     .line_height(cell_size.1)
-                    .when_some(segment_bg, |div, bg| div.bg(rgb_to_rgba(bg)))
                     .child(
                         StyledText::new(segment.text).with_runs(vec![text_run_for_style(
                             &base_text_style,
@@ -242,11 +266,20 @@ impl Render for TerminalWidget {
                             segment_len,
                         )]),
                     );
-                elements.push(segment_div.into_any_element());
+                text_elements.push(segment_text.into_any_element());
             }
             let _ = row.set_dirty(false);
             row_idx += 1;
         }
+
+        elements.extend(background_elements);
+        elements.extend(
+            graphics
+                .below_text
+                .into_iter()
+                .map(|placement| placement.into_element()),
+        );
+        elements.extend(text_elements);
 
         let is_focused = self.focus_handle.is_focused(window);
         let cursor_visible = is_focused && (self.cursor_blink_phase || !self.config.cursor_blink);
@@ -281,6 +314,12 @@ impl Render for TerminalWidget {
             };
             elements.push(cursor_div.into_any_element());
         }
+        elements.extend(
+            graphics
+                .above_text
+                .into_iter()
+                .map(|placement| placement.into_element()),
+        );
 
         let entity = cx.entity();
         let track_height: f32 = layout_size.height.into();

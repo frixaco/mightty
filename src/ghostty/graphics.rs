@@ -1,11 +1,20 @@
 use std::ffi::c_void;
+use std::io::Cursor;
 use std::marker::PhantomData;
 use std::mem::{MaybeUninit, size_of};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr::NonNull;
 use std::rc::Rc;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::ghostty::error::from_result;
 use crate::ghostty::{Error, Result, Terminal, ffi};
+
+const MAX_PNG_DECODE_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_PNG_DIMENSION: u32 = 16_384;
+static PNG_DECODE_LIMIT: AtomicU64 = AtomicU64::new(1);
+static PNG_DECODER: OnceLock<Result<()>> = OnceLock::new();
 
 /// Borrowed Kitty graphics storage for one terminal screen.
 ///
@@ -111,6 +120,7 @@ impl Terminal {
         if storage_limit == 0 {
             return Err(Error::InvalidValue);
         }
+        install_png_decoder(storage_limit)?;
 
         let disabled = false;
         for option in [
@@ -163,6 +173,81 @@ impl Terminal {
             terminal: self,
         })
     }
+}
+
+fn install_png_decoder(storage_limit: u64) -> Result<()> {
+    PNG_DECODE_LIMIT.fetch_max(storage_limit.min(MAX_PNG_DECODE_BYTES), Ordering::Relaxed);
+    *PNG_DECODER.get_or_init(|| {
+        let callback = decode_png as *const () as *const c_void;
+        let result =
+            unsafe { ffi::ghostty_sys_set(ffi::SysOption::GHOSTTY_SYS_OPT_DECODE_PNG, callback) };
+        from_result(result)
+    })
+}
+
+unsafe extern "C" fn decode_png(
+    _userdata: *mut c_void,
+    allocator: *const ffi::Allocator,
+    data: *const u8,
+    data_len: usize,
+    out: *mut ffi::SysImage,
+) -> bool {
+    catch_unwind(AssertUnwindSafe(|| {
+        decode_png_inner(allocator, data, data_len, out)
+    }))
+    .unwrap_or(false)
+}
+
+fn decode_png_inner(
+    allocator: *const ffi::Allocator,
+    data: *const u8,
+    data_len: usize,
+    out: *mut ffi::SysImage,
+) -> bool {
+    let decode_limit = PNG_DECODE_LIMIT.load(Ordering::Relaxed);
+    if allocator.is_null()
+        || data.is_null()
+        || out.is_null()
+        || data_len == 0
+        || u64::try_from(data_len).map_or(true, |len| len > MAX_PNG_DECODE_BYTES)
+    {
+        return false;
+    }
+
+    let bytes = unsafe { std::slice::from_raw_parts(data, data_len) };
+    let mut reader = image::ImageReader::with_format(Cursor::new(bytes), image::ImageFormat::Png);
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_PNG_DIMENSION);
+    limits.max_image_height = Some(MAX_PNG_DIMENSION);
+    limits.max_alloc = Some(decode_limit.saturating_mul(2));
+    reader.limits(limits);
+    let Ok(decoded) = reader.decode() else {
+        return false;
+    };
+    let pixels = decoded.into_rgba8();
+    let (width, height) = pixels.dimensions();
+    let pixels = pixels.into_raw();
+    if width == 0
+        || height == 0
+        || u64::try_from(pixels.len()).map_or(true, |len| len > decode_limit)
+    {
+        return false;
+    }
+
+    let output = unsafe { ffi::ghostty_alloc(allocator, pixels.len()) };
+    if output.is_null() {
+        return false;
+    }
+    unsafe {
+        output.copy_from_nonoverlapping(pixels.as_ptr(), pixels.len());
+        out.write(ffi::SysImage {
+            width,
+            height,
+            data: output,
+            data_len: pixels.len(),
+        });
+    }
+    true
 }
 
 impl<'terminal> Graphics<'terminal> {
