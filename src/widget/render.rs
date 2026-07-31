@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use super::{
     CursorStyle, TERMINAL_FONT_FAMILY, TERMINAL_FONT_SIZE_PX, TerminalWidget, rgb_to_rgba,
+    scrollbar_layout,
 };
 
 pub(super) trait CellWidthExt {
@@ -285,6 +286,52 @@ impl Render for TerminalWidget {
         }
 
         let entity = cx.entity();
+        let track_height: f32 = layout_size.height.into();
+        let scrollbar = self
+            .terminal
+            .scrollbar()
+            .ok()
+            .and_then(|scrollbar| scrollbar_layout(scrollbar, track_height))
+            .map(|layout| {
+                div()
+                    .absolute()
+                    .right(px(0.0))
+                    .top(px(0.0))
+                    .h_full()
+                    .w(px(10.0))
+                    .occlude()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                            this.handle_scrollbar_down(event, window, cx)
+                        }),
+                    )
+                    .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _window, cx| {
+                        this.handle_scrollbar_move(event, cx)
+                    }))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, event: &MouseUpEvent, window, cx| {
+                            this.handle_scrollbar_up(event, window, cx)
+                        }),
+                    )
+                    .on_mouse_up_out(
+                        MouseButton::Left,
+                        cx.listener(|this, event: &MouseUpEvent, window, cx| {
+                            this.handle_scrollbar_up(event, window, cx)
+                        }),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .right(px(2.0))
+                            .top(px(layout.top))
+                            .w(px(6.0))
+                            .h(px(layout.height))
+                            .rounded(px(3.0))
+                            .bg(gpui::rgba(0xffffff55)),
+                    )
+            });
 
         div()
             .size_full()
@@ -305,25 +352,62 @@ impl Render for TerminalWidget {
                     this.handle_mouse_down(event, window, cx)
                 }),
             )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                    this.handle_mouse_down(event, window, cx)
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Middle,
+                cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                    this.handle_mouse_down(event, window, cx)
+                }),
+            )
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _window, cx| {
                 this.handle_mouse_move(event, cx)
             }))
             .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(|this, event: &MouseUpEvent, _window, cx| {
-                    this.handle_mouse_up(event, cx)
+                cx.listener(|this, event: &MouseUpEvent, window, cx| {
+                    this.handle_mouse_up(event, window, cx)
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Right,
+                cx.listener(|this, event: &MouseUpEvent, window, cx| {
+                    this.handle_mouse_up(event, window, cx)
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Middle,
+                cx.listener(|this, event: &MouseUpEvent, window, cx| {
+                    this.handle_mouse_up(event, window, cx)
                 }),
             )
             .on_mouse_up_out(
                 MouseButton::Left,
-                cx.listener(|this, event: &MouseUpEvent, _window, cx| {
-                    this.handle_mouse_up(event, cx)
+                cx.listener(|this, event: &MouseUpEvent, window, cx| {
+                    this.handle_mouse_up(event, window, cx)
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Right,
+                cx.listener(|this, event: &MouseUpEvent, window, cx| {
+                    this.handle_mouse_up(event, window, cx)
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Middle,
+                cx.listener(|this, event: &MouseUpEvent, window, cx| {
+                    this.handle_mouse_up(event, window, cx)
                 }),
             )
             .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, window, cx| {
                 this.handle_scroll_wheel(event, window, cx)
             }))
             .children(elements)
+            .children(scrollbar)
             .child(
                 canvas(
                     move |bounds, _window, cx| {

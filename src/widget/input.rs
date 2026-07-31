@@ -11,7 +11,7 @@ pub(super) fn encode_key_event(
     keystroke: &gpui::Keystroke,
 ) -> Option<Vec<u8>> {
     let ghostty_key = convert_to_ghostty_key(keystroke);
-    let ghostty_mods = convert_to_ghostty_mods(keystroke);
+    let ghostty_mods = convert_modifiers(&keystroke.modifiers);
     let printable_text = printable_text(keystroke, action);
     let unshifted_codepoint = unshifted_codepoint(keystroke);
     let consumed_mods = consumed_mods(
@@ -213,18 +213,18 @@ fn convert_to_ghostty_key(keystroke: &gpui::Keystroke) -> Key {
     }
 }
 
-fn convert_to_ghostty_mods(keystroke: &gpui::Keystroke) -> Mods {
+pub(super) fn convert_modifiers(modifiers: &gpui::Modifiers) -> Mods {
     let mut mods = Mods::empty();
-    if keystroke.modifiers.shift {
+    if modifiers.shift {
         mods |= Mods::SHIFT;
     }
-    if keystroke.modifiers.alt {
+    if modifiers.alt {
         mods |= Mods::ALT;
     }
-    if keystroke.modifiers.control {
+    if modifiers.control {
         mods |= Mods::CTRL;
     }
-    if keystroke.modifiers.platform {
+    if modifiers.platform {
         mods |= Mods::SUPER;
     }
     mods

@@ -10,9 +10,11 @@ mod render;
 
 use crate::feedback;
 use crate::ghostty::{
-    RenderState, SelectionDrag, SelectionGeometry, SelectionPoint, SelectionPress, Terminal,
-    TerminalOptions, ViewportScroll,
+    RenderState, Scrollbar, SelectionDrag, SelectionGeometry, SelectionPoint, SelectionPress,
+    Terminal, TerminalOptions, ViewportScroll,
     key::{Action, Encoder, Event},
+    mouse::{Action as MouseAction, Button as MouseButton, Encoder as MouseEncoder},
+    mouse::{Event as MouseEvent, Geometry as MouseGeometry},
     render::{CellIterator, RowIterator},
     style::{Palette, RgbColor},
 };
@@ -37,6 +39,7 @@ pub(super) const TERMINAL_FONT_SIZE_PX: f32 = 16.0;
 
 const FEEDBACK_CAPTURE_KEY: &str = "f12";
 const CLICK_REPEAT_INTERVAL_NS: u64 = 500_000_000;
+const SCROLLBAR_MIN_THUMB_PX: f32 = 24.0;
 
 /// Cursor style options
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -92,6 +95,8 @@ pub struct TerminalWidget {
     terminal: Terminal,
     key_encoder: Encoder,
     key_event: Event,
+    mouse_encoder: MouseEncoder,
+    mouse_event: MouseEvent,
     render_state: RenderState,
     row_iterator: RowIterator,
     cell_iterator: CellIterator,
@@ -109,6 +114,8 @@ pub struct TerminalWidget {
     cell_size: (Pixels, Pixels),
     pending_scroll_y: f32,
     selecting: bool,
+    reported_button: Option<MouseButton>,
+    scrollbar_dragging: bool,
     theme: TerminalTheme,
     has_exited: bool,
 }
@@ -211,6 +218,8 @@ impl TerminalWidget {
         let cell_iterator = CellIterator::new().expect("Failed to create cell iterator");
         let key_encoder = Encoder::new().expect("Failed to create key encoder");
         let key_event = Event::new().expect("Failed to create key event");
+        let mouse_encoder = MouseEncoder::new().expect("Failed to create mouse encoder");
+        let mouse_event = MouseEvent::new().expect("Failed to create mouse event");
 
         let size = (config.initial_cols, config.initial_rows);
 
@@ -220,6 +229,8 @@ impl TerminalWidget {
             terminal,
             key_encoder,
             key_event,
+            mouse_encoder,
+            mouse_event,
             render_state,
             row_iterator,
             cell_iterator,
@@ -237,6 +248,8 @@ impl TerminalWidget {
             cell_size: (px(9.6), px(19.2)),
             pending_scroll_y: 0.0,
             selecting: false,
+            reported_button: None,
+            scrollbar_dragging: false,
             theme,
             has_exited,
         };
@@ -526,6 +539,24 @@ impl TerminalWidget {
         cx: &mut Context<Self>,
     ) {
         self.focus_handle.focus(window);
+        if self.try_open_hyperlink(event, window, cx) {
+            return;
+        }
+        if self.should_report_mouse(&event.modifiers) {
+            self.reported_button = ghostty_mouse_button(event.button);
+            self.send_mouse_report(
+                MouseAction::Press,
+                self.reported_button,
+                event.position,
+                &event.modifiers,
+            );
+            window.prevent_default();
+            cx.stop_propagation();
+            return;
+        }
+        if event.button != gpui::MouseButton::Left {
+            return;
+        }
         let Some(point) = self.selection_point(event.position) else {
             return;
         };
@@ -549,35 +580,65 @@ impl TerminalWidget {
     }
 
     fn handle_mouse_move(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
-        if !self.selecting || !event.dragging() {
+        if self.selecting {
+            if !event.dragging() {
+                return;
+            }
+            let Some(point) = self.selection_point(event.position) else {
+                return;
+            };
+            let drag = SelectionDrag {
+                point,
+                geometry: self.selection_geometry(),
+                rectangle: rectangle_selection(&event.modifiers),
+            };
+            if let Err(error) = self.terminal.selection_drag(drag) {
+                eprintln!("Failed to update terminal selection: {error}");
+                return;
+            }
+            cx.notify();
             return;
         }
-        let Some(point) = self.selection_point(event.position) else {
-            return;
-        };
-        let drag = SelectionDrag {
-            point,
-            geometry: self.selection_geometry(),
-            rectangle: rectangle_selection(&event.modifiers),
-        };
-        if let Err(error) = self.terminal.selection_drag(drag) {
-            eprintln!("Failed to update terminal selection: {error}");
-            return;
+
+        if self.should_report_mouse(&event.modifiers) {
+            self.reported_button = event.pressed_button.and_then(ghostty_mouse_button);
+            self.send_mouse_report(
+                MouseAction::Motion,
+                self.reported_button,
+                event.position,
+                &event.modifiers,
+            );
         }
-        cx.notify();
     }
 
-    fn handle_mouse_up(&mut self, event: &MouseUpEvent, cx: &mut Context<Self>) {
-        if !self.selecting {
+    fn handle_mouse_up(
+        &mut self,
+        event: &MouseUpEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.selecting {
+            let point = self.selection_point(event.position);
+            if let Err(error) = self.terminal.selection_release(point) {
+                eprintln!("Failed to finish terminal selection: {error}");
+            }
+            self.selecting = false;
+            cx.notify();
             return;
         }
 
-        let point = self.selection_point(event.position);
-        if let Err(error) = self.terminal.selection_release(point) {
-            eprintln!("Failed to finish terminal selection: {error}");
+        if self.reported_button.is_some() || self.should_report_mouse(&event.modifiers) {
+            let button = ghostty_mouse_button(event.button).or(self.reported_button);
+            self.reported_button = None;
+            self.send_mouse_report(
+                MouseAction::Release,
+                button,
+                event.position,
+                &event.modifiers,
+            );
+            window.prevent_default();
+            cx.stop_propagation();
         }
-        self.selecting = false;
-        cx.notify();
     }
 
     fn handle_scroll_wheel(
@@ -591,12 +652,180 @@ impl TerminalWidget {
         let cell_height: f32 = self.cell_size.1.into();
         let wheel_rows = accumulated_scroll_rows(&mut self.pending_scroll_y, delta_y, cell_height);
         if wheel_rows != 0 {
-            self.terminal
-                .scroll_viewport(wheel_rows_to_viewport_scroll(wheel_rows));
-            cx.notify();
+            if self.should_report_mouse(&event.modifiers) {
+                let button = if wheel_rows > 0 {
+                    MouseButton::Four
+                } else {
+                    MouseButton::Five
+                };
+                for _ in 0..wheel_rows.unsigned_abs().min(16) {
+                    self.send_mouse_report(
+                        MouseAction::Press,
+                        Some(button),
+                        event.position,
+                        &event.modifiers,
+                    );
+                }
+            } else {
+                self.terminal
+                    .scroll_viewport(wheel_rows_to_viewport_scroll(wheel_rows));
+                cx.notify();
+            }
         }
         window.prevent_default();
         cx.stop_propagation();
+    }
+
+    fn should_report_mouse(&self, modifiers: &Modifiers) -> bool {
+        !modifiers.shift && self.terminal.mouse_tracking().unwrap_or(false)
+    }
+
+    fn send_mouse_report(
+        &mut self,
+        action: MouseAction,
+        button: Option<MouseButton>,
+        position: Point<Pixels>,
+        modifiers: &Modifiers,
+    ) {
+        let Some((x, y)) = self.mouse_surface_position(position) else {
+            return;
+        };
+        self.mouse_event
+            .set_action(action)
+            .set_button(button)
+            .set_mods(input::convert_modifiers(modifiers))
+            .set_position(x, y);
+
+        let geometry = self.mouse_geometry();
+        let any_button_pressed = self.reported_button.is_some();
+        let mut output = Vec::with_capacity(64);
+        if let Err(error) = self
+            .mouse_encoder
+            .set_options_from_terminal(&self.terminal)
+            .set_geometry(geometry)
+            .set_any_button_pressed(any_button_pressed)
+            .encode_to_vec(&self.mouse_event, &mut output)
+        {
+            eprintln!("Failed to encode terminal mouse input: {error}");
+            return;
+        }
+        if !output.is_empty() {
+            self.send_pty_command(PtyCommand::Write(output));
+        }
+    }
+
+    fn mouse_surface_position(&self, position: Point<Pixels>) -> Option<(f32, f32)> {
+        let bounds = self.layout_bounds?;
+        let local = position - bounds.origin;
+        let width: f32 = bounds.size.width.into();
+        let height: f32 = bounds.size.height.into();
+        let x: f32 = local.x.into();
+        let y: f32 = local.y.into();
+        Some((
+            x.clamp(0.0, (width - 1.0).max(0.0)),
+            y.clamp(0.0, (height - 1.0).max(0.0)),
+        ))
+    }
+
+    fn mouse_geometry(&self) -> MouseGeometry {
+        let size = self.layout_bounds.map_or_else(
+            || Size {
+                width: self.cell_size.0 * self.size.0 as f32,
+                height: self.cell_size.1 * self.size.1 as f32,
+            },
+            |bounds| bounds.size,
+        );
+        let screen_width: f32 = size.width.into();
+        let screen_height: f32 = size.height.into();
+        let cell_width: f32 = self.cell_size.0.into();
+        let cell_height: f32 = self.cell_size.1.into();
+        MouseGeometry {
+            screen_width: screen_width.round().max(1.0) as u32,
+            screen_height: screen_height.round().max(1.0) as u32,
+            cell_width: cell_width.round().max(1.0) as u32,
+            cell_height: cell_height.round().max(1.0) as u32,
+            padding_top: 0,
+            padding_bottom: 0,
+            padding_right: 0,
+            padding_left: 0,
+        }
+    }
+
+    fn try_open_hyperlink(
+        &self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if event.button != gpui::MouseButton::Left || !hyperlink_modifier(&event.modifiers) {
+            return false;
+        }
+        let Some(point) = self.selection_point(event.position) else {
+            return false;
+        };
+        let Ok(Some(uri)) = self.terminal.hyperlink_uri(point.column, point.row) else {
+            return false;
+        };
+        window.prevent_default();
+        cx.stop_propagation();
+        if !allowed_hyperlink(&uri) {
+            eprintln!("Blocked terminal hyperlink with an unsupported URI scheme");
+            return true;
+        }
+        if let Err(error) = open_hyperlink(&uri) {
+            eprintln!("Failed to open terminal hyperlink: {error}");
+        }
+        true
+    }
+
+    fn handle_scrollbar_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.scrollbar_dragging = true;
+        self.update_scrollbar_from_pointer(event.position, cx);
+        window.prevent_default();
+        cx.stop_propagation();
+    }
+
+    fn handle_scrollbar_move(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        if !self.scrollbar_dragging || !event.dragging() {
+            return;
+        }
+        self.update_scrollbar_from_pointer(event.position, cx);
+        cx.stop_propagation();
+    }
+
+    fn handle_scrollbar_up(
+        &mut self,
+        _event: &MouseUpEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.scrollbar_dragging {
+            return;
+        }
+        self.scrollbar_dragging = false;
+        window.prevent_default();
+        cx.stop_propagation();
+    }
+
+    fn update_scrollbar_from_pointer(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let Some(bounds) = self.layout_bounds else {
+            return;
+        };
+        let Ok(scrollbar) = self.terminal.scrollbar() else {
+            return;
+        };
+        let local_y: f32 = (position.y - bounds.origin.y).into();
+        let track_height: f32 = bounds.size.height.into();
+        let Some(row) = scrollbar_row_at(scrollbar, track_height, local_y) else {
+            return;
+        };
+        self.terminal.scroll_viewport(ViewportScroll::Row(row));
+        cx.notify();
     }
 
     fn on_copy_selection(
@@ -685,6 +914,104 @@ fn terminal_palette(theme_palette: [gpui::Rgba; 16]) -> Palette {
     }
 
     Palette(palette)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct ScrollbarLayout {
+    pub top: f32,
+    pub height: f32,
+}
+
+pub(super) fn scrollbar_layout(scrollbar: Scrollbar, track_height: f32) -> Option<ScrollbarLayout> {
+    if scrollbar.total <= scrollbar.len
+        || scrollbar.len == 0
+        || !track_height.is_finite()
+        || track_height <= 0.0
+    {
+        return None;
+    }
+    let height = (track_height * scrollbar.len as f32 / scrollbar.total as f32)
+        .max(SCROLLBAR_MIN_THUMB_PX)
+        .min(track_height);
+    let max_top = track_height - height;
+    let max_offset = scrollbar.total - scrollbar.len;
+    let top = max_top * scrollbar.offset.min(max_offset) as f32 / max_offset as f32;
+    Some(ScrollbarLayout { top, height })
+}
+
+fn scrollbar_row_at(scrollbar: Scrollbar, track_height: f32, pointer_y: f32) -> Option<usize> {
+    let layout = scrollbar_layout(scrollbar, track_height)?;
+    let max_top = track_height - layout.height;
+    if max_top <= 0.0 {
+        return Some(0);
+    }
+    let thumb_top = (pointer_y - layout.height / 2.0).clamp(0.0, max_top);
+    let max_offset = scrollbar.total - scrollbar.len;
+    let row = (thumb_top / max_top * max_offset as f32).round() as u64;
+    usize::try_from(row).ok()
+}
+
+fn ghostty_mouse_button(button: gpui::MouseButton) -> Option<MouseButton> {
+    match button {
+        gpui::MouseButton::Left => Some(MouseButton::Left),
+        gpui::MouseButton::Right => Some(MouseButton::Right),
+        gpui::MouseButton::Middle => Some(MouseButton::Middle),
+        gpui::MouseButton::Navigate(gpui::NavigationDirection::Back) => Some(MouseButton::Four),
+        gpui::MouseButton::Navigate(gpui::NavigationDirection::Forward) => Some(MouseButton::Five),
+    }
+}
+
+fn hyperlink_modifier(modifiers: &Modifiers) -> bool {
+    if cfg!(target_os = "macos") {
+        modifiers.platform
+    } else {
+        modifiers.control
+    }
+}
+
+fn allowed_hyperlink(uri: &str) -> bool {
+    if uri.is_empty() || uri.chars().any(|character| character.is_control()) {
+        return false;
+    }
+    let Some((scheme, value)) = uri.split_once(':') else {
+        return false;
+    };
+    matches!(
+        scheme.to_ascii_lowercase().as_str(),
+        "http" | "https" | "file"
+    ) && value.starts_with("//")
+}
+
+#[cfg(target_os = "windows")]
+fn open_hyperlink(uri: &str) -> std::io::Result<()> {
+    std::process::Command::new("explorer.exe")
+        .arg(uri)
+        .spawn()
+        .map(|_| ())
+}
+
+#[cfg(target_os = "macos")]
+fn open_hyperlink(uri: &str) -> std::io::Result<()> {
+    std::process::Command::new("open")
+        .arg(uri)
+        .spawn()
+        .map(|_| ())
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn open_hyperlink(uri: &str) -> std::io::Result<()> {
+    std::process::Command::new("xdg-open")
+        .arg(uri)
+        .spawn()
+        .map(|_| ())
+}
+
+#[cfg(not(any(windows, unix)))]
+fn open_hyperlink(_uri: &str) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "opening hyperlinks is unsupported on this platform",
+    ))
 }
 
 fn terminal_selection_point(
@@ -810,5 +1137,50 @@ mod interaction_tests {
             ..Default::default()
         };
         assert!(rectangle_selection(&control_alt));
+    }
+
+    #[test]
+    fn lays_out_and_drags_the_scrollbar_in_ghostty_row_space() {
+        let scrollbar = Scrollbar {
+            total: 100,
+            offset: 45,
+            len: 10,
+        };
+
+        assert_eq!(
+            scrollbar_layout(scrollbar, 200.0),
+            Some(ScrollbarLayout {
+                top: 88.0,
+                height: 24.0,
+            })
+        );
+        assert_eq!(scrollbar_row_at(scrollbar, 200.0, 100.0), Some(45));
+        assert_eq!(scrollbar_row_at(scrollbar, 200.0, 0.0), Some(0));
+        assert_eq!(scrollbar_row_at(scrollbar, 200.0, 200.0), Some(90));
+    }
+
+    #[test]
+    fn hides_the_scrollbar_without_scrollback() {
+        assert_eq!(
+            scrollbar_layout(
+                Scrollbar {
+                    total: 24,
+                    offset: 0,
+                    len: 24,
+                },
+                480.0,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn permits_only_supported_hyperlink_schemes() {
+        assert!(allowed_hyperlink("https://example.com"));
+        assert!(allowed_hyperlink("HTTP://example.com"));
+        assert!(allowed_hyperlink("file:///C:/Users/test/readme.txt"));
+        assert!(!allowed_hyperlink("mailto:user@example.com"));
+        assert!(!allowed_hyperlink("javascript://alert(1)"));
+        assert!(!allowed_hyperlink("https://example.com\nunsafe"));
     }
 }
