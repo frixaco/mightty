@@ -9,9 +9,10 @@ use std::io;
 use std::os::windows::io::{FromRawHandle, IntoRawHandle, OwnedHandle as WindowsOwnedHandle};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr::{null, null_mut};
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, mpsc};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use gpui::Window;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -38,12 +39,14 @@ const IID_ITERMINAL_HANDOFF3: GUID = GUID::from_u128(0x6f23da90_15c5_4203_9db0_6
 const CLASS_E_NOAGGREGATION: HRESULT = 0x8004_0110u32 as HRESULT;
 const E_UNEXPECTED: HRESULT = 0x8000_ffffu32 as HRESULT;
 const MAX_STARTUP_TITLE_UNITS: u32 = 32 * 1024;
+const UI_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// One console session received through `ITerminalHandoff3`.
 pub struct DefaultTerminalHandoff {
     parts: PtyParts,
     startup_title: Option<String>,
     accepted: mpsc::SyncSender<bool>,
+    accepting: Arc<AtomicBool>,
 }
 
 impl DefaultTerminalHandoff {
@@ -54,6 +57,7 @@ impl DefaultTerminalHandoff {
             self.startup_title,
             DefaultTerminalResponse {
                 accepted: self.accepted,
+                accepting: self.accepting,
             },
         )
     }
@@ -62,16 +66,22 @@ impl DefaultTerminalHandoff {
 /// Completes the blocked COM handoff after the UI accepts or rejects it.
 pub struct DefaultTerminalResponse {
     accepted: mpsc::SyncSender<bool>,
+    accepting: Arc<AtomicBool>,
 }
 
 impl DefaultTerminalResponse {
-    pub fn send(self, accepted: bool) {
-        let _ = self.accepted.send(accepted);
+    /// Send a decision while the COM server still accepts handoffs.
+    pub fn send(self, accepted: bool) -> bool {
+        if accepted && !self.accepting.load(Ordering::Acquire) {
+            return false;
+        }
+        self.accepted.send(accepted).is_ok()
     }
 }
 
 /// Owns the local COM class registration and its worker thread.
 pub struct DefaultTerminalServer {
+    accepting: Arc<AtomicBool>,
     stop_tx: Option<mpsc::Sender<()>>,
     thread: Option<JoinHandle<()>>,
 }
@@ -79,14 +89,17 @@ pub struct DefaultTerminalServer {
 impl DefaultTerminalServer {
     /// Register the mightty terminal host and forward handoffs to `sender`.
     pub fn start(sender: flume::Sender<DefaultTerminalHandoff>) -> io::Result<Self> {
+        let accepting = Arc::new(AtomicBool::new(true));
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let (stop_tx, stop_rx) = mpsc::channel();
+        let thread_accepting = Arc::clone(&accepting);
         let thread = thread::Builder::new()
             .name("mightty-terminal-handoff".to_string())
-            .spawn(move || terminal_server_thread(sender, ready_tx, stop_rx))?;
+            .spawn(move || terminal_server_thread(sender, thread_accepting, ready_tx, stop_rx))?;
 
         match ready_rx.recv() {
             Ok(Ok(())) => Ok(Self {
+                accepting,
                 stop_tx: Some(stop_tx),
                 thread: Some(thread),
             }),
@@ -106,6 +119,7 @@ impl DefaultTerminalServer {
 
 impl Drop for DefaultTerminalServer {
     fn drop(&mut self) {
+        self.accepting.store(false, Ordering::Release);
         if let Some(stop_tx) = self.stop_tx.take() {
             let _ = stop_tx.send(());
         }
@@ -135,6 +149,7 @@ pub fn show_default_terminal_window(window: &mut Window) -> io::Result<()> {
 
 fn terminal_server_thread(
     sender: flume::Sender<DefaultTerminalHandoff>,
+    accepting: Arc<AtomicBool>,
     ready: mpsc::SyncSender<io::Result<()>>,
     stop: mpsc::Receiver<()>,
 ) {
@@ -151,6 +166,7 @@ fn terminal_server_thread(
         vtable: &CLASS_FACTORY_VTABLE,
         references: AtomicU32::new(1),
         sender,
+        accepting,
     }));
     let mut registration = 0;
     let register_result = unsafe {
@@ -190,6 +206,7 @@ struct ClassFactory {
     vtable: *const ClassFactoryVtable,
     references: AtomicU32,
     sender: flume::Sender<DefaultTerminalHandoff>,
+    accepting: Arc<AtomicBool>,
 }
 
 #[repr(C)]
@@ -284,6 +301,7 @@ unsafe extern "system" fn class_factory_create_instance(
             vtable: &TERMINAL_HANDOFF_VTABLE,
             references: AtomicU32::new(1),
             sender,
+            accepting: Arc::clone(&(*this.cast::<ClassFactory>()).accepting),
         }));
         let result = terminal_handoff_query_interface(object.cast(), iid, interface);
         terminal_handoff_release(object.cast());
@@ -301,6 +319,7 @@ struct TerminalHandoffObject {
     vtable: *const TerminalHandoffVtable,
     references: AtomicU32,
     sender: flume::Sender<DefaultTerminalHandoff>,
+    accepting: Arc<AtomicBool>,
 }
 
 #[repr(C)]
@@ -437,6 +456,11 @@ struct HandoffCall {
 }
 
 fn establish_pty_handoff_inner(this: *mut c_void, call: HandoffCall) -> HRESULT {
+    let object = unsafe { &*this.cast::<TerminalHandoffObject>() };
+    if !object.accepting.load(Ordering::Acquire) {
+        return E_FAIL;
+    }
+
     let signal = match unsafe { duplicate_handle(call.signal) } {
         Ok(handle) => handle,
         Err(error) => return hresult_from_io(&error),
@@ -459,14 +483,17 @@ fn establish_pty_handoff_inner(this: *mut c_void, call: HandoffCall) -> HRESULT 
     };
     let (parts, input_peer, output_peer) = handoff.into_parts();
     let startup_title = unsafe { startup_title(call.startup_info) };
-    let (accepted_tx, accepted_rx) = mpsc::sync_channel(1);
+    // A zero-capacity channel makes a late UI response fail after this wait ends.
+    let (accepted_tx, accepted_rx) = mpsc::sync_channel(0);
     let request = DefaultTerminalHandoff {
         parts,
         startup_title,
         accepted: accepted_tx,
+        accepting: Arc::clone(&object.accepting),
     };
-    let sender = unsafe { &(*this.cast::<TerminalHandoffObject>()).sender };
-    if sender.send(request).is_err() || accepted_rx.recv().ok() != Some(true) {
+    if object.sender.send(request).is_err()
+        || !wait_for_ui_response(accepted_rx, UI_RESPONSE_TIMEOUT)
+    {
         return E_FAIL;
     }
 
@@ -475,6 +502,12 @@ fn establish_pty_handoff_inner(this: *mut c_void, call: HandoffCall) -> HRESULT 
         *call.output = output_peer.into_raw_handle();
     }
     0
+}
+
+fn wait_for_ui_response(receiver: mpsc::Receiver<bool>, timeout: Duration) -> bool {
+    receiver
+        .recv_timeout(timeout)
+        .is_ok_and(|accepted| accepted)
 }
 
 unsafe fn duplicate_handle(handle: HANDLE) -> io::Result<WindowsOwnedHandle> {
@@ -550,6 +583,7 @@ mod tests {
             vtable: &CLASS_FACTORY_VTABLE,
             references: AtomicU32::new(1),
             sender,
+            accepting: Arc::new(AtomicBool::new(true)),
         }));
         let mut interface = null_mut();
         let result = unsafe {
@@ -574,6 +608,7 @@ mod tests {
             vtable: &TERMINAL_HANDOFF_VTABLE,
             references: AtomicU32::new(1),
             sender,
+            accepting: Arc::new(AtomicBool::new(true)),
         }));
         let mut interface = null_mut();
         assert_eq!(
@@ -599,5 +634,58 @@ mod tests {
         let server = DefaultTerminalServer::start(sender)
             .expect("register local default-terminal COM server");
         drop(server);
+    }
+
+    #[test]
+    fn ui_response_wait_has_a_fixed_timeout() {
+        assert_eq!(UI_RESPONSE_TIMEOUT, Duration::from_secs(5));
+        let (_sender, receiver) = mpsc::sync_channel(0);
+
+        assert!(!wait_for_ui_response(receiver, Duration::from_millis(10)));
+    }
+
+    #[test]
+    fn response_rejects_acceptance_during_shutdown() {
+        let accepting = Arc::new(AtomicBool::new(false));
+        let (accepted, _receiver) = mpsc::sync_channel(0);
+        let response = DefaultTerminalResponse {
+            accepted,
+            accepting,
+        };
+
+        assert!(!response.send(true));
+    }
+
+    #[test]
+    fn terminal_object_rejects_handoff_during_shutdown() {
+        let (sender, _receiver) = flume::unbounded();
+        let object = Box::into_raw(Box::new(TerminalHandoffObject {
+            vtable: &TERMINAL_HANDOFF_VTABLE,
+            references: AtomicU32::new(1),
+            sender,
+            accepting: Arc::new(AtomicBool::new(false)),
+        }));
+        let mut input = INVALID_HANDLE_VALUE;
+        let mut output = INVALID_HANDLE_VALUE;
+
+        let result = unsafe {
+            establish_pty_handoff(
+                object.cast(),
+                &mut input,
+                &mut output,
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                null(),
+            )
+        };
+
+        assert_eq!(result, E_FAIL);
+        assert!(input.is_null());
+        assert!(output.is_null());
+        unsafe {
+            terminal_handoff_release(object.cast());
+        }
     }
 }

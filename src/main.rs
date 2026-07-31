@@ -261,6 +261,7 @@ fn start_windows_application(startup: WindowsStartup, normal_window: TerminalWin
         default_terminal_server: Some(default_terminal_server),
         embedding,
         received_handoff: false,
+        shutting_down: false,
     }));
     controller.borrow_mut().apply_settings(cx);
 
@@ -340,6 +341,7 @@ struct WindowsApplication {
     default_terminal_server: Option<DefaultTerminalServer>,
     embedding: bool,
     received_handoff: bool,
+    shutting_down: bool,
 }
 
 #[cfg(windows)]
@@ -485,10 +487,16 @@ impl WindowsApplication {
     fn accept_handoff(&mut self, handoff: DefaultTerminalHandoff, cx: &mut App) {
         let replace_existing = self.embedding && !self.received_handoff;
         let (parts, startup_title, response) = handoff.into_parts();
+        if self.shutting_down {
+            response.send(false);
+            return;
+        }
         let accepted = self.normal_window.panes.update(cx, |panes, cx| {
+            if !panes.can_open_handoff(replace_existing) || !response.send(true) {
+                return false;
+            }
             panes.open_handoff(parts, startup_title, replace_existing, cx)
         });
-        response.send(accepted);
         if accepted {
             self.received_handoff = true;
             self.activate_normal(cx);
@@ -496,6 +504,7 @@ impl WindowsApplication {
     }
 
     fn shutdown(&mut self) {
+        self.shutting_down = true;
         self.default_terminal_server = None;
         self.global_hotkey = None;
         self.primary_instance = None;

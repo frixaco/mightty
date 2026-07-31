@@ -149,6 +149,11 @@ impl PaneContainer {
     /// The first handoff can replace the one tab created for a hidden COM start.
     /// Later handoffs add a tab without removing user sessions.
     #[cfg(windows)]
+    pub fn can_open_handoff(&self, replace_existing: bool) -> bool {
+        (replace_existing && self.tabs.len() == 1) || self.tabs.len() < MAX_SELECTABLE_TABS
+    }
+
+    #[cfg(windows)]
     pub fn open_handoff(
         &mut self,
         parts: PtyParts,
@@ -157,7 +162,7 @@ impl PaneContainer {
         cx: &mut Context<Self>,
     ) -> bool {
         let replace_initial_tab = replace_existing && self.tabs.len() == 1;
-        if !replace_initial_tab && self.tabs.len() >= MAX_SELECTABLE_TABS {
+        if !self.can_open_handoff(replace_existing) {
             return false;
         }
 
