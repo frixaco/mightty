@@ -144,6 +144,9 @@ Drag with the left mouse button to select text. Double-click selects a word and
 triple-click selects a line using Ghostty's selection rules. Hold `Ctrl+Alt`
 while dragging for rectangular selection (`Option` on macOS).
 
+Split dividers are draggable. The command palette provides directional focus,
+pane resize, and pane zoom actions.
+
 ## Project Layout
 
 ```text

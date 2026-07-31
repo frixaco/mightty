@@ -78,6 +78,7 @@ requirement because `build.rs` validates the submodule revision.
 - `Ctrl+B` toggles the sidebar.
 - `Alt+Enter` splits the active pane to the right.
 - `Alt+Shift+Enter` splits the active pane downward.
+- Split dividers are draggable. The command palette provides focus, resize, and zoom actions.
 - `Ctrl+D` closes the active pane, or closes the active tab when it has one pane.
 - The mouse wheel scrolls terminal history.
 - Left-button drag selects text; double-click selects a word and triple-click

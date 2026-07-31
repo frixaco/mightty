@@ -13,7 +13,7 @@ use crate::action::{
 use crate::command_palette::{PaletteCommand, commands, filtered_command_indices};
 use crate::profile::ProfileId;
 use crate::settings::{ReloadOutcome, SettingsStore};
-use crate::split::{Split, SplitDirection};
+use crate::split::{Split, SplitAxis};
 use crate::widget::{TerminalConfig, TerminalWidget};
 
 const WINDOW_BACKGROUND: u32 = 0x000000;
@@ -61,21 +61,22 @@ pub struct PaneContainer {
 
 impl PaneContainer {
     pub fn new(settings: SettingsStore, cx: &mut Context<Self>) -> Self {
-        let (config, title, sidebar_visible) = {
+        let (config, profile_id, title, sidebar_visible) = {
             let resolved = settings.current();
             let config = resolved
                 .terminal_config(None)
                 .expect("resolved settings contain their default profile");
+            let profile_id = resolved.default_profile.clone();
             let title = resolved
                 .profiles
-                .get(&resolved.default_profile)
+                .get(&profile_id)
                 .expect("resolved settings contain their default profile")
                 .label
                 .clone();
-            (config, title, resolved.app.sidebar_visible)
+            (config, profile_id, title, resolved.app.sidebar_visible)
         };
         let (exit_tx, exit_rx) = flume::unbounded();
-        let tab = Self::create_tab(config, title, exit_tx.clone(), cx);
+        let tab = Self::create_tab(config, profile_id, title, exit_tx.clone(), cx);
 
         let mut container = Self {
             tabs: vec![tab],
@@ -96,12 +97,13 @@ impl PaneContainer {
 
     fn create_tab(
         config: TerminalConfig,
+        profile_id: ProfileId,
         title: String,
         exit_tx: flume::Sender<()>,
         cx: &mut Context<Self>,
     ) -> Tab {
         let terminal = Self::create_terminal(config, exit_tx, cx);
-        let split = cx.new(|_cx| Split::with_terminal(terminal));
+        let split = cx.new(|_cx| Split::with_terminal(terminal, profile_id));
 
         Tab { split, title }
     }
@@ -120,9 +122,14 @@ impl PaneContainer {
         self.tabs[self.active_tab_index].split.clone()
     }
 
-    fn terminal_config(&self, profile_id: Option<&ProfileId>) -> Option<TerminalConfig> {
-        match self.settings.current().terminal_config(profile_id) {
-            Ok(config) => Some(config),
+    fn terminal_config(
+        &self,
+        profile_id: Option<&ProfileId>,
+    ) -> Option<(TerminalConfig, ProfileId)> {
+        let settings = self.settings.current();
+        let profile_id = profile_id.unwrap_or(&settings.default_profile);
+        match settings.terminal_config(Some(profile_id)) {
+            Ok(config) => Some((config, profile_id.clone())),
             Err(error) => {
                 eprintln!("Cannot launch terminal: {error}");
                 None
@@ -134,25 +141,28 @@ impl PaneContainer {
         &self,
         profile_id: Option<&ProfileId>,
         cx: &mut Context<Self>,
-    ) -> Option<Entity<TerminalWidget>> {
-        let config = self.terminal_config(profile_id)?;
-        Some(Self::create_terminal(config, self.exit_tx.clone(), cx))
+    ) -> Option<(Entity<TerminalWidget>, ProfileId)> {
+        let (config, profile_id) = self.terminal_config(profile_id)?;
+        Some((
+            Self::create_terminal(config, self.exit_tx.clone(), cx),
+            profile_id,
+        ))
     }
 
     fn split_active(
         &mut self,
-        direction: SplitDirection,
+        axis: SplitAxis,
         profile_id: Option<&ProfileId>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(new_terminal) = self.new_terminal(profile_id, cx) else {
+        let Some((new_terminal, profile_id)) = self.new_terminal(profile_id, cx) else {
             return;
         };
         let split = self.active_split();
 
         split.update(cx, |split, cx| {
-            split.split_active(direction, new_terminal, window, cx);
+            split.split_active(axis, new_terminal, profile_id, window, cx);
             split.focus_active(window, cx);
         });
 
@@ -173,7 +183,13 @@ impl PaneContainer {
         let config = settings
             .terminal_config(Some(profile_id))
             .expect("resolved profile has a terminal configuration");
-        let tab = Self::create_tab(config, profile.label.clone(), self.exit_tx.clone(), cx);
+        let tab = Self::create_tab(
+            config,
+            profile_id.clone(),
+            profile.label.clone(),
+            self.exit_tx.clone(),
+            cx,
+        );
         self.tabs.push(tab);
         self.active_tab_index = self.tabs.len() - 1;
         self.needs_focus = true;
@@ -293,7 +309,7 @@ impl PaneContainer {
 
                 let removed = tab
                     .split
-                    .update(cx, |split, _cx| split.remove_pane_by_id(pane_id));
+                    .update(cx, |split, _cx| split.remove_pane_by_entity(pane_id));
                 removed_any |= removed.is_some();
             }
         }
@@ -322,11 +338,11 @@ impl PaneContainer {
                 direction,
                 profile_id,
             } => {
-                let direction = match direction {
-                    ActionSplitDirection::Right => SplitDirection::Row,
-                    ActionSplitDirection::Down => SplitDirection::Column,
+                let axis = match direction {
+                    ActionSplitDirection::Right => SplitAxis::Horizontal,
+                    ActionSplitDirection::Down => SplitAxis::Vertical,
                 };
-                self.split_active(direction, profile_id.as_ref(), window, cx);
+                self.split_active(axis, profile_id.as_ref(), window, cx);
             }
             AppAction::ClosePane => self.close_active(window, cx),
             AppAction::Copy => {
@@ -341,13 +357,30 @@ impl PaneContainer {
             }
             AppAction::ToggleSidebar => self.toggle_sidebar(cx),
             AppAction::SelectTab { index } => self.activate_tab(usize::from(index), cx),
+            AppAction::FocusPane { direction } => {
+                let split = self.active_split();
+                split.update(cx, |split, cx| {
+                    split.focus_direction(direction, window, cx);
+                });
+            }
+            AppAction::ResizePane { direction, amount } => {
+                let split = self.active_split();
+                split.update(cx, |split, cx| {
+                    if split.resize_active(direction, amount, window, cx) {
+                        cx.notify();
+                    }
+                });
+            }
+            AppAction::TogglePaneZoom => {
+                let split = self.active_split();
+                split.update(cx, |split, cx| {
+                    split.toggle_zoom(window, cx);
+                    cx.notify();
+                });
+            }
             AppAction::CommandPalette => self.open_palette(window, cx),
             AppAction::Quit => cx.quit(),
-            AppAction::FocusPane { .. }
-            | AppAction::ResizePane { .. }
-            | AppAction::TogglePaneZoom
-            | AppAction::Search
-            | AppAction::ToggleQuickTerminal => {}
+            AppAction::Search | AppAction::ToggleQuickTerminal => {}
         }
     }
 
@@ -369,7 +402,7 @@ impl PaneContainer {
         ActionContext {
             has_selection,
             pane_count,
-            pane_management_available: false,
+            pane_management_available: true,
             search_available: false,
             quick_terminal_available: false,
         }

@@ -154,7 +154,9 @@ impl AppAction {
             Self::Copy if !context.has_selection => {
                 ActionAvailability::Unavailable("No terminal text is selected")
             }
-            Self::FocusPane { .. } | Self::ResizePane { .. } if context.pane_count < 2 => {
+            Self::FocusPane { .. } | Self::ResizePane { .. } | Self::TogglePaneZoom
+                if context.pane_count < 2 =>
+            {
                 ActionAvailability::Unavailable("The tab has only one pane")
             }
             Self::FocusPane { .. } | Self::ResizePane { .. } | Self::TogglePaneZoom
