@@ -67,12 +67,39 @@ impl AppAction {
                 ActionCategory::Pane,
                 &["ctrl-d"],
             ),
-            Self::FocusPane { .. } => {
-                descriptor("focus_pane", "Focus pane", ActionCategory::Pane, &[])
-            }
-            Self::ResizePane { .. } => {
-                descriptor("resize_pane", "Resize pane", ActionCategory::Pane, &[])
-            }
+            Self::FocusPane {
+                direction: Direction::Left,
+            } => descriptor("focus_left", "Focus pane left", ActionCategory::Pane, &[]),
+            Self::FocusPane {
+                direction: Direction::Right,
+            } => descriptor("focus_right", "Focus pane right", ActionCategory::Pane, &[]),
+            Self::FocusPane {
+                direction: Direction::Up,
+            } => descriptor("focus_up", "Focus pane up", ActionCategory::Pane, &[]),
+            Self::FocusPane {
+                direction: Direction::Down,
+            } => descriptor("focus_down", "Focus pane down", ActionCategory::Pane, &[]),
+            Self::ResizePane {
+                direction: Direction::Left,
+                ..
+            } => descriptor("resize_left", "Resize pane left", ActionCategory::Pane, &[]),
+            Self::ResizePane {
+                direction: Direction::Right,
+                ..
+            } => descriptor(
+                "resize_right",
+                "Resize pane right",
+                ActionCategory::Pane,
+                &[],
+            ),
+            Self::ResizePane {
+                direction: Direction::Up,
+                ..
+            } => descriptor("resize_up", "Resize pane up", ActionCategory::Pane, &[]),
+            Self::ResizePane {
+                direction: Direction::Down,
+                ..
+            } => descriptor("resize_down", "Resize pane down", ActionCategory::Pane, &[]),
             Self::TogglePaneZoom => descriptor(
                 "toggle_pane_zoom",
                 "Toggle pane zoom",
@@ -130,11 +157,58 @@ impl AppAction {
             Self::FocusPane { .. } | Self::ResizePane { .. } if context.pane_count < 2 => {
                 ActionAvailability::Unavailable("The tab has only one pane")
             }
+            Self::FocusPane { .. } | Self::ResizePane { .. } | Self::TogglePaneZoom
+                if !context.pane_management_available =>
+            {
+                ActionAvailability::Unavailable("Pane management is unavailable")
+            }
             Self::Search if !context.search_available => {
                 ActionAvailability::Unavailable("Terminal search is unavailable")
             }
+            Self::ToggleQuickTerminal if !context.quick_terminal_available => {
+                ActionAvailability::Unavailable("Quick terminal is unavailable")
+            }
             _ => ActionAvailability::Available,
         }
+    }
+
+    /// Static actions used by the palette and default key-binding table.
+    pub fn catalog() -> Vec<Self> {
+        let mut actions = vec![
+            Self::NewTab { profile_id: None },
+            Self::Split {
+                direction: SplitDirection::Right,
+                profile_id: None,
+            },
+            Self::Split {
+                direction: SplitDirection::Down,
+                profile_id: None,
+            },
+            Self::ClosePane,
+        ];
+        for direction in [
+            Direction::Left,
+            Direction::Right,
+            Direction::Up,
+            Direction::Down,
+        ] {
+            actions.push(Self::FocusPane { direction });
+            actions.push(Self::ResizePane {
+                direction,
+                amount: 5,
+            });
+        }
+        actions.extend([
+            Self::TogglePaneZoom,
+            Self::Copy,
+            Self::Paste,
+            Self::Search,
+            Self::ToggleSidebar,
+            Self::CommandPalette,
+            Self::ToggleQuickTerminal,
+            Self::Quit,
+        ]);
+        actions
     }
 }
 
@@ -162,6 +236,17 @@ pub enum ActionCategory {
     Terminal,
 }
 
+impl ActionCategory {
+    pub const fn title(self) -> &'static str {
+        match self {
+            Self::Application => "Application",
+            Self::Window => "Window",
+            Self::Pane => "Pane",
+            Self::Terminal => "Terminal",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ActionDescriptor {
     pub id: &'static str,
@@ -174,13 +259,74 @@ pub struct ActionDescriptor {
 pub struct ActionContext {
     pub has_selection: bool,
     pub pane_count: usize,
+    pub pane_management_available: bool,
     pub search_available: bool,
+    pub quick_terminal_available: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ActionAvailability {
     Available,
     Unavailable(&'static str),
+}
+
+/// One normalized key chord mapped to a domain action.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActionBinding {
+    pub chord: String,
+    pub action: AppAction,
+}
+
+/// Thin GPUI adapter for the domain action model.
+#[derive(Clone, gpui::Action, PartialEq, Eq, Deserialize)]
+#[action(namespace = mightty, no_json)]
+pub struct DispatchAppAction {
+    pub action: AppAction,
+}
+
+pub fn default_action_bindings() -> Vec<ActionBinding> {
+    let mut bindings = Vec::new();
+    for action in AppAction::catalog() {
+        for chord in action.descriptor().default_bindings {
+            bindings.push(ActionBinding {
+                chord: (*chord).to_string(),
+                action: action.clone(),
+            });
+        }
+    }
+    for index in 0..9 {
+        bindings.push(ActionBinding {
+            chord: format!("ctrl-{}", index + 1),
+            action: AppAction::SelectTab { index },
+        });
+    }
+    bindings
+}
+
+pub fn normalize_chord(chord: &str) -> Result<String, String> {
+    let keystroke = gpui::Keystroke::parse(chord.trim()).map_err(|error| error.to_string())?;
+    Ok(chord_for_keystroke(&keystroke))
+}
+
+pub fn chord_for_keystroke(keystroke: &gpui::Keystroke) -> String {
+    let mut parts = Vec::new();
+    if keystroke.modifiers.control {
+        parts.push("ctrl".to_string());
+    }
+    if keystroke.modifiers.alt {
+        parts.push("alt".to_string());
+    }
+    if keystroke.modifiers.shift {
+        parts.push("shift".to_string());
+    }
+    if keystroke.modifiers.platform {
+        parts.push("cmd".to_string());
+    }
+    if keystroke.modifiers.function {
+        parts.push("fn".to_string());
+    }
+    parts.push(keystroke.key.to_ascii_lowercase());
+    parts.join("-")
 }
 
 const fn descriptor(
@@ -239,5 +385,27 @@ mod tests {
             }),
             ActionAvailability::Available
         );
+    }
+
+    #[test]
+    fn default_bindings_come_from_action_descriptors() {
+        let bindings = default_action_bindings();
+        assert!(bindings.contains(&ActionBinding {
+            chord: "ctrl-t".to_string(),
+            action: AppAction::NewTab { profile_id: None },
+        }));
+        assert!(bindings.contains(&ActionBinding {
+            chord: "ctrl-1".to_string(),
+            action: AppAction::SelectTab { index: 0 },
+        }));
+    }
+
+    #[test]
+    fn chord_normalization_matches_runtime_keystrokes() {
+        let chord = normalize_chord("SHIFT-CTRL-P").unwrap();
+        let keystroke = gpui::Keystroke::parse("ctrl-shift-p").unwrap();
+
+        assert_eq!(chord, "ctrl-shift-p");
+        assert_eq!(chord_for_keystroke(&keystroke), chord);
     }
 }

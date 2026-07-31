@@ -135,6 +135,8 @@ Useful runtime shortcuts:
 - `Alt+Shift+Enter`: split the active pane downward.
 - `Ctrl+D`: close the active pane, or close the active tab when it has one pane.
 - `Ctrl+Shift+C` (`Cmd+C` on macOS): copy the active terminal selection.
+- `Ctrl+Shift+V` (`Cmd+V` on macOS): paste with unsafe-paste confirmation.
+- `Ctrl+Shift+P` (`Cmd+Shift+P` on macOS): open the command palette.
 - `Cmd+Q` on macOS: quit.
 - `Ctrl+Shift+F12`: write a terminal feedback capture to `captures/`.
 

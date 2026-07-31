@@ -10,7 +10,7 @@ use std::time::Duration;
 use serde::de::{MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::action::AppAction;
+use crate::action::{ActionBinding, default_action_bindings, normalize_chord};
 use crate::profile::{LaunchSpec, ProfileId};
 use crate::widget::{CursorStyle, TerminalClipboardPolicy, TerminalConfig, TerminalTheme};
 
@@ -26,7 +26,7 @@ pub struct UserSettings {
     pub terminal: TerminalSettings,
     pub profiles: Vec<LaunchProfile>,
     pub default_profile: Option<ProfileId>,
-    pub key_bindings: Vec<KeyBinding>,
+    pub key_bindings: Vec<ActionBinding>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -128,14 +128,6 @@ impl LaunchProfile {
     }
 }
 
-/// One configured key chord and its typed action.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct KeyBinding {
-    pub chord: String,
-    pub action: AppAction,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResolvedLaunchProfile {
     pub id: ProfileId,
@@ -151,7 +143,7 @@ pub struct ResolvedSettings {
     pub terminal: TerminalConfig,
     pub profiles: BTreeMap<ProfileId, ResolvedLaunchProfile>,
     pub default_profile: ProfileId,
-    pub key_bindings: Vec<KeyBinding>,
+    pub key_bindings: Vec<ActionBinding>,
 }
 
 impl ResolvedSettings {
@@ -393,7 +385,7 @@ fn resolve_user_settings(
     directory: &Path,
 ) -> Result<ResolvedSettings, SettingsError> {
     validate_app_settings(&settings.app)?;
-    let terminal = resolve_terminal_settings(settings.terminal)?;
+    let mut terminal = resolve_terminal_settings(settings.terminal)?;
     let profiles = resolve_profiles(settings.profiles, discovered, directory)?;
     let default_profile = match settings.default_profile {
         Some(profile_id) if profiles.contains_key(&profile_id) => profile_id,
@@ -405,6 +397,7 @@ fn resolve_user_settings(
         None => preferred_default_profile(&profiles),
     };
     let key_bindings = resolve_key_bindings(settings.key_bindings)?;
+    terminal.action_bindings = key_bindings.clone();
 
     Ok(ResolvedSettings {
         app: settings.app,
@@ -656,44 +649,29 @@ fn preferred_default_profile(profiles: &BTreeMap<ProfileId, ResolvedLaunchProfil
         .clone()
 }
 
-fn resolve_key_bindings(bindings: Vec<KeyBinding>) -> Result<Vec<KeyBinding>, SettingsError> {
-    let mut chords = BTreeSet::new();
-    bindings
+fn resolve_key_bindings(bindings: Vec<ActionBinding>) -> Result<Vec<ActionBinding>, SettingsError> {
+    let mut explicit_chords = BTreeSet::new();
+    let mut resolved = default_action_bindings()
         .into_iter()
-        .map(|mut binding| {
-            binding.chord = normalize_chord(&binding.chord)?;
-            if !chords.insert(binding.chord.clone()) {
-                return Err(SettingsError::new(format!(
-                    "key chord '{}' is duplicated",
-                    binding.chord
-                )));
-            }
-            Ok(binding)
-        })
-        .collect()
-}
-
-fn normalize_chord(chord: &str) -> Result<String, SettingsError> {
-    let chord = chord.trim().to_ascii_lowercase();
-    validate_chord(&chord)?;
-    Ok(chord)
+        .map(|binding| (binding.chord.clone(), binding))
+        .collect::<BTreeMap<_, _>>();
+    for mut binding in bindings {
+        binding.chord = normalize_chord(&binding.chord).map_err(SettingsError::new)?;
+        if !explicit_chords.insert(binding.chord.clone()) {
+            return Err(SettingsError::new(format!(
+                "key chord '{}' is duplicated",
+                binding.chord
+            )));
+        }
+        resolved.insert(binding.chord.clone(), binding);
+    }
+    Ok(resolved.into_values().collect())
 }
 
 fn validate_chord(chord: &str) -> Result<(), SettingsError> {
-    let parts = chord.split('-').collect::<Vec<_>>();
-    if parts.is_empty() || parts.iter().any(|part| part.is_empty()) {
-        return Err(SettingsError::new(format!(
-            "key chord '{chord}' is invalid"
-        )));
-    }
-    for modifier in &parts[..parts.len().saturating_sub(1)] {
-        if !matches!(*modifier, "alt" | "cmd" | "ctrl" | "platform" | "shift") {
-            return Err(SettingsError::new(format!(
-                "key chord '{chord}' has invalid modifier '{modifier}'"
-            )));
-        }
-    }
-    Ok(())
+    normalize_chord(chord)
+        .map(|_| ())
+        .map_err(SettingsError::new)
 }
 
 fn validate_environment_name(name: &str) -> Result<(), SettingsError> {
@@ -950,6 +928,8 @@ mod tests {
     use std::ffi::OsString;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use crate::action::AppAction;
+
     static TEMP_FILE_NUMBER: AtomicUsize = AtomicUsize::new(0);
 
     fn discovered_profile() -> LaunchProfile {
@@ -1032,8 +1012,12 @@ mod tests {
         assert_eq!(settings.terminal.font_family, "Test Mono");
         assert_eq!(settings.terminal.font_size_px, 18.0);
         assert_eq!(settings.terminal.theme.background, gpui::rgb(0x102030));
-        assert_eq!(settings.key_bindings[0].chord, "ctrl-shift-p");
-        assert_eq!(settings.key_bindings[0].action, AppAction::CommandPalette);
+        let binding = settings
+            .key_bindings
+            .iter()
+            .find(|binding| binding.chord == "ctrl-shift-p")
+            .unwrap();
+        assert_eq!(binding.action, AppAction::CommandPalette);
     }
 
     #[test]

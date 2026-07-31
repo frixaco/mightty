@@ -8,6 +8,9 @@ mod input;
 mod pty;
 mod render;
 
+use crate::action::{
+    ActionBinding, DispatchAppAction, chord_for_keystroke, default_action_bindings,
+};
 use crate::feedback;
 use crate::ghostty::{
     ClipboardLocation, ClipboardWrite, ClipboardWriteResult, RenderState, Scrollbar, SelectionDrag,
@@ -19,7 +22,6 @@ use crate::ghostty::{
     render::{CellIterator, RowIterator},
     style::{Palette, RgbColor},
 };
-use crate::pane_container::{CopySelection, PasteClipboard, shortcut_action};
 use crate::profile::LaunchSpec;
 use crate::shell::PtySize;
 use gpui::{
@@ -80,6 +82,7 @@ pub struct TerminalConfig {
     pub font_family: String,
     pub font_size_px: f32,
     pub theme: TerminalTheme,
+    pub action_bindings: Vec<ActionBinding>,
 }
 
 impl Default for TerminalConfig {
@@ -96,6 +99,7 @@ impl Default for TerminalConfig {
             font_family: DEFAULT_TERMINAL_FONT_FAMILY.to_string(),
             font_size_px: DEFAULT_TERMINAL_FONT_SIZE_PX,
             theme: TerminalTheme::default(),
+            action_bindings: default_action_bindings(),
         }
     }
 }
@@ -310,6 +314,16 @@ impl TerminalWidget {
         &self.focus_handle
     }
 
+    pub(crate) fn set_action_bindings(&mut self, bindings: Vec<ActionBinding>) {
+        self.config.action_bindings = bindings;
+    }
+
+    pub(crate) fn has_selection(&self) -> bool {
+        self.terminal
+            .selected_text()
+            .is_ok_and(|text| text.is_some_and(|text| !text.is_empty()))
+    }
+
     fn schedule_cursor_blink(&mut self, cx: &mut Context<Self>) {
         if !self.config.cursor_blink {
             self.cursor_blink_phase = true;
@@ -502,18 +516,33 @@ impl TerminalWidget {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        let Some(action) = shortcut_action(keystroke) else {
+        let chord = chord_for_keystroke(keystroke);
+        let Some(binding) = self
+            .config
+            .action_bindings
+            .iter()
+            .find(|binding| binding.chord == chord)
+        else {
             return false;
         };
 
-        window.dispatch_action(action, cx);
+        window.dispatch_action(
+            Box::new(DispatchAppAction {
+                action: binding.action.clone(),
+            }),
+            cx,
+        );
         window.prevent_default();
         cx.stop_propagation();
         true
     }
 
     fn is_app_shortcut(&self, keystroke: &gpui::Keystroke) -> bool {
-        shortcut_action(keystroke).is_some()
+        let chord = chord_for_keystroke(keystroke);
+        self.config
+            .action_bindings
+            .iter()
+            .any(|binding| binding.chord == chord)
     }
 
     fn send_encoded_key(
@@ -876,12 +905,7 @@ impl TerminalWidget {
         cx.notify();
     }
 
-    fn on_copy_selection(
-        &mut self,
-        _action: &CopySelection,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub(crate) fn copy_selection(&mut self, cx: &mut Context<Self>) {
         match self.terminal.selected_text() {
             Ok(Some(text)) if !text.is_empty() => {
                 cx.write_to_clipboard(ClipboardItem::new_string(text));
@@ -891,12 +915,7 @@ impl TerminalWidget {
         }
     }
 
-    fn on_paste_clipboard(
-        &mut self,
-        _action: &PasteClipboard,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub(crate) fn paste_clipboard(&mut self, cx: &mut Context<Self>) {
         let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
             return;
         };

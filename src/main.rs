@@ -34,8 +34,6 @@ fn main() {
         gpui_component::init(cx);
         Theme::change(ThemeMode::Dark, None, cx);
 
-        PaneContainer::bind_keys(cx);
-
         let bounds = Bounds::centered(None, size(px(800.), px(600.0)), cx);
         cx.open_window(
             WindowOptions {

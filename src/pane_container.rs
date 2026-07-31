@@ -1,37 +1,20 @@
 use gpui::{
-    Action, App, Context, Entity, Font, FontFallbacks, IntoElement, KeyBinding, MouseButton,
-    MouseDownEvent, Render, Task, Timer, Window, WindowControlArea, actions, div, font, prelude::*,
-    px,
+    AnyElement, Context, Entity, FocusHandle, Font, FontFallbacks, IntoElement, KeyDownEvent,
+    KeyUpEvent, MouseButton, MouseDownEvent, Render, Task, Timer, Window, WindowControlArea, div,
+    font, prelude::*, px,
 };
 use gpui_component::InteractiveElementExt;
-use serde::Deserialize;
-use std::path::Path;
 use std::sync::OnceLock;
 use std::time::Duration;
 
+use crate::action::{
+    ActionContext, AppAction, DispatchAppAction, SplitDirection as ActionSplitDirection,
+};
+use crate::command_palette::{PaletteCommand, commands, filtered_command_indices};
+use crate::profile::ProfileId;
 use crate::settings::{ReloadOutcome, SettingsStore};
 use crate::split::{Split, SplitDirection};
 use crate::widget::{TerminalConfig, TerminalWidget};
-
-actions!(
-    terminal,
-    [
-        SplitRight,
-        SplitDown,
-        NewTab,
-        CloseActive,
-        CopySelection,
-        PasteClipboard,
-        ToggleSidebar,
-        Quit
-    ]
-);
-
-#[derive(Clone, Action, PartialEq, Eq, Deserialize)]
-#[action(namespace = terminal, no_json)]
-pub struct SelectTab {
-    pub index: usize,
-}
 
 const WINDOW_BACKGROUND: u32 = 0x000000;
 const WINDOW_HORIZONTAL_PADDING_PX: f32 = 8.0;
@@ -43,6 +26,7 @@ const SIDEBAR_GAP_PX: f32 = 8.0;
 const TAB_RADIUS_PX: f32 = 4.0;
 const TAB_HEIGHT_PX: f32 = 42.0;
 const MAX_SELECTABLE_TABS: usize = 9;
+const PALETTE_MAX_RESULTS: usize = 12;
 
 #[derive(Clone, Copy)]
 enum WindowsCaptionButton {
@@ -57,35 +41,51 @@ struct Tab {
     title: String,
 }
 
+struct PaletteState {
+    query: String,
+    selected: usize,
+}
+
 pub struct PaneContainer {
     tabs: Vec<Tab>,
     active_tab_index: usize,
     sidebar_visible: bool,
     needs_focus: bool,
-    config: TerminalConfig,
     settings: SettingsStore,
     settings_task: Task<()>,
+    palette: Option<PaletteState>,
+    palette_focus: FocusHandle,
     exit_tx: flume::Sender<()>,
     exit_task: Task<()>,
 }
 
 impl PaneContainer {
     pub fn new(settings: SettingsStore, cx: &mut Context<Self>) -> Self {
-        let resolved = settings.current();
-        let config = resolved
-            .terminal_config(None)
-            .expect("resolved settings contain their default profile");
+        let (config, title, sidebar_visible) = {
+            let resolved = settings.current();
+            let config = resolved
+                .terminal_config(None)
+                .expect("resolved settings contain their default profile");
+            let title = resolved
+                .profiles
+                .get(&resolved.default_profile)
+                .expect("resolved settings contain their default profile")
+                .label
+                .clone();
+            (config, title, resolved.app.sidebar_visible)
+        };
         let (exit_tx, exit_rx) = flume::unbounded();
-        let tab = Self::create_tab(config.clone(), exit_tx.clone(), cx);
+        let tab = Self::create_tab(config, title, exit_tx.clone(), cx);
 
         let mut container = Self {
             tabs: vec![tab],
             active_tab_index: 0,
-            sidebar_visible: resolved.app.sidebar_visible,
+            sidebar_visible,
             needs_focus: true,
-            config,
             settings,
             settings_task: Task::ready(()),
+            palette: None,
+            palette_focus: cx.focus_handle(),
             exit_tx,
             exit_task: Task::ready(()),
         };
@@ -94,43 +94,16 @@ impl PaneContainer {
         container
     }
 
-    pub fn bind_keys(cx: &mut App) {
-        cx.bind_keys([
-            KeyBinding::new("alt-enter", SplitRight, None),
-            KeyBinding::new("alt-shift-enter", SplitDown, None),
-            KeyBinding::new("ctrl-t", NewTab, None),
-            KeyBinding::new("cmd-t", NewTab, None),
-            KeyBinding::new("ctrl-d", CloseActive, None),
-            KeyBinding::new("ctrl-shift-c", CopySelection, None),
-            KeyBinding::new("cmd-c", CopySelection, None),
-            KeyBinding::new("ctrl-shift-v", PasteClipboard, None),
-            KeyBinding::new("cmd-v", PasteClipboard, None),
-            KeyBinding::new("cmd-q", Quit, None),
-            KeyBinding::new("ctrl-b", ToggleSidebar, None),
-            KeyBinding::new("ctrl-1", SelectTab { index: 0 }, None),
-            KeyBinding::new("ctrl-2", SelectTab { index: 1 }, None),
-            KeyBinding::new("ctrl-3", SelectTab { index: 2 }, None),
-            KeyBinding::new("ctrl-4", SelectTab { index: 3 }, None),
-            KeyBinding::new("ctrl-5", SelectTab { index: 4 }, None),
-            KeyBinding::new("ctrl-6", SelectTab { index: 5 }, None),
-            KeyBinding::new("ctrl-7", SelectTab { index: 6 }, None),
-            KeyBinding::new("ctrl-8", SelectTab { index: 7 }, None),
-            KeyBinding::new("ctrl-9", SelectTab { index: 8 }, None),
-        ]);
-    }
-
     fn create_tab(
         config: TerminalConfig,
+        title: String,
         exit_tx: flume::Sender<()>,
         cx: &mut Context<Self>,
     ) -> Tab {
         let terminal = Self::create_terminal(config, exit_tx, cx);
         let split = cx.new(|_cx| Split::with_terminal(terminal));
 
-        Tab {
-            split,
-            title: short_current_dir_title(),
-        }
+        Tab { split, title }
     }
 
     fn create_terminal(
@@ -147,17 +120,35 @@ impl PaneContainer {
         self.tabs[self.active_tab_index].split.clone()
     }
 
-    fn new_terminal(&self, cx: &mut Context<Self>) -> Entity<TerminalWidget> {
-        Self::create_terminal(self.config.clone(), self.exit_tx.clone(), cx)
+    fn terminal_config(&self, profile_id: Option<&ProfileId>) -> Option<TerminalConfig> {
+        match self.settings.current().terminal_config(profile_id) {
+            Ok(config) => Some(config),
+            Err(error) => {
+                eprintln!("Cannot launch terminal: {error}");
+                None
+            }
+        }
+    }
+
+    fn new_terminal(
+        &self,
+        profile_id: Option<&ProfileId>,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<TerminalWidget>> {
+        let config = self.terminal_config(profile_id)?;
+        Some(Self::create_terminal(config, self.exit_tx.clone(), cx))
     }
 
     fn split_active(
         &mut self,
         direction: SplitDirection,
+        profile_id: Option<&ProfileId>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let new_terminal = self.new_terminal(cx);
+        let Some(new_terminal) = self.new_terminal(profile_id, cx) else {
+            return;
+        };
         let split = self.active_split();
 
         split.update(cx, |split, cx| {
@@ -168,12 +159,21 @@ impl PaneContainer {
         cx.notify();
     }
 
-    fn new_tab(&mut self, cx: &mut Context<Self>) {
+    fn new_tab(&mut self, profile_id: Option<&ProfileId>, cx: &mut Context<Self>) {
         if self.tabs.len() >= MAX_SELECTABLE_TABS {
             return;
         }
 
-        let tab = Self::create_tab(self.config.clone(), self.exit_tx.clone(), cx);
+        let settings = self.settings.current();
+        let profile_id = profile_id.unwrap_or(&settings.default_profile);
+        let Some(profile) = settings.profiles.get(profile_id) else {
+            eprintln!("Cannot create tab: profile '{profile_id}' does not exist");
+            return;
+        };
+        let config = settings
+            .terminal_config(Some(profile_id))
+            .expect("resolved profile has a terminal configuration");
+        let tab = Self::create_tab(config, profile.label.clone(), self.exit_tx.clone(), cx);
         self.tabs.push(tab);
         self.active_tab_index = self.tabs.len() - 1;
         self.needs_focus = true;
@@ -259,10 +259,13 @@ impl PaneContainer {
                         ReloadOutcome::Unchanged => {}
                         ReloadOutcome::Applied { .. } => {
                             let settings = this.settings.current();
-                            this.config = settings
-                                .terminal_config(None)
-                                .expect("resolved settings contain their default profile");
                             this.sidebar_visible = settings.app.sidebar_visible;
+                            let bindings = settings.key_bindings.clone();
+                            for tab in &this.tabs {
+                                tab.split.update(cx, |split, cx| {
+                                    split.set_action_bindings(&bindings, cx)
+                                });
+                            }
                             cx.notify();
                         }
                         ReloadOutcome::Rejected(diagnostic) => {
@@ -298,127 +301,165 @@ impl PaneContainer {
         removed_any
     }
 
-    fn on_split_right(
+    fn on_app_action(
         &mut self,
-        _action: &SplitRight,
+        action: &DispatchAppAction,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.split_active(SplitDirection::Row, window, cx);
+        self.dispatch_app_action(action.action.clone(), window, cx);
     }
 
-    fn on_split_down(&mut self, _action: &SplitDown, window: &mut Window, cx: &mut Context<Self>) {
-        self.split_active(SplitDirection::Column, window, cx);
-    }
-
-    fn on_new_tab(&mut self, _action: &NewTab, _window: &mut Window, cx: &mut Context<Self>) {
-        self.new_tab(cx);
-    }
-
-    fn on_close_active(
+    fn dispatch_app_action(
         &mut self,
-        _action: &CloseActive,
+        action: AppAction,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.close_active(window, cx);
+        match action {
+            AppAction::NewTab { profile_id } => self.new_tab(profile_id.as_ref(), cx),
+            AppAction::Split {
+                direction,
+                profile_id,
+            } => {
+                let direction = match direction {
+                    ActionSplitDirection::Right => SplitDirection::Row,
+                    ActionSplitDirection::Down => SplitDirection::Column,
+                };
+                self.split_active(direction, profile_id.as_ref(), window, cx);
+            }
+            AppAction::ClosePane => self.close_active(window, cx),
+            AppAction::Copy => {
+                if let Some(terminal) = self.active_terminal(window, cx) {
+                    terminal.update(cx, |terminal, cx| terminal.copy_selection(cx));
+                }
+            }
+            AppAction::Paste => {
+                if let Some(terminal) = self.active_terminal(window, cx) {
+                    terminal.update(cx, |terminal, cx| terminal.paste_clipboard(cx));
+                }
+            }
+            AppAction::ToggleSidebar => self.toggle_sidebar(cx),
+            AppAction::SelectTab { index } => self.activate_tab(usize::from(index), cx),
+            AppAction::CommandPalette => self.open_palette(window, cx),
+            AppAction::Quit => cx.quit(),
+            AppAction::FocusPane { .. }
+            | AppAction::ResizePane { .. }
+            | AppAction::TogglePaneZoom
+            | AppAction::Search
+            | AppAction::ToggleQuickTerminal => {}
+        }
     }
 
-    fn on_toggle_sidebar(
+    fn active_terminal(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<TerminalWidget>> {
+        self.active_split()
+            .update(cx, |split, cx| split.active_terminal(window, cx))
+    }
+
+    fn action_context(&self, window: &Window, cx: &mut Context<Self>) -> ActionContext {
+        let split = self.active_split();
+        let pane_count = split.read(cx).pane_count();
+        let has_selection = split
+            .update(cx, |split, cx| split.active_terminal(window, cx))
+            .is_some_and(|terminal| terminal.read(cx).has_selection());
+        ActionContext {
+            has_selection,
+            pane_count,
+            pane_management_available: false,
+            search_available: false,
+            quick_terminal_available: false,
+        }
+    }
+
+    fn palette_commands(&self, window: &Window, cx: &mut Context<Self>) -> Vec<PaletteCommand> {
+        commands(self.settings.current(), self.action_context(window, cx))
+    }
+
+    fn open_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.palette = Some(PaletteState {
+            query: String::new(),
+            selected: 0,
+        });
+        self.palette_focus.focus(window);
+        cx.notify();
+    }
+
+    fn close_palette(&mut self, cx: &mut Context<Self>) {
+        self.palette = None;
+        self.needs_focus = true;
+        cx.notify();
+    }
+
+    fn handle_palette_key_down(
         &mut self,
-        _action: &ToggleSidebar,
-        _window: &mut Window,
+        event: &KeyDownEvent,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.toggle_sidebar(cx);
-    }
-
-    fn on_select_tab(&mut self, action: &SelectTab, _window: &mut Window, cx: &mut Context<Self>) {
-        self.activate_tab(action.index, cx);
-    }
-
-    fn on_quit(&mut self, _action: &Quit, _window: &mut Window, cx: &mut Context<Self>) {
-        cx.quit();
-    }
-}
-
-pub fn shortcut_action(keystroke: &gpui::Keystroke) -> Option<Box<dyn gpui::Action>> {
-    let modifiers = keystroke.modifiers;
-    let key = keystroke.key.as_str();
-
-    if modifiers.alt && !modifiers.control && !modifiers.platform && key == "enter" {
-        return if modifiers.shift {
-            Some(Box::new(SplitDown))
-        } else {
-            Some(Box::new(SplitRight))
+        let Some(palette) = &self.palette else {
+            return;
         };
+        let query = palette.query.clone();
+        let selected = palette.selected;
+        let commands = commands(self.settings.current(), self.action_context(window, cx));
+        let matches = filtered_command_indices(&commands, &query);
+        match event.keystroke.key.as_str() {
+            "escape" => self.close_palette(cx),
+            "backspace" => {
+                let palette = self.palette.as_mut().expect("palette remains open");
+                palette.query.pop();
+                palette.selected = 0;
+                cx.notify();
+            }
+            "up" => {
+                let palette = self.palette.as_mut().expect("palette remains open");
+                palette.selected = palette.selected.saturating_sub(1);
+                cx.notify();
+            }
+            "down" => {
+                let palette = self.palette.as_mut().expect("palette remains open");
+                palette.selected = (palette.selected + 1).min(matches.len().saturating_sub(1));
+                cx.notify();
+            }
+            "enter" => {
+                if let Some(command_index) = matches.get(selected)
+                    && commands[*command_index].unavailable_reason.is_none()
+                {
+                    let action = commands[*command_index].action.clone();
+                    self.close_palette(cx);
+                    self.dispatch_app_action(action, window, cx);
+                }
+            }
+            _ if !event.keystroke.modifiers.control
+                && !event.keystroke.modifiers.alt
+                && !event.keystroke.modifiers.platform =>
+            {
+                if let Some(text) = &event.keystroke.key_char {
+                    let palette = self.palette.as_mut().expect("palette remains open");
+                    palette.query.push_str(text);
+                    palette.selected = 0;
+                    cx.notify();
+                }
+            }
+            _ => {}
+        }
+        window.prevent_default();
+        cx.stop_propagation();
     }
 
-    if modifiers.platform && !modifiers.control && !modifiers.alt && !modifiers.shift {
-        return match key {
-            "c" => Some(Box::new(CopySelection)),
-            "v" => Some(Box::new(PasteClipboard)),
-            "t" => Some(Box::new(NewTab)),
-            "q" => Some(Box::new(Quit)),
-            _ => None,
-        };
+    fn handle_palette_key_up(
+        &mut self,
+        _event: &KeyUpEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        window.prevent_default();
+        cx.stop_propagation();
     }
-
-    if modifiers.control && modifiers.shift && !modifiers.alt && !modifiers.platform && key == "c" {
-        return Some(Box::new(CopySelection));
-    }
-    if modifiers.control && modifiers.shift && !modifiers.alt && !modifiers.platform && key == "v" {
-        return Some(Box::new(PasteClipboard));
-    }
-
-    if !modifiers.control || modifiers.alt || modifiers.platform || modifiers.shift {
-        return None;
-    }
-
-    match key {
-        "t" => Some(Box::new(NewTab)),
-        "d" => Some(Box::new(CloseActive)),
-        "b" => Some(Box::new(ToggleSidebar)),
-        "1" => Some(Box::new(SelectTab { index: 0 })),
-        "2" => Some(Box::new(SelectTab { index: 1 })),
-        "3" => Some(Box::new(SelectTab { index: 2 })),
-        "4" => Some(Box::new(SelectTab { index: 3 })),
-        "5" => Some(Box::new(SelectTab { index: 4 })),
-        "6" => Some(Box::new(SelectTab { index: 5 })),
-        "7" => Some(Box::new(SelectTab { index: 6 })),
-        "8" => Some(Box::new(SelectTab { index: 7 })),
-        "9" => Some(Box::new(SelectTab { index: 8 })),
-        _ => None,
-    }
-}
-
-fn short_current_dir_title() -> String {
-    let Ok(current_dir) = std::env::current_dir() else {
-        return "term".to_string();
-    };
-
-    if let Some(home) = user_home_dir()
-        && current_dir == home
-    {
-        return "~".to_string();
-    }
-
-    current_dir
-        .file_name()
-        .and_then(|name| name.to_str())
-        .filter(|name| !name.is_empty())
-        .unwrap_or("term")
-        .to_string()
-}
-
-fn user_home_dir() -> Option<std::path::PathBuf> {
-    std::env::var_os("USERPROFILE")
-        .map(std::path::PathBuf::from)
-        .or_else(|| {
-            let drive = std::env::var_os("HOMEDRIVE")?;
-            let path = std::env::var_os("HOMEPATH")?;
-            Some(Path::new(&drive).join(path))
-        })
 }
 
 fn window_control_button(
@@ -510,19 +551,18 @@ impl Render for PaneContainer {
             self.needs_focus = false;
             self.focus_active_tab(window, cx);
         }
+        let palette = self
+            .palette
+            .as_ref()
+            .map(|_| self.render_command_palette(window, cx));
 
         div()
             .size_full()
+            .relative()
             .flex()
             .flex_col()
             .bg(gpui::rgb(WINDOW_BACKGROUND))
-            .on_action(cx.listener(Self::on_split_right))
-            .on_action(cx.listener(Self::on_split_down))
-            .on_action(cx.listener(Self::on_new_tab))
-            .on_action(cx.listener(Self::on_close_active))
-            .on_action(cx.listener(Self::on_toggle_sidebar))
-            .on_action(cx.listener(Self::on_select_tab))
-            .on_action(cx.listener(Self::on_quit))
+            .on_action(cx.listener(Self::on_app_action))
             .child(render_titlebar(window))
             .children(
                 self.settings
@@ -548,6 +588,7 @@ impl Render for PaneContainer {
                             .child(self.active_split()),
                     ),
             )
+            .children(palette)
     }
 }
 
@@ -626,6 +667,136 @@ fn render_titlebar(window: &mut Window) -> impl IntoElement {
 }
 
 impl PaneContainer {
+    fn render_command_palette(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        let palette = self
+            .palette
+            .as_ref()
+            .expect("palette render requires open state");
+        let commands = self.palette_commands(window, cx);
+        let matches = filtered_command_indices(&commands, &palette.query);
+        let selected = palette.selected.min(matches.len().saturating_sub(1));
+        let query = palette.query.clone();
+
+        div()
+            .absolute()
+            .top_0()
+            .right_0()
+            .bottom_0()
+            .left_0()
+            .flex()
+            .justify_center()
+            .items_start()
+            .pt(px(72.0))
+            .bg(gpui::rgba(0x00000099))
+            .occlude()
+            .track_focus(&self.palette_focus)
+            .on_key_down(cx.listener(Self::handle_palette_key_down))
+            .on_key_up(cx.listener(Self::handle_palette_key_up))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _event: &MouseDownEvent, window, cx| {
+                    this.close_palette(cx);
+                    window.prevent_default();
+                    cx.stop_propagation();
+                }),
+            )
+            .child(
+                div()
+                    .w(px(620.0))
+                    .max_h(px(560.0))
+                    .overflow_hidden()
+                    .rounded(px(8.0))
+                    .border_1()
+                    .border_color(gpui::rgb(0x383838))
+                    .bg(gpui::rgb(0x151515))
+                    .shadow_lg()
+                    .on_mouse_down(MouseButton::Left, |_event: &MouseDownEvent, window, cx| {
+                        window.prevent_default();
+                        cx.stop_propagation();
+                    })
+                    .child(
+                        div()
+                            .h(px(48.0))
+                            .px(px(14.0))
+                            .flex()
+                            .items_center()
+                            .border_b_1()
+                            .border_color(gpui::rgb(0x303030))
+                            .text_size(px(15.0))
+                            .text_color(gpui::rgb(0xf2f2f2))
+                            .child(if query.is_empty() {
+                                "Type a command…".to_string()
+                            } else {
+                                format!("{query}▏")
+                            }),
+                    )
+                    .children(
+                        matches
+                            .into_iter()
+                            .take(PALETTE_MAX_RESULTS)
+                            .enumerate()
+                            .map(|(result_index, command_index)| {
+                                let command = &commands[command_index];
+                                let action = command.action.clone();
+                                let available = command.unavailable_reason.is_none();
+                                let detail = command
+                                    .unavailable_reason
+                                    .map(ToOwned::to_owned)
+                                    .or_else(|| command.binding.clone())
+                                    .unwrap_or_else(|| command.category.title().to_string());
+
+                                div()
+                                    .id(("palette-command", command_index))
+                                    .h(px(40.0))
+                                    .px(px(12.0))
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .bg(if result_index == selected {
+                                        gpui::rgb(0x292929)
+                                    } else {
+                                        gpui::rgb(0x151515)
+                                    })
+                                    .text_color(if available {
+                                        gpui::rgb(0xeeeeee)
+                                    } else {
+                                        gpui::rgb(0x777777)
+                                    })
+                                    .when(available, |row| {
+                                        row.hover(|style| style.bg(gpui::rgb(0x242424)))
+                                            .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(
+                                                move |this, _event: &MouseDownEvent, window, cx| {
+                                                    this.close_palette(cx);
+                                                    this.dispatch_app_action(
+                                                        action.clone(),
+                                                        window,
+                                                        cx,
+                                                    );
+                                                    window.prevent_default();
+                                                    cx.stop_propagation();
+                                                },
+                                            ),
+                                        )
+                                    })
+                                    .child(div().text_size(px(13.0)).child(command.title.clone()))
+                                    .child(
+                                        div()
+                                            .text_size(px(11.0))
+                                            .text_color(if available {
+                                                gpui::rgb(0x999999)
+                                            } else {
+                                                gpui::rgb(0x6f6f6f)
+                                            })
+                                            .child(detail),
+                                    )
+                            }),
+                    ),
+            )
+            .into_any_element()
+    }
+
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .w(px(SIDEBAR_WIDTH_PX))
@@ -689,27 +860,5 @@ impl PaneContainer {
                             .child(title),
                     )
             }))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn shortcut_name(keystroke: &str) -> Option<&'static str> {
-        let keystroke = gpui::Keystroke::parse(keystroke).expect("parse keystroke");
-        shortcut_action(&keystroke).map(|action| action.name())
-    }
-
-    #[test]
-    fn app_shortcuts_include_platform_tab_and_quit() {
-        assert_eq!(shortcut_name("ctrl-t"), Some(NewTab.name()));
-        assert_eq!(shortcut_name("cmd-t"), Some(NewTab.name()));
-        assert_eq!(shortcut_name("cmd-q"), Some(Quit.name()));
-        assert_eq!(shortcut_name("ctrl-d"), Some(CloseActive.name()));
-        assert_eq!(shortcut_name("ctrl-shift-c"), Some(CopySelection.name()));
-        assert_eq!(shortcut_name("cmd-c"), Some(CopySelection.name()));
-        assert_eq!(shortcut_name("ctrl-shift-v"), Some(PasteClipboard.name()));
-        assert_eq!(shortcut_name("cmd-v"), Some(PasteClipboard.name()));
     }
 }

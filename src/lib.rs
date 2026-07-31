@@ -1,6 +1,7 @@
 //! mightty — a terminal emulator built with GPUI and Ghostty's VT engine.
 
 pub mod action;
+pub mod command_palette;
 pub mod feedback;
 pub mod ghostty;
 pub mod profile;

@@ -84,6 +84,8 @@ requirement because `build.rs` validates the submodule revision.
   selects a line using Ghostty's selection rules.
 - `Ctrl+Alt` drag selects a rectangle (`Option` on macOS).
 - `Ctrl+Shift+C` copies the active selection; `Cmd+C` does the same on macOS.
+- `Ctrl+Shift+V` pastes text; `Cmd+V` does the same on macOS.
+- `Ctrl+Shift+P` opens the command palette; `Cmd+Shift+P` does the same on macOS.
 - `Cmd+Q` quits on macOS.
 - Exited panes are removed when more than one pane exists.
 - `Ctrl+Shift+F12` writes a feedback capture under `captures/`.

@@ -2,6 +2,7 @@ use gpui::{
     AnyElement, Context, Entity, EntityId, IntoElement, Render, Window, div, prelude::*, px,
 };
 
+use crate::action::ActionBinding;
 use crate::widget::TerminalWidget;
 
 const SEPARATOR_COLOR: u32 = 0x00c853;
@@ -108,6 +109,21 @@ impl Split {
         }
     }
 
+    pub fn active_terminal(
+        &mut self,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> Option<Entity<TerminalWidget>> {
+        self.update_active_from_focus(window, cx);
+        self.root
+            .terminal_by_id(self.active_pane_id)
+            .or_else(|| self.root.terminal_at(0))
+    }
+
+    pub fn set_action_bindings(&self, bindings: &[ActionBinding], cx: &mut Context<Self>) {
+        self.root.set_action_bindings(bindings, cx);
+    }
+
     fn update_active_from_focus(&mut self, window: &Window, cx: &Context<Self>) {
         if let Some(focused_pane_id) = self.root.focused_pane_id(window, cx) {
             self.active_pane_id = focused_pane_id;
@@ -116,6 +132,21 @@ impl Split {
 }
 
 impl SplitNode {
+    fn set_action_bindings(&self, bindings: &[ActionBinding], cx: &mut Context<Split>) {
+        match self {
+            Self::Terminal(terminal) => {
+                terminal.update(cx, |terminal, _cx| {
+                    terminal.set_action_bindings(bindings.to_vec())
+                });
+            }
+            Self::Split { children, .. } => {
+                for child in children {
+                    child.set_action_bindings(bindings, cx);
+                }
+            }
+        }
+    }
+
     fn pane_count(&self) -> usize {
         match self {
             Self::Terminal(_) => 1,

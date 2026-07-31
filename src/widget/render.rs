@@ -427,8 +427,6 @@ impl Render for TerminalWidget {
             .relative()
             .overflow_hidden()
             .track_focus(&self.focus_handle)
-            .on_action(cx.listener(TerminalWidget::on_copy_selection))
-            .on_action(cx.listener(TerminalWidget::on_paste_clipboard))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 this.handle_key_down(event, window, cx)
             }))
