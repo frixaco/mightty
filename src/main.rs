@@ -34,6 +34,7 @@ fn main() {
     Application::new().run(move |cx: &mut App| {
         load_embedded_fonts(cx);
         gpui_component::init(cx);
+        mightty::widget::init(cx);
         Theme::change(ThemeMode::Dark, None, cx);
         cx.set_menus(app_menus());
 

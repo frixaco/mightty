@@ -12,7 +12,7 @@ use gpui::{
 use std::cell::RefCell;
 use std::sync::Arc;
 
-use super::{CursorStyle, TerminalWidget, rgb_to_rgba, scrollbar_layout};
+use super::{CursorStyle, TERMINAL_KEY_CONTEXT, TerminalWidget, rgb_to_rgba, scrollbar_layout};
 
 #[cfg(test)]
 thread_local! {
@@ -606,7 +606,10 @@ impl Render for TerminalWidget {
             .bg(rgb_to_rgba(colors.background))
             .relative()
             .overflow_hidden()
+            .key_context(TERMINAL_KEY_CONTEXT)
             .track_focus(&self.focus_handle)
+            .on_action(cx.listener(Self::handle_tab_action))
+            .on_action(cx.listener(Self::handle_tab_prev_action))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 this.handle_key_down(event, window, cx)
             }))
@@ -973,8 +976,24 @@ mod tests {
         RenderState, SelectionDrag, SelectionGeometry, SelectionPoint, SelectionPress, Terminal,
         TerminalOptions, render::RowIterator,
     };
-    use crate::widget::TerminalConfig;
-    use gpui::{AppContext, Bounds, TestAppContext, size};
+    use crate::widget::{PtyCommand, TerminalConfig};
+    use gpui::{AppContext, Bounds, Entity, FocusHandle, TestAppContext, size};
+    use gpui_component::Root;
+    use std::{cell::RefCell, rc::Rc};
+
+    struct TerminalTabFixture {
+        terminal: Entity<TerminalWidget>,
+        next_focus: FocusHandle,
+    }
+
+    impl Render for TerminalTabFixture {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .child(self.terminal.clone())
+                .child(div().track_focus(&self.next_focus))
+        }
+    }
 
     #[test]
     fn bold_style_survives_box_emoji_prompt_segment() {
@@ -1131,6 +1150,62 @@ mod tests {
             Some(selected)
         );
         assert_eq!(selected_background(selection, 5, 1, None, selected), None);
+    }
+
+    #[gpui::test]
+    fn tab_is_forwarded_without_leaving_terminal_focus(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::widget::init(cx);
+        });
+
+        let terminal_slot = Rc::new(RefCell::new(None));
+        let build_terminal_slot = Rc::clone(&terminal_slot);
+        let (pty_tx, pty_rx) = flume::unbounded();
+        let config = TerminalConfig {
+            cursor_blink: false,
+            ..Default::default()
+        };
+
+        let (_root, cx) = cx.add_window_view(move |window, cx| {
+            let terminal = cx.new(|cx| {
+                TerminalWidget::with_pty(
+                    config,
+                    Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    None,
+                    None,
+                    Some(pty_tx),
+                    cx,
+                )
+            });
+            build_terminal_slot.replace(Some(terminal.clone()));
+            let fixture = cx.new(|cx| TerminalTabFixture {
+                terminal,
+                next_focus: cx.focus_handle().tab_stop(true),
+            });
+            Root::new(fixture, window, cx)
+        });
+        let terminal = terminal_slot
+            .borrow()
+            .clone()
+            .expect("test terminal was created");
+
+        cx.refresh().expect("refresh tab focus fixture");
+        cx.update_window_entity(&terminal, |terminal, window, _cx| {
+            terminal.request_focus(window);
+        });
+        while pty_rx.try_recv().is_ok() {}
+
+        cx.simulate_keystrokes("tab");
+
+        let terminal_is_focused = cx.update_window_entity(&terminal, |terminal, window, _cx| {
+            terminal.focus_handle().is_focused(window)
+        });
+        assert!(terminal_is_focused);
+        assert!(matches!(
+            pty_rx.try_recv(),
+            Ok(PtyCommand::Write(bytes)) if bytes == b"\t"
+        ));
     }
 
     #[gpui::test]

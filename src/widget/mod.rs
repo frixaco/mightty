@@ -31,9 +31,9 @@ use crate::profile::LaunchSpec;
 use crate::shell::PtyParts;
 use crate::shell::PtySize;
 use gpui::{
-    Bounds, ClipboardItem, Context, EventEmitter, FocusHandle, KeyDownEvent, KeyUpEvent, Modifiers,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollWheelEvent, Size, Task,
-    Timer, Window, px,
+    App, Bounds, ClipboardItem, Context, EventEmitter, FocusHandle, KeyBinding, KeyDownEvent,
+    KeyUpEvent, Keystroke, Modifiers, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
+    ScrollWheelEvent, Size, Task, Timer, Window, px,
 };
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
@@ -55,6 +55,19 @@ const FEEDBACK_CAPTURE_KEY: &str = "f12";
 const CLICK_REPEAT_INTERVAL_NS: u64 = 500_000_000;
 const SCROLLBAR_MIN_THUMB_PX: f32 = 24.0;
 const MAX_TERMINAL_CLIPBOARD_BYTES: usize = 1024 * 1024;
+const TERMINAL_KEY_CONTEXT: &str = "Terminal";
+
+gpui::actions!(terminal, [ForwardTab, ForwardTabPrev]);
+
+/// Register terminal Tab actions before creating terminal widgets.
+///
+/// GPUI uses Tab for user-interface focus. The terminal must send Tab to the shell instead.
+pub fn init(cx: &mut App) {
+    cx.bind_keys([
+        KeyBinding::new("tab", ForwardTab, Some(TERMINAL_KEY_CONTEXT)),
+        KeyBinding::new("shift-tab", ForwardTabPrev, Some(TERMINAL_KEY_CONTEXT)),
+    ]);
+}
 
 /// Cursor style options
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -843,6 +856,42 @@ impl TerminalWidget {
         }
 
         self.send_encoded_key(Action::Release, &event.keystroke, cx);
+    }
+
+    fn handle_tab_action(&mut self, _: &ForwardTab, window: &mut Window, cx: &mut Context<Self>) {
+        self.send_encoded_key(
+            Action::Press,
+            &Keystroke {
+                modifiers: Modifiers::default(),
+                key: "tab".to_string(),
+                key_char: None,
+            },
+            cx,
+        );
+        window.prevent_default();
+        cx.stop_propagation();
+    }
+
+    fn handle_tab_prev_action(
+        &mut self,
+        _: &ForwardTabPrev,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.send_encoded_key(
+            Action::Press,
+            &Keystroke {
+                modifiers: Modifiers {
+                    shift: true,
+                    ..Default::default()
+                },
+                key: "tab".to_string(),
+                key_char: None,
+            },
+            cx,
+        );
+        window.prevent_default();
+        cx.stop_propagation();
     }
 
     fn dispatch_app_shortcut(
