@@ -82,7 +82,7 @@ impl DefaultTerminalResponse {
 /// Owns the local COM class registration and its worker thread.
 pub struct DefaultTerminalServer {
     accepting: Arc<AtomicBool>,
-    stop_tx: Option<mpsc::Sender<()>>,
+    stop_tx: mpsc::Sender<()>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -100,7 +100,7 @@ impl DefaultTerminalServer {
         match ready_rx.recv() {
             Ok(Ok(())) => Ok(Self {
                 accepting,
-                stop_tx: Some(stop_tx),
+                stop_tx,
                 thread: Some(thread),
             }),
             Ok(Err(error)) => {
@@ -120,9 +120,7 @@ impl DefaultTerminalServer {
 impl Drop for DefaultTerminalServer {
     fn drop(&mut self) {
         self.accepting.store(false, Ordering::Release);
-        if let Some(stop_tx) = self.stop_tx.take() {
-            let _ = stop_tx.send(());
-        }
+        let _ = self.stop_tx.send(());
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -477,11 +475,11 @@ fn establish_pty_handoff_inner(this: *mut c_void, call: HandoffCall) -> HRESULT 
         Ok(handle) => handle,
         Err(error) => return hresult_from_io(&error),
     };
-    let handoff = match PtyParts::from_handoff(signal, reference, server, client) {
-        Ok(handoff) => handoff,
-        Err(_) => return E_FAIL,
-    };
-    let (parts, input_peer, output_peer) = handoff.into_parts();
+    let (parts, input_peer, output_peer) =
+        match PtyParts::from_handoff(signal, reference, server, client) {
+            Ok(handoff) => handoff,
+            Err(_) => return E_FAIL,
+        };
     let startup_title = unsafe { startup_title(call.startup_info) };
     // A zero-capacity channel makes a late UI response fail after this wait ends.
     let (accepted_tx, accepted_rx) = mpsc::sync_channel(0);

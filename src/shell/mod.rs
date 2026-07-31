@@ -29,9 +29,7 @@ pub enum PtyRead {
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
-pub use windows::{
-    HandoffPty, PtyControl, PtyError, PtyInput, PtyOutput, PtyParts, is_conpty_available,
-};
+pub use windows::{PtyControl, PtyError, PtyInput, PtyOutput, PtyParts, is_conpty_available};
 
 #[cfg(unix)]
 mod unix;

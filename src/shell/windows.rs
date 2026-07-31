@@ -121,13 +121,6 @@ pub struct PtyParts {
     pub control: PtyControl,
 }
 
-/// A handed terminal session and the data-pipe handles returned to the console host.
-pub struct HandoffPty {
-    parts: PtyParts,
-    input_peer: WindowsOwnedHandle,
-    output_peer: WindowsOwnedHandle,
-}
-
 pub struct PtyInput {
     handle: OwnedHandle,
 }
@@ -234,17 +227,17 @@ impl PtyParts {
     /// `signal`, `reference`, `server`, and `client` must be independent
     /// duplicates. This function takes their ownership. The returned input peer
     /// is the read end used by the console host. The output peer is its write end.
-    pub fn from_handoff(
+    pub(crate) fn from_handoff(
         signal: WindowsOwnedHandle,
         reference: WindowsOwnedHandle,
         server: WindowsOwnedHandle,
         client: WindowsOwnedHandle,
-    ) -> Result<HandoffPty, PtyError> {
+    ) -> Result<(Self, WindowsOwnedHandle, WindowsOwnedHandle), PtyError> {
         let input = Pipe::create()?;
         let output = Pipe::create()?;
 
-        Ok(HandoffPty {
-            parts: Self {
+        Ok((
+            Self {
                 input: PtyInput {
                     handle: input.write,
                 },
@@ -261,19 +254,9 @@ impl PtyParts {
                     shutdown_called: false,
                 },
             },
-            input_peer: input.read.into_windows(),
-            output_peer: output.write.into_windows(),
-        })
-    }
-}
-
-impl HandoffPty {
-    /// Split the session into the terminal side and console-host pipe ends.
-    ///
-    /// The caller must return `input_peer` as the host input handle. The caller
-    /// must return `output_peer` as the host output handle.
-    pub fn into_parts(self) -> (PtyParts, WindowsOwnedHandle, WindowsOwnedHandle) {
-        (self.parts, self.input_peer, self.output_peer)
+            input.read.into_windows(),
+            output.write.into_windows(),
+        ))
     }
 }
 
@@ -1110,8 +1093,7 @@ mod tests {
 
         let (mut parts, input_peer, output_peer) =
             PtyParts::from_handoff(signal, disposable_handle(), disposable_handle(), client)
-                .expect("create handed session")
-                .into_parts();
+                .expect("create handed session");
 
         parts
             .input
@@ -1175,8 +1157,7 @@ mod tests {
         let signal = signal_pipe.write.into_windows();
         let (mut parts, _input_peer, _output_peer) =
             PtyParts::from_handoff(signal, disposable_handle(), disposable_handle(), client)
-                .expect("create handed session")
-                .into_parts();
+                .expect("create handed session");
 
         parts.control.shutdown().expect("shutdown handed session");
         let still_running = child.try_wait().expect("query handed client").is_none();
