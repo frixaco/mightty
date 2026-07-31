@@ -5,6 +5,7 @@ use gpui::{
 };
 use gpui_component::InteractiveElementExt;
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -15,7 +16,7 @@ use crate::command_palette::{PaletteCommand, commands, filtered_command_indices}
 use crate::profile::ProfileId;
 use crate::settings::{ReloadOutcome, SettingsStore};
 use crate::split::{Split, SplitAxis};
-use crate::widget::{TerminalConfig, TerminalWidget};
+use crate::widget::{TerminalConfig, TerminalEvent, TerminalWidget};
 use crate::workspace::{
     TabId, WorkspaceId, WorkspaceLayout, WorkspacePane, WorkspaceStore, WorkspaceTab,
     trusted_working_directory,
@@ -45,6 +46,8 @@ struct Tab {
     id: TabId,
     split: Entity<Split>,
     title: String,
+    default_title: String,
+    bell_pending: bool,
 }
 
 struct PaletteState {
@@ -122,7 +125,9 @@ impl PaneContainer {
         Tab {
             id: TabId::fresh(),
             split,
-            title,
+            title: title.clone(),
+            default_title: title,
+            bell_pending: false,
         }
     }
 
@@ -133,7 +138,42 @@ impl PaneContainer {
     ) -> Entity<TerminalWidget> {
         let terminal = cx.new(|cx| TerminalWidget::new(config, cx));
         terminal.update(cx, |terminal, _cx| terminal.set_exit_signal(exit_tx));
+        cx.subscribe(&terminal, Self::on_terminal_event).detach();
         terminal
+    }
+
+    fn on_terminal_event(
+        &mut self,
+        terminal: Entity<TerminalWidget>,
+        event: &TerminalEvent,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab_index) = self.tabs.iter().position(|tab| {
+            tab.split
+                .read(cx)
+                .pane_id_for_entity(terminal.entity_id())
+                .is_some()
+        }) else {
+            return;
+        };
+        let is_active_pane = {
+            let split = self.tabs[tab_index].split.read(cx);
+            split.pane_id_for_entity(terminal.entity_id()) == Some(split.active_pane_id())
+        };
+        match event {
+            TerminalEvent::TitleChanged(title) if is_active_pane => {
+                self.tabs[tab_index].title =
+                    crate::shell_integration::display_title(title.as_deref())
+                        .unwrap_or_else(|| self.tabs[tab_index].default_title.clone());
+            }
+            TerminalEvent::Bell if tab_index != self.active_tab_index => {
+                self.tabs[tab_index].bell_pending = true;
+            }
+            TerminalEvent::TitleChanged(_)
+            | TerminalEvent::WorkingDirectoryChanged(_)
+            | TerminalEvent::Bell => {}
+        }
+        cx.notify();
     }
 
     fn active_split(&self) -> Entity<Split> {
@@ -158,9 +198,13 @@ impl PaneContainer {
     fn new_terminal(
         &self,
         profile_id: Option<&ProfileId>,
+        working_directory: Option<PathBuf>,
         cx: &mut Context<Self>,
     ) -> Option<(Entity<TerminalWidget>, ProfileId)> {
-        let (config, profile_id) = self.terminal_config(profile_id)?;
+        let (mut config, profile_id) = self.terminal_config(profile_id)?;
+        if let Some(working_directory) = working_directory {
+            config.launch.working_directory = Some(working_directory);
+        }
         Some((
             Self::create_terminal(config, self.exit_tx.clone(), cx),
             profile_id,
@@ -171,10 +215,12 @@ impl PaneContainer {
         &mut self,
         axis: SplitAxis,
         profile_id: Option<&ProfileId>,
+        working_directory: Option<PathBuf>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some((new_terminal, profile_id)) = self.new_terminal(profile_id, cx) else {
+        let Some((new_terminal, profile_id)) = self.new_terminal(profile_id, working_directory, cx)
+        else {
             return;
         };
         let split = self.active_split();
@@ -242,8 +288,10 @@ impl PaneContainer {
                     .map(|(pane_id, profile_id, terminal)| {
                         let working_directory = terminal
                             .read(cx)
-                            .launch_working_directory()
-                            .filter(|directory| trusted_working_directory(directory));
+                            .current_working_directory()
+                            .filter(|directory| {
+                                trusted_working_directory(directory) && directory.is_dir()
+                            });
                         (
                             pane_id,
                             WorkspacePane {
@@ -335,7 +383,9 @@ impl PaneContainer {
             tabs.push(Tab {
                 id,
                 split: cx.new(|_cx| split),
-                title,
+                title: title.clone(),
+                default_title: title,
+                bell_pending: false,
             });
         }
         let active_tab_index = tabs
@@ -356,6 +406,7 @@ impl PaneContainer {
         }
 
         self.active_tab_index = index;
+        self.tabs[index].bell_pending = false;
         self.needs_focus = true;
         cx.notify();
     }
@@ -363,6 +414,16 @@ impl PaneContainer {
     fn focus_active_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let split = self.active_split();
         split.update(cx, |split, cx| split.focus_active(window, cx));
+    }
+
+    fn refresh_active_tab_title(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let title = self
+            .active_terminal(window, cx)
+            .and_then(|terminal| {
+                crate::shell_integration::display_title(terminal.read(cx).reported_title())
+            })
+            .unwrap_or_else(|| self.tabs[self.active_tab_index].default_title.clone());
+        self.tabs[self.active_tab_index].title = title;
     }
 
     fn close_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -496,7 +557,20 @@ impl PaneContainer {
                     ActionSplitDirection::Right => SplitAxis::Horizontal,
                     ActionSplitDirection::Down => SplitAxis::Vertical,
                 };
-                self.split_active(axis, profile_id.as_ref(), window, cx);
+                self.split_active(axis, profile_id.as_ref(), None, window, cx);
+            }
+            AppAction::SplitFromCurrentDirectory { direction } => {
+                let working_directory = self
+                    .active_terminal(window, cx)
+                    .and_then(|terminal| terminal.read(cx).current_working_directory())
+                    .filter(|directory| directory.is_dir());
+                if working_directory.is_some() {
+                    let axis = match direction {
+                        ActionSplitDirection::Right => SplitAxis::Horizontal,
+                        ActionSplitDirection::Down => SplitAxis::Vertical,
+                    };
+                    self.split_active(axis, None, working_directory, window, cx);
+                }
             }
             AppAction::ClosePane => self.close_active(window, cx),
             AppAction::Copy => {
@@ -557,13 +631,21 @@ impl PaneContainer {
     fn action_context(&self, window: &Window, cx: &mut Context<Self>) -> ActionContext {
         let split = self.active_split();
         let pane_count = split.read(cx).pane_count();
-        let has_selection = split
-            .update(cx, |split, cx| split.active_terminal(window, cx))
+        let active_terminal = split.update(cx, |split, cx| split.active_terminal(window, cx));
+        let has_selection = active_terminal
+            .as_ref()
             .is_some_and(|terminal| terminal.read(cx).has_selection());
+        let has_local_working_directory = active_terminal.is_some_and(|terminal| {
+            terminal
+                .read(cx)
+                .current_working_directory()
+                .is_some_and(|directory| directory.is_dir())
+        });
         ActionContext {
             has_selection,
             pane_count,
             tab_count: self.tabs.len(),
+            has_local_working_directory,
             pane_management_available: true,
             search_available: false,
             quick_terminal_available: false,
@@ -756,6 +838,7 @@ impl Render for PaneContainer {
             self.needs_focus = false;
             self.focus_active_tab(window, cx);
         }
+        self.refresh_active_tab_title(window, cx);
         let palette = self
             .palette
             .as_ref()
@@ -1027,7 +1110,11 @@ impl PaneContainer {
             .pt(px(4.0))
             .children(self.tabs.iter().enumerate().map(|(index, tab)| {
                 let is_active = index == self.active_tab_index;
-                let label = (index + 1).to_string();
+                let label = if tab.bell_pending {
+                    format!("{}•", index + 1)
+                } else {
+                    (index + 1).to_string()
+                };
                 let title = tab.title.clone();
 
                 div()

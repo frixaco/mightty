@@ -14,6 +14,9 @@ pub enum AppAction {
         direction: SplitDirection,
         profile_id: Option<ProfileId>,
     },
+    SplitFromCurrentDirectory {
+        direction: SplitDirection,
+    },
     ClosePane,
     FocusPane {
         direction: Direction,
@@ -70,6 +73,22 @@ impl AppAction {
                 "Split down",
                 ActionCategory::Pane,
                 &["alt-shift-enter"],
+            ),
+            Self::SplitFromCurrentDirectory {
+                direction: SplitDirection::Right,
+            } => descriptor(
+                "split_right_from_current_directory",
+                "Split right in current directory",
+                ActionCategory::Pane,
+                &[],
+            ),
+            Self::SplitFromCurrentDirectory {
+                direction: SplitDirection::Down,
+            } => descriptor(
+                "split_down_from_current_directory",
+                "Split down in current directory",
+                ActionCategory::Pane,
+                &[],
             ),
             Self::ClosePane => descriptor(
                 "close_pane",
@@ -207,6 +226,9 @@ impl AppAction {
             Self::MoveTab { .. } if context.tab_count < 2 => {
                 ActionAvailability::Unavailable("The window has only one tab")
             }
+            Self::SplitFromCurrentDirectory { .. } if !context.has_local_working_directory => {
+                ActionAvailability::Unavailable("The active shell has no local working directory")
+            }
             _ => ActionAvailability::Available,
         }
     }
@@ -222,6 +244,12 @@ impl AppAction {
             Self::Split {
                 direction: SplitDirection::Down,
                 profile_id: None,
+            },
+            Self::SplitFromCurrentDirectory {
+                direction: SplitDirection::Right,
+            },
+            Self::SplitFromCurrentDirectory {
+                direction: SplitDirection::Down,
             },
             Self::ClosePane,
         ];
@@ -308,6 +336,7 @@ pub struct ActionContext {
     pub has_selection: bool,
     pub pane_count: usize,
     pub tab_count: usize,
+    pub has_local_working_directory: bool,
     pub pane_management_available: bool,
     pub search_available: bool,
     pub quick_terminal_available: bool,

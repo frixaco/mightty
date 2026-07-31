@@ -25,7 +25,7 @@ use crate::ghostty::{
 use crate::profile::LaunchSpec;
 use crate::shell::PtySize;
 use gpui::{
-    Bounds, ClipboardItem, Context, FocusHandle, KeyDownEvent, KeyUpEvent, Modifiers,
+    Bounds, ClipboardItem, Context, EventEmitter, FocusHandle, KeyDownEvent, KeyUpEvent, Modifiers,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollWheelEvent, Size, Task,
     Timer, Window, px,
 };
@@ -132,8 +132,27 @@ pub struct TerminalWidget {
     scrollbar_dragging: bool,
     pending_paste: Option<String>,
     terminal_clipboard_writes: Rc<RefCell<Vec<String>>>,
+    terminal_effects: Rc<RefCell<PendingTerminalEffects>>,
+    reported_title: Option<Option<String>>,
+    reported_working_directory: Option<Option<String>>,
     theme: TerminalTheme,
     has_exited: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TerminalEvent {
+    TitleChanged(Option<String>),
+    WorkingDirectoryChanged(Option<String>),
+    Bell,
+}
+
+impl EventEmitter<TerminalEvent> for TerminalWidget {}
+
+#[derive(Default)]
+struct PendingTerminalEffects {
+    title: Option<Option<String>>,
+    working_directory: Option<Option<String>>,
+    bell: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -186,6 +205,7 @@ impl TerminalWidget {
         })
         .expect("Failed to create terminal");
         let terminal_clipboard_writes = Rc::new(RefCell::new(Vec::new()));
+        let terminal_effects = Rc::new(RefCell::new(PendingTerminalEffects::default()));
 
         #[cfg(any(windows, unix))]
         let (pty_worker, pty_event_rx, pty_tx) = {
@@ -233,6 +253,20 @@ impl TerminalWidget {
                 ClipboardWriteResult::Success
             })
             .expect("Failed to configure terminal clipboard policy");
+        let effects = Rc::clone(&terminal_effects);
+        terminal
+            .on_title_changed(move |title| effects.borrow_mut().title = Some(title))
+            .expect("Failed to configure terminal title updates");
+        let effects = Rc::clone(&terminal_effects);
+        terminal
+            .on_working_directory_changed(move |working_directory| {
+                effects.borrow_mut().working_directory = Some(working_directory);
+            })
+            .expect("Failed to configure terminal working-directory updates");
+        let effects = Rc::clone(&terminal_effects);
+        terminal
+            .on_bell(move || effects.borrow_mut().bell = true)
+            .expect("Failed to configure terminal bell updates");
         terminal
             .set_default_fg_color(Some(rgba_to_rgb(theme.foreground)))
             .and_then(|terminal| terminal.set_default_bg_color(Some(rgba_to_rgb(theme.background))))
@@ -281,6 +315,9 @@ impl TerminalWidget {
             scrollbar_dragging: false,
             pending_paste: None,
             terminal_clipboard_writes,
+            terminal_effects,
+            reported_title: None,
+            reported_working_directory: None,
             theme,
             has_exited,
         };
@@ -325,8 +362,16 @@ impl TerminalWidget {
             .is_ok_and(|text| text.is_some_and(|text| !text.is_empty()))
     }
 
-    pub(crate) fn launch_working_directory(&self) -> Option<PathBuf> {
-        self.config.launch.working_directory.clone()
+    pub(crate) fn current_working_directory(&self) -> Option<PathBuf> {
+        match &self.reported_working_directory {
+            Some(Some(report)) => crate::shell_integration::local_working_directory(report),
+            Some(None) => None,
+            None => self.config.launch.working_directory.clone(),
+        }
+    }
+
+    pub(crate) fn reported_title(&self) -> Option<&str> {
+        self.reported_title.as_ref().and_then(Option::as_deref)
     }
 
     fn schedule_cursor_blink(&mut self, cx: &mut Context<Self>) {
@@ -399,8 +444,24 @@ impl TerminalWidget {
                 for text in self.terminal_clipboard_writes.borrow_mut().drain(..) {
                     cx.write_to_clipboard(ClipboardItem::new_string(text));
                 }
+                self.emit_terminal_effects(cx);
             }
             PtyEvent::Exited => self.mark_exited(),
+        }
+    }
+
+    fn emit_terminal_effects(&mut self, cx: &mut Context<Self>) {
+        let effects = std::mem::take(&mut *self.terminal_effects.borrow_mut());
+        if let Some(title) = effects.title {
+            self.reported_title = Some(title.clone());
+            cx.emit(TerminalEvent::TitleChanged(title));
+        }
+        if let Some(working_directory) = effects.working_directory {
+            self.reported_working_directory = Some(working_directory.clone());
+            cx.emit(TerminalEvent::WorkingDirectoryChanged(working_directory));
+        }
+        if effects.bell {
+            cx.emit(TerminalEvent::Bell);
         }
     }
 
