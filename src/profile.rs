@@ -7,7 +7,7 @@ use std::str::FromStr;
 use serde::{Deserialize, Deserializer, Serialize};
 
 /// Stable launch-profile identifier used by settings, actions, and workspaces.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct ProfileId(String);
 

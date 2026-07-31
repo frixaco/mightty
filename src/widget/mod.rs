@@ -27,6 +27,7 @@ use gpui::{
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollWheelEvent, Size, Task,
     Timer, Window, px,
 };
+use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::OnceLock;
@@ -38,8 +39,8 @@ use std::time::{Duration, Instant};
 
 use pty::{OUTPUT_DRAIN_BUDGET, PtyCommand, PtyEvent, PtyWorker};
 
-pub(super) const TERMINAL_FONT_FAMILY: &str = "JetBrainsMono Nerd Font Mono";
-pub(super) const TERMINAL_FONT_SIZE_PX: f32 = 16.0;
+pub const DEFAULT_TERMINAL_FONT_FAMILY: &str = "JetBrainsMono Nerd Font Mono";
+pub const DEFAULT_TERMINAL_FONT_SIZE_PX: f32 = 16.0;
 
 const FEEDBACK_CAPTURE_KEY: &str = "f12";
 const CLICK_REPEAT_INTERVAL_NS: u64 = 500_000_000;
@@ -47,7 +48,8 @@ const SCROLLBAR_MIN_THUMB_PX: f32 = 24.0;
 const MAX_TERMINAL_CLIPBOARD_BYTES: usize = 1024 * 1024;
 
 /// Cursor style options
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CursorStyle {
     #[default]
     Block,
@@ -56,7 +58,8 @@ pub enum CursorStyle {
 }
 
 /// Policy for clipboard writes requested by terminal output.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TerminalClipboardPolicy {
     #[default]
     Deny,
@@ -74,19 +77,25 @@ pub struct TerminalConfig {
     pub cursor_blink: bool,
     pub blink_interval: Duration,
     pub terminal_clipboard_policy: TerminalClipboardPolicy,
+    pub font_family: String,
+    pub font_size_px: f32,
+    pub theme: TerminalTheme,
 }
 
 impl Default for TerminalConfig {
     fn default() -> Self {
         Self {
             launch: LaunchSpec::default_shell(),
-            initial_rows: 24,
-            initial_cols: 80,
-            scrollback: 1000,
+            initial_rows: 30,
+            initial_cols: 100,
+            scrollback: 10000,
             cursor_style: CursorStyle::Line,
             cursor_blink: true,
             blink_interval: Duration::from_millis(500),
             terminal_clipboard_policy: TerminalClipboardPolicy::Deny,
+            font_family: DEFAULT_TERMINAL_FONT_FAMILY.to_string(),
+            font_size_px: DEFAULT_TERMINAL_FONT_SIZE_PX,
+            theme: TerminalTheme::default(),
         }
     }
 }
@@ -162,7 +171,7 @@ impl Default for TerminalTheme {
 
 impl TerminalWidget {
     pub fn new(config: TerminalConfig, cx: &mut Context<Self>) -> Self {
-        let theme = TerminalTheme::default();
+        let theme = config.theme.clone();
         let exit_flag = Arc::new(AtomicBool::new(false));
 
         let mut terminal = Terminal::new(TerminalOptions {

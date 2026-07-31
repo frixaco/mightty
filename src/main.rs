@@ -1,8 +1,7 @@
 use gpui::{App, Application, Bounds, WindowBounds, WindowOptions, prelude::*, px, size};
 use gpui_component::{Root, Theme, ThemeMode, TitleBar};
-use mightty::{pane_container::PaneContainer, widget::TerminalConfig};
+use mightty::{pane_container::PaneContainer, settings::SettingsStore};
 use std::borrow::Cow;
-use std::time::Duration;
 
 fn load_embedded_fonts(cx: &mut App) {
     let fonts = vec![
@@ -45,15 +44,8 @@ fn main() {
                 ..Default::default()
             },
             |window, cx| {
-                let config = TerminalConfig {
-                    initial_rows: 30,
-                    initial_cols: 100,
-                    scrollback: 10000,
-                    cursor_blink: true,
-                    blink_interval: Duration::from_millis(500),
-                    ..Default::default()
-                };
-                let pane_container = cx.new(|cx| PaneContainer::new(config, cx));
+                let settings = SettingsStore::open_default();
+                let pane_container = cx.new(|cx| PaneContainer::new(settings, cx));
                 cx.new(|cx| Root::new(pane_container, window, cx))
             },
         )

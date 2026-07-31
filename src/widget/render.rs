@@ -10,10 +10,7 @@ use gpui::{
 };
 use std::sync::Arc;
 
-use super::{
-    CursorStyle, TERMINAL_FONT_FAMILY, TERMINAL_FONT_SIZE_PX, TerminalWidget, rgb_to_rgba,
-    scrollbar_layout,
-};
+use super::{CursorStyle, TerminalWidget, rgb_to_rgba, scrollbar_layout};
 
 pub(super) trait CellWidthExt {
     fn column_advance(self) -> u16;
@@ -84,10 +81,10 @@ impl Render for TerminalWidget {
         let selection_color = super::rgba_to_rgb(self.theme.selection);
         let mut elements: Vec<gpui::AnyElement> = Vec::new();
         let mut base_text_style = window.text_style();
-        base_text_style.font_family = TERMINAL_FONT_FAMILY.into();
+        base_text_style.font_family = self.config.font_family.clone().into();
         base_text_style.font_features = terminal_font_features();
-        base_text_style.font_fallbacks = Some(terminal_font_fallbacks());
-        base_text_style.font_size = px(TERMINAL_FONT_SIZE_PX).into();
+        base_text_style.font_fallbacks = Some(terminal_font_fallbacks(&self.config.font_family));
+        base_text_style.font_size = px(self.config.font_size_px).into();
         base_text_style.line_height = cell_size.1.into();
         base_text_style.white_space = WhiteSpace::Nowrap;
 
@@ -234,8 +231,8 @@ impl Render for TerminalWidget {
                     .h(cell_size.1)
                     .overflow_hidden()
                     .whitespace_nowrap()
-                    .text_size(px(TERMINAL_FONT_SIZE_PX))
-                    .font_family(TERMINAL_FONT_FAMILY)
+                    .text_size(px(self.config.font_size_px))
+                    .font_family(self.config.font_family.clone())
                     .line_height(cell_size.1)
                     .when_some(segment_bg, |div, bg| div.bg(rgb_to_rgba(bg)))
                     .child(
@@ -542,9 +539,9 @@ fn terminal_font_features() -> FontFeatures {
     ]))
 }
 
-fn terminal_font_fallbacks() -> FontFallbacks {
+fn terminal_font_fallbacks(primary: &str) -> FontFallbacks {
     FontFallbacks::from_fonts(vec![
-        TERMINAL_FONT_FAMILY.to_string(),
+        primary.to_string(),
         "Consolas".to_string(),
         "Cascadia Mono".to_string(),
         "DejaVu Sans Mono".to_string(),

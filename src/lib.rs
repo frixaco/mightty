@@ -4,6 +4,7 @@ pub mod action;
 pub mod feedback;
 pub mod ghostty;
 pub mod profile;
+pub mod settings;
 pub mod shell;
 pub mod widget;
 

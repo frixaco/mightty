@@ -7,8 +7,8 @@ use crate::ghostty::{
     style::{RgbColor, Underline},
 };
 
+use super::TerminalWidget;
 use super::render::CellWidthExt;
-use super::{TERMINAL_FONT_FAMILY, TERMINAL_FONT_SIZE_PX, TerminalWidget};
 
 impl TerminalWidget {
     pub(super) fn build_feedback_capture(&mut self) -> crate::ghostty::Result<TerminalCapture> {
@@ -71,8 +71,8 @@ impl TerminalWidget {
                 height: self.cell_size.1.into(),
             },
             font: FontCapture {
-                family: TERMINAL_FONT_FAMILY.to_string(),
-                size_px: TERMINAL_FONT_SIZE_PX,
+                family: self.config.font_family.clone(),
+                size_px: self.config.font_size_px,
             },
             colors: CaptureColors {
                 foreground: rgb_hex(colors.foreground),

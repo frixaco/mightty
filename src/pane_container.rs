@@ -1,12 +1,15 @@
 use gpui::{
     Action, App, Context, Entity, Font, FontFallbacks, IntoElement, KeyBinding, MouseButton,
-    MouseDownEvent, Render, Task, Window, WindowControlArea, actions, div, font, prelude::*, px,
+    MouseDownEvent, Render, Task, Timer, Window, WindowControlArea, actions, div, font, prelude::*,
+    px,
 };
 use gpui_component::InteractiveElementExt;
 use serde::Deserialize;
 use std::path::Path;
 use std::sync::OnceLock;
+use std::time::Duration;
 
+use crate::settings::{ReloadOutcome, SettingsStore};
 use crate::split::{Split, SplitDirection};
 use crate::widget::{TerminalConfig, TerminalWidget};
 
@@ -60,25 +63,34 @@ pub struct PaneContainer {
     sidebar_visible: bool,
     needs_focus: bool,
     config: TerminalConfig,
+    settings: SettingsStore,
+    settings_task: Task<()>,
     exit_tx: flume::Sender<()>,
     exit_task: Task<()>,
 }
 
 impl PaneContainer {
-    pub fn new(config: TerminalConfig, cx: &mut Context<Self>) -> Self {
+    pub fn new(settings: SettingsStore, cx: &mut Context<Self>) -> Self {
+        let resolved = settings.current();
+        let config = resolved
+            .terminal_config(None)
+            .expect("resolved settings contain their default profile");
         let (exit_tx, exit_rx) = flume::unbounded();
         let tab = Self::create_tab(config.clone(), exit_tx.clone(), cx);
 
         let mut container = Self {
             tabs: vec![tab],
             active_tab_index: 0,
-            sidebar_visible: true,
+            sidebar_visible: resolved.app.sidebar_visible,
             needs_focus: true,
             config,
+            settings,
+            settings_task: Task::ready(()),
             exit_tx,
             exit_task: Task::ready(()),
         };
         container.start_exit_task(exit_rx, cx);
+        container.start_settings_task(cx);
         container
     }
 
@@ -231,6 +243,37 @@ impl PaneContainer {
                     }
                 })
                 .ok();
+            }
+        });
+    }
+
+    fn start_settings_task(&mut self, cx: &mut Context<Self>) {
+        self.settings_task = cx.spawn(async move |this, cx| {
+            loop {
+                Timer::after(Duration::from_secs(2)).await;
+                let Some(this) = this.upgrade() else {
+                    break;
+                };
+                let should_continue = this
+                    .update(cx, |this, cx| match this.settings.reload_if_changed() {
+                        ReloadOutcome::Unchanged => {}
+                        ReloadOutcome::Applied { .. } => {
+                            let settings = this.settings.current();
+                            this.config = settings
+                                .terminal_config(None)
+                                .expect("resolved settings contain their default profile");
+                            this.sidebar_visible = settings.app.sidebar_visible;
+                            cx.notify();
+                        }
+                        ReloadOutcome::Rejected(diagnostic) => {
+                            eprintln!("Settings reload failed: {diagnostic}");
+                            cx.notify();
+                        }
+                    })
+                    .is_ok();
+                if !should_continue {
+                    break;
+                }
             }
         });
     }
@@ -481,6 +524,11 @@ impl Render for PaneContainer {
             .on_action(cx.listener(Self::on_select_tab))
             .on_action(cx.listener(Self::on_quit))
             .child(render_titlebar(window))
+            .children(
+                self.settings
+                    .diagnostic()
+                    .map(|diagnostic| render_settings_diagnostic(diagnostic.to_string())),
+            )
             .child(
                 div()
                     .flex_1()
@@ -501,6 +549,16 @@ impl Render for PaneContainer {
                     ),
             )
     }
+}
+
+fn render_settings_diagnostic(message: String) -> impl IntoElement {
+    div()
+        .px(px(10.0))
+        .py(px(6.0))
+        .bg(gpui::rgb(0x5a1717))
+        .text_color(gpui::rgb(0xffffff))
+        .text_size(px(12.0))
+        .child(format!("Settings error: {message}"))
 }
 
 fn render_titlebar(window: &mut Window) -> impl IntoElement {

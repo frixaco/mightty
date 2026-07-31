@@ -83,6 +83,9 @@ mise exec -- cargo run
 The default shell is `pwsh.exe` on Windows. Unix uses `$SHELL`, falling back to
 `/bin/sh` when the variable is unset.
 
+See [Settings](docs/settings.md) for profiles, themes, fonts, key bindings, and
+safe live reload.
+
 ## Shell I/O
 
 Terminal I/O is wake-driven. `TerminalWidget` owns a `PtyWorker`; the platform
