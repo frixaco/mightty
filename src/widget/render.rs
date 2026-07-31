@@ -973,7 +973,6 @@ mod tests {
         RenderState, SelectionDrag, SelectionGeometry, SelectionPoint, SelectionPress, Terminal,
         TerminalOptions, render::RowIterator,
     };
-    use crate::profile::LaunchSpec;
     use crate::widget::TerminalConfig;
     use gpui::{AppContext, Bounds, TestAppContext, size};
 
@@ -1137,7 +1136,6 @@ mod tests {
     #[gpui::test]
     fn kitty_graphics_fixture_reaches_the_final_widget_render(cx: &mut TestAppContext) {
         let mut config = TerminalConfig {
-            launch: quiet_test_launch(),
             initial_cols: 20,
             initial_rows: 8,
             cursor_blink: false,
@@ -1145,7 +1143,16 @@ mod tests {
         };
         config.theme.background = gpui::rgb(0x101010);
 
-        let (widget, cx) = cx.add_window_view(|_window, cx| TerminalWidget::new(config, cx));
+        let (widget, cx) = cx.add_window_view(|_window, cx| {
+            TerminalWidget::with_pty(
+                config,
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                None,
+                None,
+                None,
+                cx,
+            )
+        });
         cx.simulate_resize(size(px(192.0), px(115.2)));
         cx.refresh().expect("refresh resized test window");
         cx.run_until_parked();
@@ -1217,14 +1224,6 @@ mod tests {
             actual,
             include_str!("fixtures/kitty-graphics-render.golden").replace("\r\n", "\n")
         );
-    }
-
-    fn quiet_test_launch() -> LaunchSpec {
-        if cfg!(windows) {
-            LaunchSpec::new("cmd.exe").with_arguments(["/d", "/c", "exit", "0"])
-        } else {
-            LaunchSpec::new("/bin/sh").with_arguments(["-c", "exit 0"])
-        }
     }
 
     fn format_fixture_bounds(label: &str, bounds: Bounds<Pixels>) -> String {
