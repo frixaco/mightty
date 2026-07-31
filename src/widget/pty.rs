@@ -53,6 +53,13 @@ impl PtyWorker {
         exit_flag: Arc<AtomicBool>,
     ) -> Result<(Self, flume::Receiver<PtyEvent>), crate::shell::PtyError> {
         let parts = PtyParts::spawn(&launch, PtySize::new(rows, cols))?;
+        Ok(Self::from_parts(parts, exit_flag))
+    }
+
+    pub(super) fn from_parts(
+        parts: PtyParts,
+        exit_flag: Arc<AtomicBool>,
+    ) -> (Self, flume::Receiver<PtyEvent>) {
         let (command_tx, command_rx) = flume::unbounded::<PtyCommand>();
         let (event_tx, event_rx) = flume::bounded::<PtyEvent>(OUTPUT_QUEUE_CAPACITY);
 
@@ -104,14 +111,14 @@ impl PtyWorker {
             let _ = event_tx.try_send(PtyEvent::Exited);
         });
 
-        Ok((
+        (
             Self {
                 command_tx,
                 control_thread: Some(control_thread),
                 reader_thread: Some(reader_thread),
             },
             event_rx,
-        ))
+        )
     }
 
     pub(super) fn command_tx(&self) -> flume::Sender<PtyCommand> {

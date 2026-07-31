@@ -9,6 +9,7 @@ use std::ffi::{OsStr, OsString, c_void};
 use std::io;
 use std::os::raw::c_uint;
 use std::os::windows::ffi::OsStrExt;
+use std::os::windows::io::{FromRawHandle, IntoRawHandle, OwnedHandle as WindowsOwnedHandle};
 use std::ptr::null_mut;
 
 use windows_sys::Win32::Foundation::{
@@ -32,6 +33,7 @@ use crate::profile::LaunchSpec;
 
 const WAIT_FAILED: u32 = u32::MAX;
 const SHUTDOWN_WAIT_MS: u32 = 250;
+const PTY_SIGNAL_RESIZE_WINDOW: u16 = 8;
 
 unsafe extern "system" {
     fn ReadFile(
@@ -119,6 +121,13 @@ pub struct PtyParts {
     pub control: PtyControl,
 }
 
+/// A handed terminal session and the data-pipe handles returned to the console host.
+pub struct HandoffPty {
+    parts: PtyParts,
+    input_peer: WindowsOwnedHandle,
+    output_peer: WindowsOwnedHandle,
+}
+
 pub struct PtyInput {
     handle: OwnedHandle,
 }
@@ -128,9 +137,18 @@ pub struct PtyOutput {
 }
 
 pub struct PtyControl {
-    pty_handle: Option<HPCON>,
+    backend: Option<PtyControlBackend>,
     process_handle: Option<OwnedHandle>,
     shutdown_called: bool,
+}
+
+enum PtyControlBackend {
+    ConPty(HPCON),
+    Handoff {
+        signal: OwnedHandle,
+        reference: OwnedHandle,
+        server: OwnedHandle,
+    },
 }
 
 struct Pipe {
@@ -203,12 +221,59 @@ impl PtyParts {
                     handle: pty_output.read,
                 },
                 control: PtyControl {
-                    pty_handle: Some(pty_handle),
+                    backend: Some(PtyControlBackend::ConPty(pty_handle)),
                     process_handle: Some(process_handle),
                     shutdown_called: false,
                 },
             })
         }
+    }
+
+    /// Create terminal data pipes and adopt the handles received from a handoff.
+    ///
+    /// `signal`, `reference`, `server`, and `client` must be independent
+    /// duplicates. This function takes their ownership. The returned input peer
+    /// is the read end used by the console host. The output peer is its write end.
+    pub fn from_handoff(
+        signal: WindowsOwnedHandle,
+        reference: WindowsOwnedHandle,
+        server: WindowsOwnedHandle,
+        client: WindowsOwnedHandle,
+    ) -> Result<HandoffPty, PtyError> {
+        let input = Pipe::create()?;
+        let output = Pipe::create()?;
+
+        Ok(HandoffPty {
+            parts: Self {
+                input: PtyInput {
+                    handle: input.write,
+                },
+                output: PtyOutput {
+                    handle: output.read,
+                },
+                control: PtyControl {
+                    backend: Some(PtyControlBackend::Handoff {
+                        signal: OwnedHandle::from_windows(signal),
+                        reference: OwnedHandle::from_windows(reference),
+                        server: OwnedHandle::from_windows(server),
+                    }),
+                    process_handle: Some(OwnedHandle::from_windows(client)),
+                    shutdown_called: false,
+                },
+            },
+            input_peer: input.read.into_windows(),
+            output_peer: output.write.into_windows(),
+        })
+    }
+}
+
+impl HandoffPty {
+    /// Split the session into the terminal side and console-host pipe ends.
+    ///
+    /// The caller must return `input_peer` as the host input handle. The caller
+    /// must return `output_peer` as the host output handle.
+    pub fn into_parts(self) -> (PtyParts, WindowsOwnedHandle, WindowsOwnedHandle) {
+        (self.parts, self.input_peer, self.output_peer)
     }
 }
 
@@ -273,6 +338,18 @@ impl OwnedHandle {
 
     fn raw(&self) -> HANDLE {
         self.handle
+    }
+
+    fn from_windows(handle: WindowsOwnedHandle) -> Self {
+        Self::new(handle.into_raw_handle())
+    }
+
+    fn into_windows(mut self) -> WindowsOwnedHandle {
+        let handle = self.handle;
+        self.handle = INVALID_HANDLE_VALUE;
+
+        // The handle came from CreatePipe and remains uniquely owned.
+        unsafe { WindowsOwnedHandle::from_raw_handle(handle) }
     }
 
     fn close(&mut self, operation: &'static str) -> Result<(), PtyError> {
@@ -418,35 +495,7 @@ fn create_process_with_pty(
 
 impl PtyInput {
     pub fn write_all(&mut self, data: &[u8]) -> Result<(), PtyError> {
-        let mut written_total = 0usize;
-
-        while written_total < data.len() {
-            let remaining = &data[written_total..];
-            let bytes_to_write = remaining.len().min(u32::MAX as usize) as u32;
-
-            unsafe {
-                let mut bytes_written = 0u32;
-                let result = WriteFile(
-                    self.handle.raw(),
-                    remaining.as_ptr(),
-                    bytes_to_write,
-                    &mut bytes_written,
-                    null_mut(),
-                );
-
-                if result == 0 {
-                    return Err(PtyError::io("write to ConPTY input pipe"));
-                }
-
-                if bytes_written == 0 {
-                    return Err(PtyError::ZeroLengthWrite);
-                }
-
-                written_total += bytes_written as usize;
-            }
-        }
-
-        Ok(())
+        write_all_to_handle(self.handle.raw(), data, "write to terminal input pipe")
     }
 }
 
@@ -490,20 +539,30 @@ impl PtyControl {
             return Err(PtyError::InvalidDimensions);
         }
 
-        unsafe {
-            let Some(pty_handle) = self.pty_handle else {
-                return Err(PtyError::from_io(
-                    "resize pseudoconsole",
-                    io::Error::other("pseudoconsole handle is closed"),
-                ));
-            };
-            let result = ResizePseudoConsole(pty_handle, size_to_coord(size));
-            if result != S_OK {
-                return Err(PtyError::io("resize pseudoconsole"));
-            }
+        let Some(backend) = &self.backend else {
+            return Err(PtyError::from_io(
+                "resize pseudoconsole",
+                io::Error::other("pseudoconsole handle is closed"),
+            ));
+        };
 
-            Ok(())
+        match backend {
+            PtyControlBackend::ConPty(pty_handle) => unsafe {
+                let result = ResizePseudoConsole(*pty_handle, size_to_coord(size));
+                if result != S_OK {
+                    return Err(PtyError::io("resize pseudoconsole"));
+                }
+            },
+            PtyControlBackend::Handoff { signal, .. } => {
+                let mut packet = [0u8; 6];
+                packet[0..2].copy_from_slice(&PTY_SIGNAL_RESIZE_WINDOW.to_le_bytes());
+                packet[2..4].copy_from_slice(&size.cols.to_le_bytes());
+                packet[4..6].copy_from_slice(&size.rows.to_le_bytes());
+                write_all_to_handle(signal.raw(), &packet, "write terminal resize signal")?;
+            }
         }
+
+        Ok(())
     }
 
     pub fn has_exited(&self) -> Result<bool, PtyError> {
@@ -544,15 +603,34 @@ impl PtyControl {
 
     fn close_handles(&mut self, allow_graceful_wait: bool) -> Result<(), PtyError> {
         let mut first_error = None;
+        let terminate_process = matches!(self.backend, Some(PtyControlBackend::ConPty(_)));
 
         unsafe {
-            if let Some(pty_handle) = self.pty_handle.take() {
-                ClosePseudoConsole(pty_handle);
+            match self.backend.take() {
+                Some(PtyControlBackend::ConPty(pty_handle)) => ClosePseudoConsole(pty_handle),
+                Some(PtyControlBackend::Handoff {
+                    mut signal,
+                    mut reference,
+                    mut server,
+                }) => {
+                    for (handle, operation) in [
+                        (&mut signal, "close handoff signal handle"),
+                        (&mut reference, "close handoff reference handle"),
+                        (&mut server, "close handoff server handle"),
+                    ] {
+                        if let Err(err) = handle.close(operation) {
+                            first_error.get_or_insert(err);
+                        }
+                    }
+                }
+                None => {}
             }
 
             if let Some(mut process_handle) = self.process_handle.take() {
                 let raw_process_handle = process_handle.raw();
-                if allow_graceful_wait {
+                if !terminate_process {
+                    // The console host owns a handed process. We only observe it.
+                } else if allow_graceful_wait {
                     match WaitForSingleObject(raw_process_handle, SHUTDOWN_WAIT_MS) {
                         WAIT_OBJECT_0 => {}
                         WAIT_TIMEOUT => {
@@ -609,6 +687,42 @@ fn size_to_coord(size: PtySize) -> COORD {
         X: size.cols as i16,
         Y: size.rows as i16,
     }
+}
+
+fn write_all_to_handle(
+    handle: HANDLE,
+    data: &[u8],
+    operation: &'static str,
+) -> Result<(), PtyError> {
+    let mut written_total = 0usize;
+
+    while written_total < data.len() {
+        let remaining = &data[written_total..];
+        let bytes_to_write = remaining.len().min(u32::MAX as usize) as u32;
+
+        unsafe {
+            let mut bytes_written = 0u32;
+            let result = WriteFile(
+                handle,
+                remaining.as_ptr(),
+                bytes_to_write,
+                &mut bytes_written,
+                null_mut(),
+            );
+
+            if result == 0 {
+                return Err(PtyError::io(operation));
+            }
+
+            if bytes_written == 0 {
+                return Err(PtyError::ZeroLengthWrite);
+            }
+
+            written_total += bytes_written as usize;
+        }
+    }
+
+    Ok(())
 }
 
 fn windows_application_name(launch: &LaunchSpec) -> Result<Option<Vec<u16>>, PtyError> {
@@ -735,9 +849,14 @@ fn nul_terminated_wide(value: &OsStr, field: &'static str) -> Result<Vec<u16>, P
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::windows::io::{AsRawHandle, RawHandle};
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
     use std::sync::mpsc;
     use std::thread;
     use std::time::{Duration, Instant};
+    use windows_sys::Win32::Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle};
+    use windows_sys::Win32::System::Threading::{CREATE_NO_WINDOW, GetCurrentProcess};
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -782,6 +901,35 @@ mod tests {
             "expected marker {marker:?}; output was {output:?}"
         );
         output
+    }
+
+    fn duplicate_handle(handle: RawHandle) -> WindowsOwnedHandle {
+        let process = unsafe { GetCurrentProcess() };
+        let mut duplicate = INVALID_HANDLE_VALUE;
+        let result = unsafe {
+            DuplicateHandle(
+                process,
+                handle,
+                process,
+                &mut duplicate,
+                0,
+                0,
+                DUPLICATE_SAME_ACCESS,
+            )
+        };
+        assert_ne!(
+            result,
+            0,
+            "duplicate handle: {}",
+            io::Error::last_os_error()
+        );
+
+        unsafe { WindowsOwnedHandle::from_raw_handle(duplicate) }
+    }
+
+    fn disposable_handle() -> WindowsOwnedHandle {
+        let pipe = Pipe::create().expect("create disposable handle");
+        pipe.read.into_windows()
     }
 
     #[test]
@@ -949,5 +1097,92 @@ mod tests {
             .write_all(command.as_bytes())
             .expect("write large input");
         control.shutdown().expect("shutdown shell");
+    }
+
+    #[test]
+    fn handed_session_uses_expected_pipe_directions_and_resize_packet() {
+        let signal_pipe = Pipe::create().expect("create signal pipe");
+        let signal = signal_pipe.write.into_windows();
+        let mut signal_reader = PtyOutput {
+            handle: signal_pipe.read,
+        };
+        let client = duplicate_handle(unsafe { GetCurrentProcess() });
+
+        let (mut parts, input_peer, output_peer) =
+            PtyParts::from_handoff(signal, disposable_handle(), disposable_handle(), client)
+                .expect("create handed session")
+                .into_parts();
+
+        parts
+            .input
+            .write_all(b"terminal-input")
+            .expect("write terminal input");
+        let mut input_buf = [0u8; 14];
+        let mut input_peer = PtyOutput {
+            handle: OwnedHandle::from_windows(input_peer),
+        };
+        assert_eq!(
+            input_peer.read(&mut input_buf).expect("read host input"),
+            PtyRead::Data(input_buf.len()),
+        );
+        assert_eq!(&input_buf, b"terminal-input");
+
+        write_all_to_handle(
+            output_peer.as_raw_handle(),
+            b"terminal-output",
+            "write host output",
+        )
+        .expect("write host output");
+        let mut output_buf = [0u8; 15];
+        assert_eq!(
+            parts
+                .output
+                .read(&mut output_buf)
+                .expect("read terminal output"),
+            PtyRead::Data(output_buf.len()),
+        );
+        assert_eq!(&output_buf, b"terminal-output");
+
+        parts
+            .control
+            .resize(PtySize::new(40, 120))
+            .expect("write resize packet");
+        let mut resize_packet = [0u8; 6];
+        assert_eq!(
+            signal_reader
+                .read(&mut resize_packet)
+                .expect("read resize packet"),
+            PtyRead::Data(resize_packet.len()),
+        );
+        assert_eq!(resize_packet, [8, 0, 120, 0, 40, 0]);
+
+        parts.control.shutdown().expect("shutdown handed session");
+    }
+
+    #[test]
+    fn handed_session_does_not_terminate_client_process() {
+        let mut child = Command::new("C:\\Windows\\System32\\cmd.exe");
+        child
+            .args(["/d", "/q", "/c", "ping -n 30 127.0.0.1 > nul"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW);
+        let mut child = child.spawn().expect("spawn handed client");
+        let client = duplicate_handle(child.as_raw_handle());
+
+        let signal_pipe = Pipe::create().expect("create signal pipe");
+        let signal = signal_pipe.write.into_windows();
+        let (mut parts, _input_peer, _output_peer) =
+            PtyParts::from_handoff(signal, disposable_handle(), disposable_handle(), client)
+                .expect("create handed session")
+                .into_parts();
+
+        parts.control.shutdown().expect("shutdown handed session");
+        let still_running = child.try_wait().expect("query handed client").is_none();
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert!(still_running, "shutdown terminated the handed client");
     }
 }
