@@ -62,7 +62,6 @@ struct TextureKey {
     generation: u64,
 }
 
-#[derive(Clone)]
 struct CachedTexture {
     image: Arc<RenderImage>,
     byte_len: usize,
@@ -105,7 +104,7 @@ impl GraphicsRenderer {
             let mut placements = graphics.placements(&mut self.iterator, PlacementLayer::All)?;
             while let Some(current) = placements.next() {
                 let placement = current.placement()?;
-                if placement.is_virtual || !placement.geometry.viewport_visible {
+                if placement.is_virtual {
                     continue;
                 }
 
@@ -138,7 +137,7 @@ impl GraphicsRenderer {
             }
         }
 
-        self.cache.finish_frame(&active_keys, &pending_textures)?;
+        self.cache.finish_frame(&active_keys, pending_textures)?;
 
         let mut frame = GraphicsFrame::default();
         for placement in pending_placements {
@@ -146,7 +145,6 @@ impl GraphicsRenderer {
                 .cache
                 .entries
                 .get(&placement.key)
-                .or_else(|| pending_textures.get(&placement.key))
                 .ok_or(Error::InvalidValue)?
                 .image
                 .clone();
@@ -216,7 +214,7 @@ impl TextureCache {
     fn finish_frame(
         &mut self,
         active_keys: &HashSet<TextureKey>,
-        pending: &HashMap<TextureKey, CachedTexture>,
+        pending: HashMap<TextureKey, CachedTexture>,
     ) -> Result<()> {
         self.entries.retain(|key, texture| {
             let keep = active_keys.contains(key);
@@ -227,7 +225,7 @@ impl TextureCache {
         });
 
         for (key, texture) in pending {
-            if self.entries.contains_key(key) {
+            if self.entries.contains_key(&key) {
                 continue;
             }
             let Some(next_len) = self.byte_len.checked_add(texture.byte_len) else {
@@ -236,7 +234,7 @@ impl TextureCache {
             if next_len > self.limit {
                 return Err(Error::OutOfMemory);
             }
-            self.entries.insert(*key, texture.clone());
+            self.entries.insert(key, texture);
             self.byte_len = next_len;
         }
         Ok(())

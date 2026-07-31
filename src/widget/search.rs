@@ -59,9 +59,7 @@ impl SearchOverlay {
             return Vec::new();
         }
         let visible_start = scrollbar.offset;
-        let visible_end = visible_start
-            .saturating_add(scrollbar.len)
-            .min(visible_start.saturating_add(u64::from(rows)));
+        let visible_end = visible_start.saturating_add(scrollbar.len.min(u64::from(rows)));
         let last_column = columns - 1;
         let mut highlights = Vec::new();
 

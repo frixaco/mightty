@@ -648,9 +648,7 @@ impl TerminalWidget {
         match event {
             PtyEvent::Output(data) => {
                 self.terminal.vt_write(&data);
-                if self.search.is_some() {
-                    self.schedule_search_step(cx);
-                }
+                self.schedule_search_step(cx);
                 if !self.semantic_commands_available {
                     self.semantic_commands_available =
                         self.terminal.has_semantic_prompt().unwrap_or(false);
