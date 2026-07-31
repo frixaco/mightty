@@ -5,7 +5,7 @@
 //! threads.
 
 use std::alloc::{Layout, alloc, dealloc};
-use std::ffi::{OsStr, c_void};
+use std::ffi::{OsStr, OsString, c_void};
 use std::io;
 use std::os::raw::c_uint;
 use std::os::windows::ffi::OsStrExt;
@@ -20,13 +20,15 @@ use windows_sys::Win32::System::Console::{
 };
 use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::Threading::{
-    CreateProcessW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT,
-    GetExitCodeProcess, InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
-    PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW,
-    STARTUPINFOW, TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
+    CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
+    EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, InitializeProcThreadAttributeList,
+    LPPROC_THREAD_ATTRIBUTE_LIST, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION,
+    STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW, TerminateProcess,
+    UpdateProcThreadAttribute, WaitForSingleObject,
 };
 
 use super::{PtyRead, PtySize};
+use crate::profile::LaunchSpec;
 
 const WAIT_FAILED: u32 = u32::MAX;
 const SHUTDOWN_WAIT_MS: u32 = 250;
@@ -59,6 +61,7 @@ pub enum PtyError {
     ProcessCreationFailed(u32),
     ProcessWaitFailed(u32),
     InvalidDimensions,
+    InvalidProcessInput(&'static str),
     ZeroLengthWrite,
 }
 
@@ -89,6 +92,7 @@ impl std::fmt::Display for PtyError {
                 write!(f, "wait for process failed with Windows status {code}")
             }
             Self::InvalidDimensions => write!(f, "invalid terminal dimensions"),
+            Self::InvalidProcessInput(field) => write!(f, "invalid process {field}"),
             Self::ZeroLengthWrite => write!(f, "write made no progress"),
         }
     }
@@ -148,14 +152,15 @@ impl PtyParts {
     /// Spawn a new shell process with split input, output, and control handles.
     ///
     /// ```no_run
-    /// use mightty::shell::{PtyParts, PtySize};
+    /// use mightty::{profile::LaunchSpec, shell::{PtyParts, PtySize}};
     ///
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// let _parts = PtyParts::spawn("cmd.exe", PtySize::new(24, 80))?;
+    /// let launch = LaunchSpec::new("cmd.exe");
+    /// let _parts = PtyParts::spawn(&launch, PtySize::new(24, 80))?;
     /// # Ok(())
     /// # }
     /// ```
-    pub fn spawn(command: &str, size: PtySize) -> Result<Self, PtyError> {
+    pub fn spawn(launch: &LaunchSpec, size: PtySize) -> Result<Self, PtyError> {
         if !size.is_valid() {
             return Err(PtyError::InvalidDimensions);
         }
@@ -182,7 +187,7 @@ impl PtyParts {
                 return Err(PtyError::io("create pseudoconsole"));
             }
 
-            let process_handle = match create_process_with_pty(command, pty_handle) {
+            let process_handle = match create_process_with_pty(launch, pty_handle) {
                 Ok(handle) => handle,
                 Err(err) => {
                     ClosePseudoConsole(pty_handle);
@@ -292,18 +297,18 @@ impl Drop for OwnedHandle {
     }
 }
 
-fn create_process_with_pty(command: &str, pty_handle: HPCON) -> Result<OwnedHandle, PtyError> {
-    let mut cmd_wide: Vec<u16> = OsStr::new(command).encode_wide().chain(Some(0)).collect();
-    let application = application_name(command);
-    let application_wide = application.as_deref().map(|application| {
-        OsStr::new(application)
-            .encode_wide()
-            .chain(Some(0))
-            .collect::<Vec<u16>>()
-    });
-    let application_ptr = application_wide
+fn create_process_with_pty(
+    launch: &LaunchSpec,
+    pty_handle: HPCON,
+) -> Result<OwnedHandle, PtyError> {
+    let application_wide = windows_application_name(launch)?;
+    let mut command_line = windows_command_line(launch)?;
+    let environment = windows_environment_block(launch)?;
+    let working_directory = launch
+        .working_directory
         .as_ref()
-        .map_or(null_mut(), |application| application.as_ptr() as *mut _);
+        .map(|directory| nul_terminated_wide(directory.as_os_str(), "working directory"))
+        .transpose()?;
 
     let mut startup_info: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
     startup_info.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
@@ -366,16 +371,28 @@ fn create_process_with_pty(command: &str, pty_handle: HPCON) -> Result<OwnedHand
     startup_info.lpAttributeList = attr_list;
 
     let mut process_info: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+    let creation_flags = EXTENDED_STARTUPINFO_PRESENT
+        | if environment.is_some() {
+            CREATE_UNICODE_ENVIRONMENT
+        } else {
+            0
+        };
     let result = unsafe {
         CreateProcessW(
-            application_ptr,
-            cmd_wide.as_mut_ptr(),
+            application_wide
+                .as_ref()
+                .map_or(null_mut(), |application| application.as_ptr() as *mut u16),
+            command_line.as_mut_ptr(),
             null_mut(),
             null_mut(),
             0,
-            EXTENDED_STARTUPINFO_PRESENT,
-            null_mut(),
-            null_mut(),
+            creation_flags,
+            environment.as_ref().map_or(null_mut(), |environment| {
+                environment.as_ptr() as *mut c_void
+            }),
+            working_directory
+                .as_ref()
+                .map_or(null_mut(), |directory| directory.as_ptr() as *mut u16),
             (&mut startup_info as *mut STARTUPINFOEXW).cast::<STARTUPINFOW>(),
             &mut process_info,
         )
@@ -594,19 +611,125 @@ fn size_to_coord(size: PtySize) -> COORD {
     }
 }
 
-fn application_name(command: &str) -> Option<String> {
-    let trimmed = command.trim_start();
-    if trimmed.is_empty() {
-        return None;
+fn windows_application_name(launch: &LaunchSpec) -> Result<Option<Vec<u16>>, PtyError> {
+    let executable: Vec<u16> = launch.executable().encode_wide().collect();
+    if executable.is_empty() || executable.contains(&0) {
+        return Err(PtyError::InvalidProcessInput("executable"));
     }
 
-    let first = if let Some(rest) = trimmed.strip_prefix('"') {
-        rest.split('"').next()?
-    } else {
-        trimmed.split_whitespace().next()?
-    };
+    // A null application name makes CreateProcessW search for a bare file name.
+    // A path remains explicit and avoids parsing it from the command line.
+    executable
+        .iter()
+        .any(|value| matches!(*value, 0x2f | 0x5c))
+        .then(|| nul_terminated_wide(launch.executable(), "executable"))
+        .transpose()
+}
 
-    (first.contains('\\') || first.contains('/')).then(|| first.to_string())
+fn windows_command_line(launch: &LaunchSpec) -> Result<Vec<u16>, PtyError> {
+    if launch.executable().is_empty() {
+        return Err(PtyError::InvalidProcessInput("executable"));
+    }
+
+    let mut command_line = Vec::new();
+    push_windows_argument(&mut command_line, launch.executable())?;
+    for argument in &launch.arguments {
+        command_line.push(u16::from(b' '));
+        push_windows_argument(&mut command_line, argument)?;
+    }
+    command_line.push(0);
+    Ok(command_line)
+}
+
+// Windows programs usually parse CreateProcessW's command line with the CRT
+// rules. Backslashes before quotes need doubling so each argument round-trips.
+fn push_windows_argument(output: &mut Vec<u16>, argument: &OsStr) -> Result<(), PtyError> {
+    let argument: Vec<u16> = argument.encode_wide().collect();
+    if argument.contains(&0) {
+        return Err(PtyError::InvalidProcessInput("argument"));
+    }
+    let quoted = argument.is_empty()
+        || argument
+            .iter()
+            .any(|value| matches!(*value, 0x09 | 0x20 | 0x22));
+    if !quoted {
+        output.extend(argument);
+        return Ok(());
+    }
+
+    output.push(u16::from(b'"'));
+    let mut backslashes = 0;
+    for value in argument {
+        if value == u16::from(b'\\') {
+            backslashes += 1;
+            continue;
+        }
+        if value == u16::from(b'"') {
+            output.extend(std::iter::repeat_n(u16::from(b'\\'), backslashes * 2 + 1));
+            output.push(value);
+        } else {
+            output.extend(std::iter::repeat_n(u16::from(b'\\'), backslashes));
+            output.push(value);
+        }
+        backslashes = 0;
+    }
+    output.extend(std::iter::repeat_n(u16::from(b'\\'), backslashes * 2));
+    output.push(u16::from(b'"'));
+    Ok(())
+}
+
+fn windows_environment_block(launch: &LaunchSpec) -> Result<Option<Vec<u16>>, PtyError> {
+    if launch.environment.is_empty() {
+        return Ok(None);
+    }
+
+    let mut environment: Vec<(OsString, OsString)> = std::env::vars_os().collect();
+    for (key, value) in &launch.environment {
+        validate_environment_key(key)?;
+        environment.retain(|(existing, _)| !existing.eq_ignore_ascii_case(key));
+        environment.push((key.clone(), value.clone()));
+    }
+    environment.sort_by(|(left, _), (right, _)| {
+        left.to_string_lossy()
+            .to_ascii_lowercase()
+            .cmp(&right.to_string_lossy().to_ascii_lowercase())
+    });
+
+    let mut block = Vec::new();
+    for (key, value) in environment {
+        append_environment_value(&mut block, &key)?;
+        block.push(u16::from(b'='));
+        append_environment_value(&mut block, &value)?;
+        block.push(0);
+    }
+    block.push(0);
+    Ok(Some(block))
+}
+
+fn validate_environment_key(key: &OsStr) -> Result<(), PtyError> {
+    let wide: Vec<u16> = key.encode_wide().collect();
+    if wide.is_empty() || wide.contains(&0) || wide.contains(&u16::from(b'=')) {
+        return Err(PtyError::InvalidProcessInput("environment key"));
+    }
+    Ok(())
+}
+
+fn append_environment_value(output: &mut Vec<u16>, value: &OsStr) -> Result<(), PtyError> {
+    let wide: Vec<u16> = value.encode_wide().collect();
+    if wide.contains(&0) {
+        return Err(PtyError::InvalidProcessInput("environment value"));
+    }
+    output.extend(wide);
+    Ok(())
+}
+
+fn nul_terminated_wide(value: &OsStr, field: &'static str) -> Result<Vec<u16>, PtyError> {
+    let mut wide: Vec<u16> = value.encode_wide().collect();
+    if wide.is_empty() || wide.contains(&0) {
+        return Err(PtyError::InvalidProcessInput(field));
+    }
+    wide.push(0);
+    Ok(wide)
 }
 
 #[cfg(test)]
@@ -619,8 +742,8 @@ mod tests {
     const TEST_TIMEOUT: Duration = Duration::from_secs(3);
 
     fn spawn_test_cmd() -> PtyParts {
-        PtyParts::spawn("C:\\Windows\\System32\\cmd.exe /d /q", PtySize::new(24, 80))
-            .expect("spawn cmd.exe")
+        let launch = LaunchSpec::new("C:\\Windows\\System32\\cmd.exe").with_arguments(["/d", "/q"]);
+        PtyParts::spawn(&launch, PtySize::new(24, 80)).expect("spawn cmd.exe")
     }
 
     fn read_until(mut output: PtyOutput, marker: &'static str) -> mpsc::Receiver<String> {
@@ -663,17 +786,63 @@ mod tests {
 
     #[test]
     fn spawn_cmd() {
-        let shell = PtyParts::spawn("cmd.exe", PtySize::new(24, 80));
+        let launch = LaunchSpec::new("cmd.exe");
+        let shell = PtyParts::spawn(&launch, PtySize::new(24, 80));
         assert!(shell.is_ok(), "failed to spawn cmd.exe: {:?}", shell.err());
     }
 
     #[test]
     fn invalid_dimensions() {
-        let result = PtyParts::spawn("cmd.exe", PtySize::new(0, 80));
+        let launch = LaunchSpec::new("cmd.exe");
+        let result = PtyParts::spawn(&launch, PtySize::new(0, 80));
         assert!(matches!(result, Err(PtyError::InvalidDimensions)));
 
-        let result = PtyParts::spawn("cmd.exe", PtySize::new(24, 0));
+        let result = PtyParts::spawn(&launch, PtySize::new(24, 0));
         assert!(matches!(result, Err(PtyError::InvalidDimensions)));
+    }
+
+    #[test]
+    fn quotes_windows_arguments_without_shell_parsing() {
+        let launch = LaunchSpec::new("C:\\Program Files\\pwsh.exe").with_arguments([
+            "-NoLogo",
+            "hello world",
+            "C:\\path with space\\",
+        ]);
+        let command_line = windows_command_line(&launch).unwrap();
+        let command_line = String::from_utf16(&command_line[..command_line.len() - 1]).unwrap();
+
+        assert_eq!(
+            command_line,
+            r#""C:\Program Files\pwsh.exe" -NoLogo "hello world" "C:\path with space\\""#,
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_environment_keys() {
+        let launch = LaunchSpec::new("cmd.exe").with_environment([("BAD=KEY", "value")]);
+        assert!(matches!(
+            windows_environment_block(&launch),
+            Err(PtyError::InvalidProcessInput("environment key"))
+        ));
+    }
+
+    #[test]
+    fn passes_profile_environment_to_the_child() {
+        let launch = LaunchSpec::new("C:\\Windows\\System32\\cmd.exe")
+            .with_arguments(["/d", "/q"])
+            .with_environment([("MIGHTTY_PROFILE_TEST", "works")]);
+        let PtyParts {
+            mut input,
+            output,
+            mut control,
+        } = PtyParts::spawn(&launch, PtySize::new(24, 80)).expect("spawn cmd.exe");
+        let output_rx = read_until(output, "mightty-env-works");
+
+        input
+            .write_all(b"echo mightty-env-%MIGHTTY_PROFILE_TEST%\r\n")
+            .expect("write environment command");
+        assert_marker(output_rx, "mightty-env-works");
+        control.shutdown().expect("shutdown shell");
     }
 
     #[test]

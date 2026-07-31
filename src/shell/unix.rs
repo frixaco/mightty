@@ -3,15 +3,20 @@
 //! Manages pseudo-terminal connection between UI and shell processes on Unix.
 
 use std::cell::Cell;
-use std::ffi::CString;
+use std::collections::BTreeMap;
+use std::ffi::{CString, OsStr, OsString};
 use std::io;
 use std::mem::MaybeUninit;
 use std::os::fd::RawFd;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
 use std::ptr;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use super::{PtyRead, PtySize};
+use crate::profile::LaunchSpec;
 
 const SHUTDOWN_WAIT: Duration = Duration::from_millis(250);
 const SHUTDOWN_POLL: Duration = Duration::from_millis(10);
@@ -24,8 +29,7 @@ pub enum PtyError {
         source: io::Error,
     },
     InvalidDimensions,
-    EmptyCommand,
-    CommandContainsNul,
+    InvalidProcessInput(&'static str),
     ZeroLengthWrite,
 }
 
@@ -47,8 +51,7 @@ impl std::fmt::Display for PtyError {
         match self {
             Self::Io { operation, source } => write!(f, "{operation} failed: {source}"),
             Self::InvalidDimensions => write!(f, "invalid terminal dimensions"),
-            Self::EmptyCommand => write!(f, "shell command is empty"),
-            Self::CommandContainsNul => write!(f, "shell command contains a NUL byte"),
+            Self::InvalidProcessInput(field) => write!(f, "invalid process {field}"),
             Self::ZeroLengthWrite => write!(f, "write made no progress"),
         }
     }
@@ -92,21 +95,11 @@ pub struct PtyControl {
 }
 
 impl PtyParts {
-    pub fn spawn(command: &str, size: PtySize) -> Result<Self, PtyError> {
+    pub fn spawn(launch: &LaunchSpec, size: PtySize) -> Result<Self, PtyError> {
         if !size.is_valid() {
             return Err(PtyError::InvalidDimensions);
         }
-
-        let command = command.trim();
-        if command.is_empty() {
-            return Err(PtyError::EmptyCommand);
-        }
-
-        let shell = CString::new("/bin/sh").expect("static shell path has no NUL");
-        let shell_name = CString::new("sh").expect("static shell name has no NUL");
-        let shell_arg = CString::new("-lc").expect("static shell arg has no NUL");
-        let command =
-            CString::new(format!("exec {command}")).map_err(|_| PtyError::CommandContainsNul)?;
+        let launch = ResolvedUnixLaunch::new(launch)?;
         let mut winsize = winsize_from_size(size);
 
         let mut master_fd = INVALID_FD;
@@ -125,12 +118,15 @@ impl PtyParts {
 
         if child_pid == 0 {
             unsafe {
-                libc::execl(
-                    shell.as_ptr(),
-                    shell_name.as_ptr(),
-                    shell_arg.as_ptr(),
-                    command.as_ptr(),
-                    ptr::null::<libc::c_char>(),
+                if let Some(directory) = &launch.working_directory
+                    && libc::chdir(directory.as_ptr()) != 0
+                {
+                    libc::_exit(126);
+                }
+                libc::execve(
+                    launch.executable.as_ptr(),
+                    launch.argument_pointers.as_ptr(),
+                    launch.environment_pointers.as_ptr(),
                 );
                 libc::_exit(127);
             }
@@ -384,6 +380,107 @@ pub fn is_conpty_available() -> bool {
     true
 }
 
+struct ResolvedUnixLaunch {
+    executable: CString,
+    _arguments: Vec<CString>,
+    argument_pointers: Vec<*const libc::c_char>,
+    _environment: Vec<CString>,
+    environment_pointers: Vec<*const libc::c_char>,
+    working_directory: Option<CString>,
+}
+
+impl ResolvedUnixLaunch {
+    fn new(launch: &LaunchSpec) -> Result<Self, PtyError> {
+        let executable_path = resolve_executable(launch)?;
+        let executable = unix_cstring(executable_path.as_os_str(), "executable")?;
+
+        let mut arguments = Vec::with_capacity(launch.arguments.len() + 1);
+        arguments.push(unix_cstring(executable_path.as_os_str(), "executable")?);
+        for argument in &launch.arguments {
+            arguments.push(unix_cstring(argument, "argument")?);
+        }
+        let mut argument_pointers = arguments
+            .iter()
+            .map(|argument| argument.as_ptr())
+            .collect::<Vec<_>>();
+        argument_pointers.push(ptr::null());
+
+        let mut environment = std::env::vars_os().collect::<BTreeMap<OsString, OsString>>();
+        environment.extend(launch.environment.clone());
+        let environment = environment
+            .into_iter()
+            .map(|(key, value)| unix_environment_entry(&key, &value))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut environment_pointers = environment
+            .iter()
+            .map(|entry| entry.as_ptr())
+            .collect::<Vec<_>>();
+        environment_pointers.push(ptr::null());
+
+        let working_directory = launch
+            .working_directory
+            .as_deref()
+            .map(|path| unix_cstring(path.as_os_str(), "working directory"))
+            .transpose()?;
+
+        Ok(Self {
+            executable,
+            _arguments: arguments,
+            argument_pointers,
+            _environment: environment,
+            environment_pointers,
+            working_directory,
+        })
+    }
+}
+
+fn resolve_executable(launch: &LaunchSpec) -> Result<PathBuf, PtyError> {
+    let executable = launch.executable.as_os_str();
+    if executable.is_empty() || executable.as_bytes().contains(&0) {
+        return Err(PtyError::InvalidProcessInput("executable"));
+    }
+    if executable.as_bytes().contains(&b'/') {
+        return Ok(launch.executable.clone());
+    }
+
+    let path = launch
+        .environment
+        .get(OsStr::new("PATH"))
+        .cloned()
+        .or_else(|| std::env::var_os("PATH"))
+        .unwrap_or_default();
+    for directory in std::env::split_paths(&path) {
+        let candidate = directory.join(&launch.executable);
+        let Ok(metadata) = candidate.metadata() else {
+            continue;
+        };
+        if metadata.is_file() && metadata.permissions().mode() & 0o111 != 0 {
+            return Ok(candidate);
+        }
+    }
+
+    Err(PtyError::InvalidProcessInput("executable"))
+}
+
+fn unix_environment_entry(key: &OsStr, value: &OsStr) -> Result<CString, PtyError> {
+    if key.is_empty() || key.as_bytes().contains(&b'=') || key.as_bytes().contains(&0) {
+        return Err(PtyError::InvalidProcessInput("environment key"));
+    }
+    if value.as_bytes().contains(&0) {
+        return Err(PtyError::InvalidProcessInput("environment value"));
+    }
+
+    let mut entry = Vec::with_capacity(key.as_bytes().len() + value.as_bytes().len() + 1);
+    entry.extend_from_slice(key.as_bytes());
+    entry.push(b'=');
+    entry.extend_from_slice(value.as_bytes());
+    CString::new(entry).map_err(|_| PtyError::InvalidProcessInput("environment"))
+}
+
+fn unix_cstring(value: &OsStr, field: &'static str) -> Result<CString, PtyError> {
+    CString::new(value.as_bytes()).map_err(|_| PtyError::InvalidProcessInput(field))
+}
+
 fn duplicate_fd(fd: RawFd, operation: &'static str) -> Result<RawFd, PtyError> {
     let duplicated = unsafe { libc::dup(fd) };
     if duplicated < 0 {
@@ -428,7 +525,7 @@ mod tests {
     const TEST_TIMEOUT: Duration = Duration::from_secs(3);
 
     fn spawn_test_shell() -> PtyParts {
-        PtyParts::spawn("/bin/sh", PtySize::new(24, 80)).expect("spawn /bin/sh")
+        PtyParts::spawn(&LaunchSpec::new("/bin/sh"), PtySize::new(24, 80)).expect("spawn /bin/sh")
     }
 
     fn read_until(mut output: PtyOutput, marker: &'static str) -> mpsc::Receiver<String> {
@@ -472,17 +569,35 @@ mod tests {
 
     #[test]
     fn spawn_shell() {
-        let shell = PtyParts::spawn("/bin/sh", PtySize::new(24, 80));
+        let shell = PtyParts::spawn(&LaunchSpec::new("/bin/sh"), PtySize::new(24, 80));
         assert!(shell.is_ok(), "failed to spawn /bin/sh: {:?}", shell.err());
     }
 
     #[test]
     fn invalid_dimensions() {
-        let result = PtyParts::spawn("/bin/sh", PtySize::new(0, 80));
+        let launch = LaunchSpec::new("/bin/sh");
+        let result = PtyParts::spawn(&launch, PtySize::new(0, 80));
         assert!(matches!(result, Err(PtyError::InvalidDimensions)));
 
-        let result = PtyParts::spawn("/bin/sh", PtySize::new(24, 0));
+        let result = PtyParts::spawn(&launch, PtySize::new(24, 0));
         assert!(matches!(result, Err(PtyError::InvalidDimensions)));
+    }
+
+    #[test]
+    fn passes_arguments_environment_and_working_directory() {
+        let launch = LaunchSpec::new("/bin/sh")
+            .with_arguments(["-c", "printf '%s:%s' \"$MIGHTTY_TEST\" \"$PWD\""])
+            .with_environment([("MIGHTTY_TEST", "ready")])
+            .with_working_directory("/tmp");
+        let PtyParts {
+            input: _input,
+            output,
+            mut control,
+        } = PtyParts::spawn(&launch, PtySize::new(24, 80)).expect("spawn configured shell");
+
+        let output = assert_marker(read_until(output, "ready:/tmp"), "ready:/tmp");
+        assert!(output.contains("ready:/tmp"));
+        control.shutdown().expect("shutdown shell");
     }
 
     #[test]

@@ -4,6 +4,7 @@ use std::sync::{
 };
 use std::thread::JoinHandle;
 
+use crate::profile::LaunchSpec;
 use crate::shell::PtySize;
 #[cfg(any(windows, unix))]
 use crate::shell::{PtyParts, PtyRead};
@@ -46,12 +47,12 @@ pub(super) struct PtyWorker;
 #[cfg(any(windows, unix))]
 impl PtyWorker {
     pub(super) fn spawn(
-        shell_cmd: String,
+        launch: LaunchSpec,
         rows: u16,
         cols: u16,
         exit_flag: Arc<AtomicBool>,
     ) -> Result<(Self, flume::Receiver<PtyEvent>), crate::shell::PtyError> {
-        let parts = PtyParts::spawn(&shell_cmd, PtySize::new(rows, cols))?;
+        let parts = PtyParts::spawn(&launch, PtySize::new(rows, cols))?;
         let (command_tx, command_rx) = flume::unbounded::<PtyCommand>();
         let (event_tx, event_rx) = flume::bounded::<PtyEvent>(OUTPUT_QUEUE_CAPACITY);
 

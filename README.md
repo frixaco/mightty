@@ -88,6 +88,10 @@ The default shell is `pwsh.exe` on Windows. Unix uses `$SHELL`, falling back to
 Terminal I/O is wake-driven. `TerminalWidget` owns a `PtyWorker`; the platform
 shell modules own the raw PTY handles.
 
+`LaunchSpec` keeps the executable, arguments, working directory, and environment
+separate. Both platform shell modules use these values without a shell command
+string.
+
 On Windows, `PtyParts::spawn` creates split ConPTY handles:
 
 - `PtyInput::write_all(&[u8])` sends command input and terminal responses.

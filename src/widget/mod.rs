@@ -20,6 +20,7 @@ use crate::ghostty::{
     style::{Palette, RgbColor},
 };
 use crate::pane_container::{CopySelection, PasteClipboard, shortcut_action};
+use crate::profile::LaunchSpec;
 use crate::shell::PtySize;
 use gpui::{
     Bounds, ClipboardItem, Context, FocusHandle, KeyDownEvent, KeyUpEvent, Modifiers,
@@ -65,7 +66,7 @@ pub enum TerminalClipboardPolicy {
 /// Terminal widget configuration
 #[derive(Debug, Clone)]
 pub struct TerminalConfig {
-    pub shell: String,
+    pub launch: LaunchSpec,
     pub initial_rows: u16,
     pub initial_cols: u16,
     pub scrollback: usize,
@@ -78,7 +79,7 @@ pub struct TerminalConfig {
 impl Default for TerminalConfig {
     fn default() -> Self {
         Self {
-            shell: default_shell(),
+            launch: LaunchSpec::default_shell(),
             initial_rows: 24,
             initial_cols: 80,
             scrollback: 1000,
@@ -88,21 +89,6 @@ impl Default for TerminalConfig {
             terminal_clipboard_policy: TerminalClipboardPolicy::Deny,
         }
     }
-}
-
-#[cfg(windows)]
-fn default_shell() -> String {
-    "pwsh.exe".to_string()
-}
-
-#[cfg(unix)]
-fn default_shell() -> String {
-    std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
-}
-
-#[cfg(not(any(windows, unix)))]
-fn default_shell() -> String {
-    String::new()
 }
 
 pub struct TerminalWidget {
@@ -190,7 +176,7 @@ impl TerminalWidget {
         #[cfg(any(windows, unix))]
         let (pty_worker, pty_event_rx, pty_tx) = {
             match PtyWorker::spawn(
-                config.shell.clone(),
+                config.launch.clone(),
                 config.initial_rows,
                 config.initial_cols,
                 Arc::clone(&exit_flag),
