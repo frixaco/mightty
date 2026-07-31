@@ -1,8 +1,8 @@
 use std::ffi::c_void;
 use std::io::Cursor;
 use std::marker::PhantomData;
-use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::mem::size_of;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::OnceLock;
