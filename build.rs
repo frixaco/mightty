@@ -19,8 +19,10 @@ fn main() {
     println!("cargo:rerun-if-changed=ghostty/build.zig.zon");
     println!("cargo:rerun-if-changed=ghostty/include");
     println!("cargo:rerun-if-changed=ghostty/src");
+    println!("cargo:rerun-if-changed=tools/ghostty-search");
 
     require_matching_bindings(&ghostty_dir, &bindings_version);
+    build_and_link_search(&repo_dir);
     build_and_link_ghostty(&ghostty_dir);
 }
 
@@ -78,7 +80,6 @@ fn build_and_link_ghostty(ghostty_dir: &Path) {
     let install_dir = out_dir.join("ghostty-install");
     let cache_dir = out_dir.join("ghostty-zig-cache");
     let target = env::var("TARGET").expect("missing TARGET");
-    let host = env::var("HOST").expect("missing HOST");
     let optimize = optimize_mode();
     let zig = env::var_os("ZIG").unwrap_or_else(|| OsString::from("zig"));
 
@@ -93,10 +94,8 @@ fn build_and_link_ghostty(ghostty_dir: &Path) {
         .arg(&install_dir)
         .arg("--cache-dir")
         .arg(&cache_dir)
+        .arg(format!("-Dtarget={}", zig_target(&target)))
         .current_dir(ghostty_dir);
-    if target != host {
-        command.arg(format!("-Dtarget={}", zig_target(&target)));
-    }
     run(&mut command, "build Ghostty's libghostty-vt with Zig");
 
     let installed_lib_dir = install_dir.join("lib");
@@ -133,6 +132,46 @@ fn build_and_link_ghostty(ghostty_dir: &Path) {
         );
     }
     println!("cargo:rustc-link-lib=static=ghostty-vt");
+}
+
+fn build_and_link_search(repo_dir: &Path) {
+    let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("missing OUT_DIR"));
+    let install_dir = out_dir.join("ghostty-search-install");
+    let cache_dir = out_dir.join("ghostty-search-zig-cache");
+    let target = env::var("TARGET").expect("missing TARGET");
+    let zig = env::var_os("ZIG").unwrap_or_else(|| OsString::from("zig"));
+
+    let mut command = Command::new(&zig);
+    command
+        .arg("build")
+        .arg(format!("-Doptimize={}", optimize_mode()))
+        .arg("--prefix")
+        .arg(&install_dir)
+        .arg("--cache-dir")
+        .arg(&cache_dir)
+        .arg(format!("-Dtarget={}", zig_target(&target)))
+        .current_dir(repo_dir.join("tools").join("ghostty-search"));
+    run(
+        &mut command,
+        "build Mightty's Ghostty search bridge with Zig",
+    );
+
+    let installed_lib_dir = install_dir.join("lib");
+    let library = if target.contains("windows") {
+        installed_lib_dir.join("mightty-ghostty-search.lib")
+    } else {
+        installed_lib_dir.join("libmightty-ghostty-search.a")
+    };
+    assert!(
+        library.is_file(),
+        "Ghostty search bridge did not produce {}",
+        library.display()
+    );
+    println!(
+        "cargo:rustc-link-search=native={}",
+        installed_lib_dir.display()
+    );
+    println!("cargo:rustc-link-lib=static=mightty-ghostty-search");
 }
 
 fn optimize_mode() -> &'static str {

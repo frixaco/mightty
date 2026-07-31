@@ -4,6 +4,7 @@
 //! private. Callers use terminal concepts and never handle C pointers.
 
 mod error;
+mod search;
 mod selection;
 mod semantic;
 mod terminal;
@@ -31,6 +32,7 @@ mod ffi;
 
 pub use error::{Error, Result};
 pub use render::RenderState;
+pub use search::{SearchDirection, SearchPoint, SearchProgress, SearchRange};
 pub use selection::{SelectionDrag, SelectionGeometry, SelectionPoint, SelectionPress};
 pub use semantic::PromptDirection;
 pub use terminal::{

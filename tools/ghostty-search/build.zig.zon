@@ -1,0 +1,12 @@
+.{
+    .name = .mightty_ghostty_search,
+    .version = "0.1.0",
+    .fingerprint = 0xd195e7c3487eb10d,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .ghostty = .{
+            .path = "../../ghostty",
+        },
+    },
+    .paths = .{""},
+}

@@ -2689,3 +2689,61 @@ unsafe extern "C" {
 unsafe extern "C" {
     pub fn ghostty_unicode_grapheme_width(cps: *const u32, len: usize, width: *mut u8) -> usize;
 }
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct MighttyGhosttySearchImpl {
+    _unused: [u8; 0],
+}
+pub type MighttyGhosttySearch = *mut MighttyGhosttySearchImpl;
+pub mod MighttyGhosttySearchStep {
+    pub type Type = ::std::os::raw::c_int;
+    pub const PENDING: Type = 0;
+    pub const COMPLETE: Type = 1;
+    pub const MAX_VALUE: Type = 2147483647;
+}
+pub mod MighttyGhosttySearchDirection {
+    pub type Type = ::std::os::raw::c_int;
+    pub const NEXT: Type = 0;
+    pub const PREVIOUS: Type = 1;
+    pub const MAX_VALUE: Type = 2147483647;
+}
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone)]
+pub struct MighttyGhosttySearchRange {
+    pub start_x: u16,
+    pub start_y: u32,
+    pub end_x: u16,
+    pub end_y: u32,
+}
+unsafe extern "C" {
+    pub fn mightty_ghostty_search_new(
+        terminal: Terminal,
+        query: *const u8,
+        query_len: usize,
+        out_search: *mut MighttyGhosttySearch,
+    ) -> Result::Type;
+}
+unsafe extern "C" {
+    pub fn mightty_ghostty_search_free(search: MighttyGhosttySearch);
+}
+unsafe extern "C" {
+    pub fn mightty_ghostty_search_step(
+        search: MighttyGhosttySearch,
+        out_step: *mut MighttyGhosttySearchStep::Type,
+    ) -> Result::Type;
+}
+unsafe extern "C" {
+    pub fn mightty_ghostty_search_ranges(
+        search: MighttyGhosttySearch,
+        ranges: *mut MighttyGhosttySearchRange,
+        capacity: usize,
+        out_len: *mut usize,
+    ) -> Result::Type;
+}
+unsafe extern "C" {
+    pub fn mightty_ghostty_search_select(
+        search: MighttyGhosttySearch,
+        direction: MighttyGhosttySearchDirection::Type,
+        out_range: *mut MighttyGhosttySearchRange,
+    ) -> Result::Type;
+}

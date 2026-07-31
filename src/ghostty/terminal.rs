@@ -6,6 +6,7 @@ use std::ptr::NonNull;
 use std::rc::Rc;
 
 use crate::ghostty::error::{from_result, from_result_with_len};
+use crate::ghostty::search::SearchState;
 use crate::ghostty::selection::{SelectionDrag, SelectionGesture, SelectionPress, SelectionUpdate};
 use crate::ghostty::style::{Palette, RgbColor};
 use crate::ghostty::{Error, Result, ffi};
@@ -16,6 +17,7 @@ use crate::ghostty::{Error, Result, ffi};
 /// all render/input helpers that observe it must stay on their creating thread.
 pub struct Terminal {
     raw: NonNull<ffi::TerminalImpl>,
+    pub(crate) search: Option<SearchState>,
     selection_gesture: SelectionGesture,
     callbacks: Box<CallbackState>,
     _not_send_or_sync: PhantomData<Rc<()>>,
@@ -107,6 +109,7 @@ impl Terminal {
         };
         let mut terminal = Self {
             raw,
+            search: None,
             selection_gesture,
             callbacks: Box::new(CallbackState::default()),
             _not_send_or_sync: PhantomData,
@@ -464,6 +467,7 @@ impl Terminal {
 
 impl Drop for Terminal {
     fn drop(&mut self) {
+        self.search.take();
         self.selection_gesture.deinit(self.raw.as_ptr());
         unsafe {
             ffi::ghostty_terminal_free(self.as_raw());

@@ -18,6 +18,12 @@ fn main() {
     let ghostty_dir = repo_dir.join("ghostty");
     let include_dir = ghostty_dir.join("include");
     let header = include_dir.join("ghostty").join("vt.h");
+    let search_header = repo_dir
+        .join("tools")
+        .join("ghostty-search")
+        .join("include")
+        .join("mightty")
+        .join("ghostty_search.h");
     let output = repo_dir.join("src").join("ghostty").join("ffi.rs");
     let version_output = repo_dir
         .join("src")
@@ -34,10 +40,14 @@ fn main() {
     let fingerprint = fingerprint::header_fingerprint(&include_dir);
     let bindings = bindgen::Builder::default()
         .header(header.to_string_lossy())
+        .header(search_header.to_string_lossy())
         .clang_arg(format!("-I{}", include_dir.to_string_lossy()))
         .allowlist_function("[Gg]hostty.*")
+        .allowlist_function("mightty_ghostty.*")
         .allowlist_type("[Gg]hostty.*")
+        .allowlist_type("MighttyGhostty.*")
         .allowlist_var("GHOSTTY_.*")
+        .allowlist_var("MIGHTTY_GHOSTTY_.*")
         .generate_cstr(true)
         .generate_comments(false)
         .derive_default(true)
@@ -107,6 +117,11 @@ const PREFIXES: &[(&str, &str)] = &[
     (
         "GhosttySelectionGestureEventOption",
         "GHOSTTY_SELECTION_GESTURE_EVENT_OPT",
+    ),
+    ("MighttyGhosttySearchStep", "MIGHTTY_GHOSTTY_SEARCH_STEP"),
+    (
+        "MighttyGhosttySearchDirection",
+        "MIGHTTY_GHOSTTY_SEARCH_DIRECTION",
     ),
 ];
 
