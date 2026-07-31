@@ -3,6 +3,8 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+#[cfg(test)]
+use gpui::InteractiveElement;
 use gpui::{
     AnyElement, IntoElement, ObjectFit, ParentElement, Pixels, RenderImage, Styled, StyledImage,
     div, img, px,
@@ -182,23 +184,42 @@ impl GraphicsRenderer {
 impl RenderedPlacement {
     pub(super) fn into_element(self) -> AnyElement {
         let layout = self.layout;
-        div()
+        let image = img(self.image)
+            .absolute()
+            .left(px(layout.image_left))
+            .top(px(layout.image_top))
+            .w(px(layout.image_width))
+            .h(px(layout.image_height))
+            .object_fit(ObjectFit::Fill);
+        #[cfg(test)]
+        let image = image.debug_selector(|| {
+            format!(
+                "kitty-graphics-image-{}-{}-{}",
+                self.image_id, self.placement_id, self.z
+            )
+        });
+
+        let placement = div()
             .absolute()
             .left(px(layout.destination_left))
             .top(px(layout.destination_top))
             .w(px(layout.destination_width))
             .h(px(layout.destination_height))
-            .overflow_hidden()
-            .child(
-                img(self.image)
-                    .absolute()
-                    .left(px(layout.image_left))
-                    .top(px(layout.image_top))
-                    .w(px(layout.image_width))
-                    .h(px(layout.image_height))
-                    .object_fit(ObjectFit::Fill),
+            .overflow_hidden();
+        #[cfg(test)]
+        let placement = placement.debug_selector(|| {
+            format!(
+                "kitty-graphics-clip-{}-{}-{}",
+                self.image_id, self.placement_id, self.z
             )
-            .into_any_element()
+        });
+
+        placement.child(image).into_any_element()
+    }
+
+    #[cfg(test)]
+    pub(super) fn z(&self) -> i32 {
+        self.z
     }
 }
 

@@ -8,9 +8,31 @@ use gpui::{
     ScrollWheelEvent, StrikethroughStyle, Styled, StyledText, TextRun, TextStyle, UnderlineStyle,
     WhiteSpace, Window, canvas, div, prelude::*, px,
 };
+#[cfg(test)]
+use std::cell::RefCell;
 use std::sync::Arc;
 
 use super::{CursorStyle, TerminalWidget, rgb_to_rgba, scrollbar_layout};
+
+#[cfg(test)]
+thread_local! {
+    static RENDER_STAGE_TRACE: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+fn reset_render_stage_trace() {
+    RENDER_STAGE_TRACE.with(|trace| trace.borrow_mut().clear());
+}
+
+#[cfg(test)]
+fn record_render_stage(stage: impl Into<String>) {
+    RENDER_STAGE_TRACE.with(|trace| trace.borrow_mut().push(stage.into()));
+}
+
+#[cfg(test)]
+fn render_stage_trace() -> Vec<String> {
+    RENDER_STAGE_TRACE.with(|trace| trace.borrow().clone())
+}
 
 pub(super) trait CellWidthExt {
     fn column_advance(self) -> u16;
@@ -57,6 +79,9 @@ impl RowSegment {
 
 impl Render for TerminalWidget {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        #[cfg(test)]
+        reset_render_stage_trace();
+
         let layout_size = self
             .layout_bounds
             .map_or_else(|| window.viewport_size(), |bounds| bounds.size);
@@ -95,6 +120,15 @@ impl Render for TerminalWidget {
                 Default::default()
             }
         };
+        #[cfg(test)]
+        record_render_stage(format!(
+            "below-background graphics z={:?}",
+            graphics
+                .below_background
+                .iter()
+                .map(|placement| placement.z())
+                .collect::<Vec<_>>()
+        ));
         let mut elements: Vec<gpui::AnyElement> = graphics
             .below_background
             .into_iter()
@@ -281,7 +315,17 @@ impl Render for TerminalWidget {
             row_idx += 1;
         }
 
+        #[cfg(test)]
+        record_render_stage(format!(
+            "cell backgrounds count={}",
+            background_elements.len()
+        ));
         elements.extend(background_elements);
+        #[cfg(test)]
+        record_render_stage(format!(
+            "search highlights count={}",
+            search_highlights.len()
+        ));
         elements.extend(search_highlights.into_iter().map(|highlight| {
             let color = if highlight.active {
                 gpui::rgba(0xffa500cc)
@@ -297,12 +341,23 @@ impl Render for TerminalWidget {
                 .bg(color)
                 .into_any_element()
         }));
+        #[cfg(test)]
+        record_render_stage(format!(
+            "below-text graphics z={:?}",
+            graphics
+                .below_text
+                .iter()
+                .map(|placement| placement.z())
+                .collect::<Vec<_>>()
+        ));
         elements.extend(
             graphics
                 .below_text
                 .into_iter()
                 .map(|placement| placement.into_element()),
         );
+        #[cfg(test)]
+        record_render_stage(format!("cell text count={}", text_elements.len()));
         elements.extend(text_elements);
 
         let is_focused = self.focus_handle.is_focused(window);
@@ -338,6 +393,20 @@ impl Render for TerminalWidget {
             };
             elements.push(cursor_div.into_any_element());
         }
+        #[cfg(test)]
+        record_render_stage(format!(
+            "cursor count={}",
+            usize::from(cursor_visible && snapshot.cursor_viewport().ok().flatten().is_some())
+        ));
+        #[cfg(test)]
+        record_render_stage(format!(
+            "above-text graphics z={:?}",
+            graphics
+                .above_text
+                .iter()
+                .map(|placement| placement.z())
+                .collect::<Vec<_>>()
+        ));
         elements.extend(
             graphics
                 .above_text
@@ -904,6 +973,9 @@ mod tests {
         RenderState, SelectionDrag, SelectionGeometry, SelectionPoint, SelectionPress, Terminal,
         TerminalOptions, render::RowIterator,
     };
+    use crate::profile::LaunchSpec;
+    use crate::widget::TerminalConfig;
+    use gpui::{AppContext, Bounds, TestAppContext, size};
 
     #[test]
     fn bold_style_survives_box_emoji_prompt_segment() {
@@ -1060,6 +1132,107 @@ mod tests {
             Some(selected)
         );
         assert_eq!(selected_background(selection, 5, 1, None, selected), None);
+    }
+
+    #[gpui::test]
+    fn kitty_graphics_fixture_reaches_the_final_widget_render(cx: &mut TestAppContext) {
+        let mut config = TerminalConfig {
+            launch: quiet_test_launch(),
+            initial_cols: 20,
+            initial_rows: 8,
+            cursor_blink: false,
+            ..Default::default()
+        };
+        config.theme.background = gpui::rgb(0x101010);
+
+        let (widget, cx) = cx.add_window_view(|_window, cx| TerminalWidget::new(config, cx));
+        cx.simulate_resize(size(px(192.0), px(115.2)));
+        cx.refresh().expect("refresh resized test window");
+        cx.run_until_parked();
+        cx.update_window_entity(&widget, |widget, window, cx| {
+            widget.request_focus(window);
+            widget.terminal.vt_write(
+                concat!(
+                    "\x1b[41mX\x1b[0m\x1b[H",
+                    "\x1b_Ga=t,t=d,f=32,i=7,s=4,v=4;",
+                    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                    "AAAAAAAAAAAAAAAAAAAAAA==",
+                    "\x1b\\",
+                    "\x1b_Ga=p,i=7,p=1,z=-1073741825,x=1,y=1,w=2,h=2,c=2,r=2;\x1b\\",
+                    "\x1b[H",
+                    "\x1b_Ga=p,i=7,p=2,z=-1,x=1,y=1,w=2,h=2,c=2,r=2;\x1b\\",
+                    "\x1b[H",
+                    "\x1b_Ga=p,i=7,p=3,z=0,x=1,y=1,w=2,h=2,c=2,r=2;\x1b\\",
+                    "\x1b[H",
+                    "\x1b_Ga=p,i=7,p=4,z=5,x=1,y=1,w=2,h=2,c=2,r=2;\x1b\\",
+                    "\x1b[5;5H\x1b[41mX\x1b[0m"
+                )
+                .as_bytes(),
+            );
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let mut actual = String::from("before deletion\n");
+        for stage in render_stage_trace() {
+            actual.push_str(&stage);
+            actual.push('\n');
+        }
+        actual.push_str(&format_fixture_bounds(
+            "crop clip",
+            cx.debug_bounds("kitty-graphics-clip-7-3-0")
+                .unwrap_or_else(|| {
+                    panic!(
+                        "cropped placement clip; render trace: {:?}",
+                        render_stage_trace()
+                    )
+                }),
+        ));
+        actual.push('\n');
+        actual.push_str(&format_fixture_bounds(
+            "full image",
+            cx.debug_bounds("kitty-graphics-image-7-3-0")
+                .expect("cropped placement image"),
+        ));
+        actual.push('\n');
+
+        cx.update_entity(&widget, |widget, cx| {
+            widget.terminal.vt_write(b"\x1b_Ga=d,d=A\x1b\\");
+            cx.notify();
+        });
+        cx.refresh().expect("refresh deleted graphics");
+        cx.run_until_parked();
+
+        actual.push_str("after deletion\n");
+        for stage in render_stage_trace() {
+            actual.push_str(&stage);
+            actual.push('\n');
+        }
+        actual.push_str(&format!(
+            "crop clip present={}\n",
+            cx.debug_bounds("kitty-graphics-clip-7-3-0").is_some()
+        ));
+
+        assert_eq!(
+            actual,
+            include_str!("fixtures/kitty-graphics-render.golden").replace("\r\n", "\n")
+        );
+    }
+
+    fn quiet_test_launch() -> LaunchSpec {
+        if cfg!(windows) {
+            LaunchSpec::new("cmd.exe").with_arguments(["/d", "/c", "exit", "0"])
+        } else {
+            LaunchSpec::new("/bin/sh").with_arguments(["-c", "exit 0"])
+        }
+    }
+
+    fn format_fixture_bounds(label: &str, bounds: Bounds<Pixels>) -> String {
+        let left = f32::from(bounds.origin.x);
+        let top = f32::from(bounds.origin.y);
+        let width = f32::from(bounds.size.width);
+        let height = f32::from(bounds.size.height);
+        format!("{label}=({left:.3},{top:.3}) {width:.3}x{height:.3}")
     }
 
     fn selection_test_point(column: u16) -> SelectionPoint {
