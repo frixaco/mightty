@@ -349,7 +349,7 @@ impl Mods {
         self.0 & other.0 == other.0
     }
 
-    const fn bits(self) -> u16 {
+    pub(crate) const fn bits(self) -> u16 {
         self.0
     }
 }

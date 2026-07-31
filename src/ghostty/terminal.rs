@@ -46,6 +46,39 @@ pub struct Scrollbar {
     pub len: u64,
 }
 
+/// Clipboard destination requested by terminal output.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClipboardLocation {
+    Standard,
+    Selection,
+    Primary,
+}
+
+/// One MIME representation in a terminal clipboard request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClipboardContent {
+    pub mime: String,
+    pub data: Vec<u8>,
+}
+
+/// One atomic clipboard write requested by terminal output.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClipboardWrite {
+    pub location: ClipboardLocation,
+    pub contents: Vec<ClipboardContent>,
+}
+
+/// Result returned to Ghostty after a clipboard write request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClipboardWriteResult {
+    Success,
+    Denied,
+    Unsupported,
+    Busy,
+    InvalidData,
+    IoError,
+}
+
 impl Terminal {
     pub fn new(options: TerminalOptions) -> Result<Self> {
         if options.cols == 0 || options.rows == 0 {
@@ -142,6 +175,79 @@ impl Terminal {
         })
     }
 
+    pub fn mouse_tracking(&self) -> Result<bool> {
+        unsafe { self.get_unchecked(ffi::TerminalData::MOUSE_TRACKING) }
+    }
+
+    pub fn bracketed_paste(&self) -> Result<bool> {
+        self.mode(2004)
+    }
+
+    pub fn encode_paste(&self, data: &[u8]) -> Result<Vec<u8>> {
+        crate::ghostty::paste::encode(data, self.bracketed_paste()?)
+    }
+
+    pub fn title(&self) -> Result<Option<String>> {
+        terminal_string(self.as_raw(), ffi::TerminalData::TITLE)
+    }
+
+    pub fn working_directory(&self) -> Result<Option<String>> {
+        terminal_string(self.as_raw(), ffi::TerminalData::PWD)
+    }
+
+    pub fn hyperlink_uri(&self, column: u16, row: u32) -> Result<Option<String>> {
+        let point = ffi::Point {
+            tag: ffi::PointTag::VIEWPORT,
+            value: ffi::PointValue {
+                coordinate: ffi::PointCoordinate { x: column, y: row },
+            },
+        };
+        let mut grid_ref = ffi::GridRef {
+            size: size_of::<ffi::GridRef>(),
+            ..Default::default()
+        };
+        let result =
+            unsafe { ffi::ghostty_terminal_grid_ref(self.as_raw(), point, &raw mut grid_ref) };
+        from_result(result)?;
+
+        let mut required = 0;
+        let result = unsafe {
+            ffi::ghostty_grid_ref_hyperlink_uri(
+                &raw const grid_ref,
+                std::ptr::null_mut(),
+                0,
+                &raw mut required,
+            )
+        };
+        match result {
+            ffi::Result::SUCCESS if required == 0 => return Ok(None),
+            ffi::Result::OUT_OF_SPACE => {}
+            other => {
+                from_result_with_len(other, required)?;
+                return Err(Error::InvalidValue);
+            }
+        }
+
+        let mut bytes = vec![0_u8; required];
+        let mut written = 0;
+        let result = unsafe {
+            ffi::ghostty_grid_ref_hyperlink_uri(
+                &raw const grid_ref,
+                bytes.as_mut_ptr(),
+                bytes.len(),
+                &raw mut written,
+            )
+        };
+        let written = from_result_with_len(result, written)?;
+        if written > bytes.len() {
+            return Err(Error::InvalidValue);
+        }
+        bytes.truncate(written);
+        String::from_utf8(bytes)
+            .map(Some)
+            .map_err(|_| Error::InvalidValue)
+    }
+
     pub fn selection_press(&mut self, input: SelectionPress) -> Result<()> {
         let update = self.selection_gesture.press(self.as_raw(), input)?;
         self.apply_selection_update(update)
@@ -223,6 +329,55 @@ impl Terminal {
         Ok(self)
     }
 
+    pub fn on_bell(&mut self, callback: impl FnMut() + 'static) -> Result<&mut Self> {
+        self.callbacks.bell = Some(Box::new(callback));
+        let callback: ffi::TerminalBellFn = Some(bell_trampoline);
+        let pointer = callback.map_or(std::ptr::null(), |callback| {
+            callback as *const () as *const c_void
+        });
+        self.set_raw_pointer(ffi::TerminalOption::BELL, pointer)?;
+        Ok(self)
+    }
+
+    pub fn on_title_changed(
+        &mut self,
+        callback: impl FnMut(Option<String>) + 'static,
+    ) -> Result<&mut Self> {
+        self.callbacks.title_changed = Some(Box::new(callback));
+        let callback: ffi::TerminalTitleChangedFn = Some(title_changed_trampoline);
+        let pointer = callback.map_or(std::ptr::null(), |callback| {
+            callback as *const () as *const c_void
+        });
+        self.set_raw_pointer(ffi::TerminalOption::TITLE_CHANGED, pointer)?;
+        Ok(self)
+    }
+
+    pub fn on_working_directory_changed(
+        &mut self,
+        callback: impl FnMut(Option<String>) + 'static,
+    ) -> Result<&mut Self> {
+        self.callbacks.working_directory_changed = Some(Box::new(callback));
+        let callback: ffi::TerminalPwdChangedFn = Some(working_directory_changed_trampoline);
+        let pointer = callback.map_or(std::ptr::null(), |callback| {
+            callback as *const () as *const c_void
+        });
+        self.set_raw_pointer(ffi::TerminalOption::PWD_CHANGED, pointer)?;
+        Ok(self)
+    }
+
+    pub fn on_clipboard_write(
+        &mut self,
+        callback: impl FnMut(ClipboardWrite) -> ClipboardWriteResult + 'static,
+    ) -> Result<&mut Self> {
+        self.callbacks.clipboard_write = Some(Box::new(callback));
+        let callback: ffi::TerminalClipboardWriteFn = Some(clipboard_write_trampoline);
+        let pointer = callback.map_or(std::ptr::null(), |callback| {
+            callback as *const () as *const c_void
+        });
+        self.set_raw_pointer(ffi::TerminalOption::CLIPBOARD_WRITE, pointer)?;
+        Ok(self)
+    }
+
     pub fn set_default_fg_color(&mut self, color: Option<RgbColor>) -> Result<&mut Self> {
         self.set_optional_color(ffi::TerminalOption::COLOR_FOREGROUND, color)?;
         Ok(self)
@@ -283,6 +438,13 @@ impl Terminal {
         from_result(result)
     }
 
+    fn mode(&self, mode: ffi::Mode) -> Result<bool> {
+        let mut value = false;
+        let result = unsafe { ffi::ghostty_terminal_mode_get(self.as_raw(), mode, &raw mut value) };
+        from_result(result)?;
+        Ok(value)
+    }
+
     /// `T` must be the output type documented for `data`.
     unsafe fn get_unchecked<T>(&self, data: ffi::TerminalData::Type) -> Result<T> {
         let mut value = MaybeUninit::<T>::uninit();
@@ -303,10 +465,17 @@ impl Drop for Terminal {
 }
 
 type PtyWriteCallback = dyn FnMut(&[u8]) + 'static;
+type BellCallback = dyn FnMut() + 'static;
+type MetadataCallback = dyn FnMut(Option<String>) + 'static;
+type ClipboardWriteCallback = dyn FnMut(ClipboardWrite) -> ClipboardWriteResult + 'static;
 
 #[derive(Default)]
 struct CallbackState {
     pty_write: Option<Box<PtyWriteCallback>>,
+    bell: Option<Box<BellCallback>>,
+    title_changed: Option<Box<MetadataCallback>>,
+    working_directory_changed: Option<Box<MetadataCallback>>,
+    clipboard_write: Option<Box<ClipboardWriteCallback>>,
 }
 
 unsafe extern "C" fn pty_write_trampoline(
@@ -315,9 +484,6 @@ unsafe extern "C" fn pty_write_trampoline(
     data: *const u8,
     len: usize,
 ) {
-    let Some(callbacks) = NonNull::new(userdata.cast::<CallbackState>()) else {
-        return;
-    };
     if data.is_null() && len != 0 {
         return;
     }
@@ -327,16 +493,165 @@ unsafe extern "C" fn pty_write_trampoline(
         unsafe { std::slice::from_raw_parts(data, len) }
     };
 
-    let callback_result = catch_unwind(AssertUnwindSafe(|| {
-        let callbacks = unsafe { callbacks.as_ptr().as_mut() }.expect("non-null callback state");
+    invoke_callback(userdata, |callbacks| {
         if let Some(callback) = callbacks.pty_write.as_deref_mut() {
             callback(bytes);
         }
+    });
+}
+
+unsafe extern "C" fn bell_trampoline(_terminal: ffi::Terminal, userdata: *mut c_void) {
+    invoke_callback(userdata, |callbacks| {
+        if let Some(callback) = callbacks.bell.as_deref_mut() {
+            callback();
+        }
+    });
+}
+
+unsafe extern "C" fn title_changed_trampoline(terminal: ffi::Terminal, userdata: *mut c_void) {
+    let title = terminal_string(terminal, ffi::TerminalData::TITLE)
+        .ok()
+        .flatten();
+    invoke_callback(userdata, |callbacks| {
+        if let Some(callback) = callbacks.title_changed.as_deref_mut() {
+            callback(title);
+        }
+    });
+}
+
+unsafe extern "C" fn working_directory_changed_trampoline(
+    terminal: ffi::Terminal,
+    userdata: *mut c_void,
+) {
+    let working_directory = terminal_string(terminal, ffi::TerminalData::PWD)
+        .ok()
+        .flatten();
+    invoke_callback(userdata, |callbacks| {
+        if let Some(callback) = callbacks.working_directory_changed.as_deref_mut() {
+            callback(working_directory);
+        }
+    });
+}
+
+unsafe extern "C" fn clipboard_write_trampoline(
+    _terminal: ffi::Terminal,
+    userdata: *mut c_void,
+    write: *const ffi::ClipboardWrite,
+) -> ffi::ClipboardWriteResult::Type {
+    let Ok(write) = clipboard_write(write) else {
+        return ffi::ClipboardWriteResult::INVALID_DATA;
+    };
+    invoke_callback(userdata, |callbacks| {
+        callbacks
+            .clipboard_write
+            .as_deref_mut()
+            .map_or(ClipboardWriteResult::Denied, |callback| callback(write))
+    })
+    .unwrap_or(ClipboardWriteResult::Denied)
+    .as_raw()
+}
+
+fn invoke_callback<R>(
+    userdata: *mut c_void,
+    callback: impl FnOnce(&mut CallbackState) -> R,
+) -> Option<R> {
+    let callbacks = NonNull::new(userdata.cast::<CallbackState>())?;
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let callbacks = unsafe { callbacks.as_ptr().as_mut() }.expect("non-null callback state");
+        callback(callbacks)
     }));
-    if callback_result.is_err() {
-        let _ = catch_unwind(AssertUnwindSafe(|| {
-            eprintln!("panic in Ghostty PTY callback; response was dropped");
-        }));
+    match result {
+        Ok(value) => Some(value),
+        Err(_) => {
+            let _ = catch_unwind(AssertUnwindSafe(|| {
+                eprintln!("panic in Ghostty terminal callback; effect was dropped");
+            }));
+            None
+        }
+    }
+}
+
+fn terminal_string(
+    terminal: ffi::Terminal,
+    data: ffi::TerminalData::Type,
+) -> Result<Option<String>> {
+    let mut raw = MaybeUninit::<ffi::String>::uninit();
+    let result = unsafe { ffi::ghostty_terminal_get(terminal, data, raw.as_mut_ptr().cast()) };
+    from_result(result)?;
+    let raw = unsafe { raw.assume_init() };
+    if raw.len == 0 {
+        return Ok(None);
+    }
+    if raw.ptr.is_null() {
+        return Err(Error::InvalidValue);
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(raw.ptr, raw.len) };
+    std::str::from_utf8(bytes)
+        .map(|value| Some(value.to_owned()))
+        .map_err(|_| Error::InvalidValue)
+}
+
+fn clipboard_write(write: *const ffi::ClipboardWrite) -> Result<ClipboardWrite> {
+    let write = unsafe { write.as_ref() }.ok_or(Error::InvalidValue)?;
+    if write.size < size_of::<ffi::ClipboardWrite>() {
+        return Err(Error::InvalidValue);
+    }
+    let location = ClipboardLocation::from_raw(write.location)?;
+    let contents = if write.contents_len == 0 {
+        &[][..]
+    } else {
+        if write.contents.is_null() {
+            return Err(Error::InvalidValue);
+        }
+        unsafe { std::slice::from_raw_parts(write.contents, write.contents_len) }
+    };
+    let contents = contents
+        .iter()
+        .map(|content| {
+            let mime = ffi_string(content.mime)?;
+            let data = ffi_bytes(content.data)?;
+            Ok(ClipboardContent { mime, data })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(ClipboardWrite { location, contents })
+}
+
+fn ffi_string(value: ffi::String) -> Result<String> {
+    let bytes = ffi_bytes(value)?;
+    String::from_utf8(bytes).map_err(|_| Error::InvalidValue)
+}
+
+fn ffi_bytes(value: ffi::String) -> Result<Vec<u8>> {
+    if value.len == 0 {
+        return Ok(Vec::new());
+    }
+    if value.ptr.is_null() {
+        return Err(Error::InvalidValue);
+    }
+    Ok(unsafe { std::slice::from_raw_parts(value.ptr, value.len) }.to_vec())
+}
+
+impl ClipboardLocation {
+    fn from_raw(value: ffi::ClipboardLocation::Type) -> Result<Self> {
+        match value {
+            ffi::ClipboardLocation::STANDARD => Ok(Self::Standard),
+            ffi::ClipboardLocation::SELECTION => Ok(Self::Selection),
+            ffi::ClipboardLocation::PRIMARY => Ok(Self::Primary),
+            _ => Err(Error::InvalidValue),
+        }
+    }
+}
+
+impl ClipboardWriteResult {
+    fn as_raw(self) -> ffi::ClipboardWriteResult::Type {
+        match self {
+            Self::Success => ffi::ClipboardWriteResult::SUCCESS,
+            Self::Denied => ffi::ClipboardWriteResult::DENIED,
+            Self::Unsupported => ffi::ClipboardWriteResult::UNSUPPORTED,
+            Self::Busy => ffi::ClipboardWriteResult::BUSY,
+            Self::InvalidData => ffi::ClipboardWriteResult::INVALID_DATA,
+            Self::IoError => ffi::ClipboardWriteResult::IO_ERROR,
+        }
     }
 }
 
@@ -397,6 +712,76 @@ mod tests {
             .unwrap();
 
         terminal.vt_write(b"\x1b[5n");
+    }
+
+    #[test]
+    fn exposes_mouse_and_bracketed_paste_modes() {
+        let mut terminal = selection_terminal(80, 24);
+        assert!(!terminal.mouse_tracking().unwrap());
+        assert!(!terminal.bracketed_paste().unwrap());
+
+        terminal.vt_write(b"\x1b[?1000h\x1b[?2004h");
+
+        assert!(terminal.mouse_tracking().unwrap());
+        assert!(terminal.bracketed_paste().unwrap());
+        assert_eq!(
+            terminal.encode_paste(b"one\ntwo").unwrap(),
+            b"\x1b[200~one\ntwo\x1b[201~"
+        );
+    }
+
+    #[test]
+    fn reports_title_directory_bell_and_clipboard_effects() {
+        let titles = Rc::new(RefCell::new(Vec::new()));
+        let title_events = Rc::clone(&titles);
+        let directories = Rc::new(RefCell::new(Vec::new()));
+        let directory_events = Rc::clone(&directories);
+        let bells = Rc::new(RefCell::new(0_u8));
+        let bell_events = Rc::clone(&bells);
+        let clipboard = Rc::new(RefCell::new(Vec::new()));
+        let clipboard_events = Rc::clone(&clipboard);
+        let mut terminal = selection_terminal(80, 24);
+        terminal
+            .on_title_changed(move |title| title_events.borrow_mut().push(title))
+            .unwrap()
+            .on_working_directory_changed(move |directory| {
+                directory_events.borrow_mut().push(directory)
+            })
+            .unwrap()
+            .on_bell(move || *bell_events.borrow_mut() += 1)
+            .unwrap()
+            .on_clipboard_write(move |write| {
+                clipboard_events.borrow_mut().push(write);
+                ClipboardWriteResult::Success
+            })
+            .unwrap();
+
+        terminal
+            .vt_write(b"\x1b]2;mightty test\x07\x1b]7;file:///tmp\x07\x07\x1b]52;c;aGVsbG8=\x07");
+
+        assert_eq!(terminal.title().unwrap().as_deref(), Some("mightty test"));
+        assert_eq!(
+            titles.borrow().as_slice(),
+            &[Some("mightty test".to_string())]
+        );
+        assert_eq!(
+            directories.borrow().last(),
+            Some(&terminal.working_directory().unwrap())
+        );
+        assert_eq!(*bells.borrow(), 1);
+        assert_eq!(clipboard.borrow()[0].contents[0].data.as_slice(), b"hello");
+    }
+
+    #[test]
+    fn resolves_hyperlinks_at_viewport_cells() {
+        let mut terminal = selection_terminal(20, 2);
+        terminal.vt_write(b"\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\");
+
+        assert_eq!(
+            terminal.hyperlink_uri(0, 0).unwrap().as_deref(),
+            Some("https://example.com")
+        );
+        assert_eq!(terminal.hyperlink_uri(5, 0).unwrap(), None);
     }
 
     #[test]
