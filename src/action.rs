@@ -1,3 +1,4 @@
+use gpui::{Menu, MenuItem};
 use serde::{Deserialize, Serialize};
 
 pub use crate::ghostty::PromptDirection;
@@ -410,6 +411,29 @@ pub struct DispatchAppAction {
     pub action: AppAction,
 }
 
+/// Build native application menus from the same action descriptors as the palette.
+pub fn app_menus() -> Vec<Menu> {
+    [
+        ActionCategory::Terminal,
+        ActionCategory::Pane,
+        ActionCategory::Window,
+        ActionCategory::Application,
+    ]
+    .into_iter()
+    .map(|category| Menu {
+        name: category.title().into(),
+        items: AppAction::catalog()
+            .into_iter()
+            .filter(|action| action.descriptor().category == category)
+            .map(|action| {
+                let title = action.descriptor().title;
+                MenuItem::action(title, DispatchAppAction { action })
+            })
+            .collect(),
+    })
+    .collect()
+}
+
 pub fn default_action_bindings() -> Vec<ActionBinding> {
     let mut bindings = Vec::new();
     for action in AppAction::catalog() {
@@ -532,6 +556,15 @@ mod tests {
             chord: "ctrl-1".to_string(),
             action: AppAction::SelectTab { index: 0 },
         }));
+    }
+
+    #[test]
+    fn native_menus_cover_the_static_action_catalog() {
+        let menus = app_menus();
+        let item_count = menus.iter().map(|menu| menu.items.len()).sum::<usize>();
+
+        assert_eq!(menus.len(), 4);
+        assert_eq!(item_count, AppAction::catalog().len());
     }
 
     #[test]

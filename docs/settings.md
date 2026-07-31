@@ -16,7 +16,7 @@ All fields are optional. This example shows the main settings:
 {
   "app": {
     "sidebar_visible": true,
-    "check_for_updates": true,
+    "bell_notifications": true,
     "quick_terminal": {
       "enabled": false,
       "hotkey": "ctrl-`",
@@ -69,3 +69,10 @@ An explicit profile can override a discovered profile with the same ID.
 
 mightty discovers PowerShell, Command Prompt, WSL distributions, and Git Bash
 on Windows. Unix uses `$SHELL` and falls back to `/bin/sh`.
+
+`bell_notifications` flashes the Windows taskbar button when an unfocused
+window receives a terminal bell. Active windows do not request attention.
+
+AppInstaller controls updates for installed Windows packages. It checks on
+launch and in the background. See
+[Windows distribution](windows-distribution.md) for package details.

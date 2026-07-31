@@ -33,7 +33,7 @@ pub struct UserSettings {
 #[serde(default, deny_unknown_fields)]
 pub struct AppSettings {
     pub sidebar_visible: bool,
-    pub check_for_updates: bool,
+    pub bell_notifications: bool,
     pub quick_terminal: QuickTerminalSettings,
 }
 
@@ -41,7 +41,7 @@ impl Default for AppSettings {
     fn default() -> Self {
         Self {
             sidebar_visible: true,
-            check_for_updates: true,
+            bell_notifications: true,
             quick_terminal: QuickTerminalSettings::default(),
         }
     }

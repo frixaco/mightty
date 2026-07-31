@@ -7,14 +7,20 @@ use gpui::Window;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows_sys::Win32::Foundation::{HWND, POINT, RECT};
 use windows_sys::Win32::Graphics::Gdi::{
-    GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint,
+    GetMonitorInfoW, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint,
+    MonitorFromWindow,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    GA_ROOTOWNER, GetAncestor, GetCursorPos, GetForegroundWindow, HWND_TOPMOST, IsWindowVisible,
-    SW_HIDE, SWP_SHOWWINDOW, SetForegroundWindow, SetWindowPos, ShowWindow,
+    AW_ACTIVATE, AW_HIDE, AW_SLIDE, AW_VER_NEGATIVE, AW_VER_POSITIVE, AnimateWindow,
+    FLASHW_TIMERNOFG, FLASHW_TRAY, FLASHWINFO, FlashWindowEx, GA_ROOTOWNER, GetAncestor,
+    GetCursorPos, GetForegroundWindow, HWND_TOPMOST, IsWindowVisible, SW_HIDE, SW_SHOW,
+    SWP_NOACTIVATE, SetForegroundWindow, SetWindowPos, ShowWindow,
 };
 
 use crate::settings::QuickTerminalSettings;
+
+const SHOW_ANIMATION_MS: u32 = 120;
+const HIDE_ANIMATION_MS: u32 = 90;
 
 /// Toggle the persistent quick-terminal window.
 ///
@@ -62,12 +68,23 @@ pub fn quick_terminal_has_focus(window: &Window) -> io::Result<bool> {
         && (foreground == hwnd || unsafe { GetAncestor(foreground, GA_ROOTOWNER) } == hwnd))
 }
 
-fn show(hwnd: HWND, settings: &QuickTerminalSettings) -> io::Result<()> {
-    let mut cursor = POINT::default();
-    if unsafe { GetCursorPos(&mut cursor) } == 0 {
-        return Err(io::Error::last_os_error());
+/// Ask Windows to flash the taskbar button until the window receives focus.
+pub fn request_window_attention(window: &Window) -> io::Result<()> {
+    let flash = FLASHWINFO {
+        cbSize: size_of::<FLASHWINFO>() as u32,
+        hwnd: native_window(window)?,
+        dwFlags: FLASHW_TRAY | FLASHW_TIMERNOFG,
+        uCount: 3,
+        dwTimeout: 0,
+    };
+    unsafe {
+        FlashWindowEx(&flash);
     }
-    let monitor = unsafe { MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST) };
+    Ok(())
+}
+
+fn show(hwnd: HWND, settings: &QuickTerminalSettings) -> io::Result<()> {
+    let monitor = active_monitor()?;
     if monitor.is_null() {
         return Err(io::Error::other("Windows did not return a display"));
     }
@@ -92,11 +109,23 @@ fn show(hwnd: HWND, settings: &QuickTerminalSettings) -> io::Result<()> {
             placement.y,
             placement.width,
             placement.height,
-            SWP_SHOWWINDOW,
+            SWP_NOACTIVATE,
         )
     } == 0
     {
         return Err(io::Error::last_os_error());
+    }
+    if unsafe { IsWindowVisible(hwnd) } == 0 {
+        unsafe {
+            AnimateWindow(
+                hwnd,
+                SHOW_ANIMATION_MS,
+                AW_ACTIVATE | AW_SLIDE | AW_VER_POSITIVE,
+            );
+        }
+    }
+    unsafe {
+        ShowWindow(hwnd, SW_SHOW);
     }
     unsafe { SetForegroundWindow(hwnd) };
     Ok(())
@@ -104,8 +133,28 @@ fn show(hwnd: HWND, settings: &QuickTerminalSettings) -> io::Result<()> {
 
 fn hide(hwnd: HWND) {
     unsafe {
+        if IsWindowVisible(hwnd) != 0 {
+            AnimateWindow(
+                hwnd,
+                HIDE_ANIMATION_MS,
+                AW_HIDE | AW_SLIDE | AW_VER_NEGATIVE,
+            );
+        }
         ShowWindow(hwnd, SW_HIDE);
     }
+}
+
+fn active_monitor() -> io::Result<HMONITOR> {
+    let foreground = unsafe { GetForegroundWindow() };
+    if !foreground.is_null() {
+        return Ok(unsafe { MonitorFromWindow(foreground, MONITOR_DEFAULTTONEAREST) });
+    }
+
+    let mut cursor = POINT::default();
+    if unsafe { GetCursorPos(&mut cursor) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST) })
 }
 
 fn native_window(window: &Window) -> io::Result<HWND> {

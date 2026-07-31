@@ -11,13 +11,20 @@ shell I/O through a forkpty-backed bridge.
 - GPU-rendered terminal UI through GPUI.
 - Terminal emulation through Ghostty's `libghostty-vt`, built directly from the
   pinned Ghostty source submodule.
-- Windows shell I/O through ConPTY.
-- Unix shell I/O through forkpty.
-- Tabs in a compact left sidebar.
-- Right and down pane splits.
-- Active pane and tab closing.
-- Mouse-wheel scrollback and Ghostty-backed text selection.
-- Selection copy through `Ctrl+Shift+C` (`Cmd+C` on macOS).
+- Scrollback, selection, mouse reporting, safe paste, hyperlinks, a scrollbar,
+  and full-scrollback search.
+- Typed profiles, themes, fonts, key bindings, and safe settings reload.
+- One typed action model for shortcuts, native menus, and the command palette.
+- Binary pane splits with divider drag, directional focus, resize, and zoom.
+- Named workspace save and restore with fresh shell processes.
+- Shell titles, trusted local directories, prompt navigation, and command-output
+  selection through PowerShell and Bash integration.
+- One Windows process with activation IPC and a persistent quick-terminal
+  window.
+- Signed per-user MSIX packaging, AppInstaller updates, and Windows
+  default-terminal handoff support.
+- Kitty graphics rendering with crop, z-order, deletion, and GPU cache reuse.
+- Windows shell I/O through ConPTY and Unix shell I/O through forkpty.
 - Embedded JetBrainsMono Nerd Font Mono for terminal text.
 - Feedback capture with `Ctrl+Shift+F12`.
 
@@ -91,6 +98,9 @@ See [Workspaces](docs/workspaces.md) for named layout save and restore.
 See [Shell integration](docs/shell-integration.md) for PowerShell and Bash
 prompt markers, directory inheritance, and semantic actions.
 
+See [Windows distribution](docs/windows-distribution.md) for signed packages,
+updates, protocol activation, and default-terminal setup.
+
 ## Shell I/O
 
 Terminal I/O is wake-driven. `TerminalWidget` owns a `PtyWorker`; the platform
@@ -141,6 +151,7 @@ Useful runtime shortcuts:
 - `Ctrl+D`: close the active pane, or close the active tab when it has one pane.
 - `Ctrl+Shift+C` (`Cmd+C` on macOS): copy the active terminal selection.
 - `Ctrl+Shift+V` (`Cmd+V` on macOS): paste with unsafe-paste confirmation.
+- `Ctrl+Shift+F` (`Cmd+F` on macOS): search the full terminal scrollback.
 - `Ctrl+Shift+P` (`Cmd+Shift+P` on macOS): open the command palette.
 - `Cmd+Q` on macOS: quit.
 - `Ctrl+Shift+F12`: write a terminal feedback capture to `captures/`.
@@ -156,22 +167,38 @@ pane resize, and pane zoom actions.
 
 ```text
 src/
-├── main.rs              # App entry point and window setup
+├── main.rs              # App entry point and window lifecycle
 ├── lib.rs               # Library module exports
+├── action.rs            # Typed actions, descriptors, bindings, and menus
+├── command_palette.rs   # Palette filtering and action entries
 ├── feedback.rs          # Feedback capture output
-├── pane_container.rs    # Tabs, sidebar, pane actions, and key bindings
-├── split.rs             # Orientation-aware terminal split tree
+├── pane_container.rs    # Tabs, sidebar, workspaces, and action dispatch
+├── profile.rs           # Stable profile IDs and shell launch values
+├── settings.rs          # Typed settings, discovery, and safe reload
+├── shell_integration.rs # Trusted shell metadata and integration setup
+├── split.rs             # Binary split tree and pane geometry
+├── workspace.rs         # Serializable workspace layouts
+├── application/
+│   ├── activation.rs    # Typed process activation requests
+│   └── windows/         # Hotkey, IPC, quick terminal, and COM handoff
 ├── widget/
 │   ├── mod.rs           # Terminal widget lifecycle and GPUI task wiring
 │   ├── pty.rs           # Wake-driven PTY worker bridge
 │   ├── input.rs         # GPUI key event to Ghostty key encoding
 │   ├── render.rs        # Terminal cell rendering
+│   ├── graphics.rs      # Kitty graphics resource cache and placement
+│   ├── search.rs        # Search result projection and overlay state
 │   └── capture.rs       # Terminal-state feedback snapshot
 ├── ghostty/
 │   ├── mod.rs           # Public local Ghostty interface
 │   ├── terminal.rs      # Terminal ownership and PTY callback
 │   ├── selection.rs     # Ghostty selection gesture state and event bridge
 │   ├── render.rs        # Snapshot and lending render iterators
+│   ├── graphics.rs      # Lending Kitty graphics wrappers
+│   ├── search.rs        # Incremental full-scrollback search
+│   ├── semantic.rs      # Shell metadata and semantic regions
+│   ├── mouse.rs         # Mouse mode and event encoding
+│   ├── paste.rs         # Paste safety and bracketed encoding
 │   ├── key.rs           # Key event and encoder ownership
 │   ├── style.rs         # Renderer-facing colors and styles
 │   ├── error.rs         # C result conversion
@@ -183,7 +210,10 @@ src/
     ├── windows.rs       # Windows ConPTY implementation
     └── unix.rs          # Unix forkpty implementation
 tools/
-└── ghostty-bindings/    # Reproducible binding generator
+├── ghostty-bindings/    # Reproducible binding generator
+└── *.ps1                # Windows package, proxy, and upgrade tools
+packaging/windows/       # MSIX, AppInstaller, and COM proxy inputs
+shell-integration/       # PowerShell and Bash integration resources
 ```
 
 ## License

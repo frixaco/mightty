@@ -1,8 +1,22 @@
-# Next feature roadmap
+# Feature roadmap
 
-This document records the next substantial product features for mightty and the
-architecture that should support them. The order is intentional: later features
-depend on the interaction, configuration, and action foundations above them.
+This document records the implemented product features and their supporting
+architecture. The order remains useful because later features depend on the
+interaction, configuration, and action foundations above them.
+
+## Implementation status
+
+All seven roadmap areas have production code and focused tests.
+
+| Area | Main implementation |
+| --- | --- |
+| Terminal interaction | Safe Ghostty wrappers and GPUI interaction, search, and paste overlays |
+| Profiles and settings | Typed resolution, discovery, validation, and atomic live reload |
+| Actions and menus | Shared action descriptors, bindings, native menus, and command palette |
+| Panes and workspaces | Binary layout tree, geometry actions, and serialized restore |
+| Shell integration | PowerShell and Bash resources with trusted semantic metadata |
+| Windows product | Activation IPC, quick terminal, signed MSIX updates, and default-terminal COM |
+| Kitty graphics | Safe lending wrappers, bounded media, GPU cache, and layered placements |
 
 ## Short feature list
 

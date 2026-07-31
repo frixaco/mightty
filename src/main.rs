@@ -3,7 +3,7 @@ use gpui::{
     px, size,
 };
 use gpui_component::{Root, Theme, ThemeMode, TitleBar};
-use mightty::{pane_container::PaneContainer, settings::SettingsStore};
+use mightty::{action::app_menus, pane_container::PaneContainer, settings::SettingsStore};
 use std::borrow::Cow;
 
 #[cfg(windows)]
@@ -35,6 +35,7 @@ fn main() {
         load_embedded_fonts(cx);
         gpui_component::init(cx);
         Theme::change(ThemeMode::Dark, None, cx);
+        cx.set_menus(app_menus());
 
         #[cfg(windows)]
         {
@@ -62,13 +63,24 @@ fn open_normal_window(show: bool, cx: &mut App) -> TerminalWindow {
             show,
             ..Default::default()
         },
+        true,
         cx,
     )
 }
 
-fn open_terminal_window(options: WindowOptions, cx: &mut App) -> TerminalWindow {
+fn open_terminal_window(
+    options: WindowOptions,
+    show_titlebar: bool,
+    cx: &mut App,
+) -> TerminalWindow {
     let settings = SettingsStore::open_default();
-    let panes = cx.new(|cx| PaneContainer::new(settings, cx));
+    let panes = cx.new(|cx| {
+        if show_titlebar {
+            PaneContainer::new(settings, cx)
+        } else {
+            PaneContainer::new_without_titlebar(settings, cx)
+        }
+    });
     let root_panes = panes.clone();
     let handle = cx
         .open_window(options, move |window, cx| {
@@ -263,16 +275,25 @@ fn start_windows_application(startup: WindowsStartup, normal_window: TerminalWin
         shutting_down: false,
     }));
     controller.borrow_mut().apply_settings(cx);
+    if startup_request
+        .as_ref()
+        .is_some_and(|request| !request_shows_normal_window(request))
+    {
+        controller.borrow_mut().ensure_quick_window(cx);
+    }
 
     let action_controller = Rc::clone(&controller);
     cx.on_action::<DispatchAppAction>(move |action, cx| {
         if action.action == AppAction::ToggleQuickTerminal {
-            action_controller.borrow_mut().dispatch(
-                ActivationRequest::Dispatch {
-                    action: action.action.clone(),
-                },
-                cx,
-            );
+            let mut controller = action_controller.borrow_mut();
+            if controller.quick_settings.enabled {
+                controller.dispatch(
+                    ActivationRequest::Dispatch {
+                        action: action.action.clone(),
+                    },
+                    cx,
+                );
+            }
         }
     });
 
@@ -430,9 +451,9 @@ impl WindowsApplication {
             }
         }
 
-        if !self.quick_settings.enabled
-            && let Some(window) = &self.quick_window
-        {
+        if self.quick_settings.enabled {
+            self.ensure_quick_window(cx);
+        } else if let Some(window) = &self.quick_window {
             let _ = window
                 .handle
                 .update(cx, |_, window, _| hide_quick_terminal(window));
@@ -456,6 +477,7 @@ impl WindowsApplication {
                 kind: WindowKind::PopUp,
                 ..Default::default()
             },
+            false,
             cx,
         );
         let handle = window.handle;
@@ -554,9 +576,9 @@ mod tests {
 
     #[test]
     fn cold_quick_activation_keeps_the_normal_window_hidden() {
-        assert!(!request_shows_normal_window(
-            &ActivationRequest::OpenQuickTerminal { profile_id: None }
-        ));
+        let quick = ActivationRequest::OpenQuickTerminal { profile_id: None };
+
+        assert!(!request_shows_normal_window(&quick));
         assert!(request_shows_normal_window(&ActivationRequest::Activate));
     }
 

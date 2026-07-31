@@ -3,7 +3,7 @@ use gpui::{
     KeyUpEvent, MouseButton, MouseDownEvent, Render, Task, Timer, Window, WindowControlArea, div,
     font, prelude::*, px,
 };
-use gpui_component::InteractiveElementExt;
+use gpui_component::{InteractiveElementExt, menu::AppMenuBar};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -62,6 +62,9 @@ pub struct PaneContainer {
     active_tab_index: usize,
     sidebar_visible: bool,
     needs_focus: bool,
+    titlebar_visible: bool,
+    app_menu_bar: Option<Entity<AppMenuBar>>,
+    bell_notification_pending: bool,
     settings: SettingsStore,
     settings_task: Task<()>,
     workspace_store: WorkspaceStore,
@@ -75,6 +78,19 @@ pub struct PaneContainer {
 
 impl PaneContainer {
     pub fn new(settings: SettingsStore, cx: &mut Context<Self>) -> Self {
+        Self::with_titlebar(settings, true, cx)
+    }
+
+    /// Create terminal content for a frameless quick-terminal window.
+    pub fn new_without_titlebar(settings: SettingsStore, cx: &mut Context<Self>) -> Self {
+        Self::with_titlebar(settings, false, cx)
+    }
+
+    fn with_titlebar(
+        settings: SettingsStore,
+        titlebar_visible: bool,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let (config, profile_id, title, sidebar_visible) = {
             let resolved = settings.current();
             let config = resolved
@@ -99,6 +115,9 @@ impl PaneContainer {
             active_tab_index: 0,
             sidebar_visible,
             needs_focus: true,
+            titlebar_visible,
+            app_menu_bar: None,
+            bell_notification_pending: false,
             settings,
             settings_task: Task::ready(()),
             workspace_store,
@@ -233,14 +252,33 @@ impl PaneContainer {
                     crate::shell_integration::display_title(title.as_deref())
                         .unwrap_or_else(|| self.tabs[tab_index].default_title.clone());
             }
-            TerminalEvent::Bell if tab_index != self.active_tab_index => {
-                self.tabs[tab_index].bell_pending = true;
+            TerminalEvent::Bell => {
+                if tab_index != self.active_tab_index {
+                    self.tabs[tab_index].bell_pending = true;
+                }
+                self.bell_notification_pending = true;
             }
-            TerminalEvent::TitleChanged(_)
-            | TerminalEvent::WorkingDirectoryChanged(_)
-            | TerminalEvent::Bell => {}
+            TerminalEvent::TitleChanged(_) | TerminalEvent::WorkingDirectoryChanged(_) => {}
         }
         cx.notify();
+    }
+
+    fn deliver_bell_notification(&mut self, window: &Window) {
+        if !self.bell_notification_pending {
+            return;
+        }
+        self.bell_notification_pending = false;
+        if !bell_notification_allowed(
+            self.settings.current().app.bell_notifications,
+            window.is_window_active(),
+        ) {
+            return;
+        }
+
+        #[cfg(windows)]
+        if let Err(error) = crate::application::windows::request_window_attention(window) {
+            eprintln!("Cannot request attention for a terminal bell: {error}");
+        }
     }
 
     fn active_split(&self) -> Entity<Split> {
@@ -942,6 +980,11 @@ impl Render for PaneContainer {
             self.focus_active_tab(window, cx);
         }
         self.refresh_active_tab_title(window, cx);
+        self.deliver_bell_notification(window);
+        if self.titlebar_visible && !cfg!(target_os = "macos") && self.app_menu_bar.is_none() {
+            self.app_menu_bar = Some(AppMenuBar::new(window, cx));
+        }
+        let app_menu_bar = self.app_menu_bar.clone();
         let palette = self
             .palette
             .as_ref()
@@ -954,7 +997,10 @@ impl Render for PaneContainer {
             .flex_col()
             .bg(gpui::rgb(WINDOW_BACKGROUND))
             .on_action(cx.listener(Self::on_app_action))
-            .child(render_titlebar(window))
+            .children(
+                self.titlebar_visible
+                    .then(|| render_titlebar(window, app_menu_bar)),
+            )
             .children(
                 self.settings
                     .diagnostic()
@@ -1008,7 +1054,10 @@ fn render_workspace_diagnostic(message: String) -> impl IntoElement {
         .child(format!("Workspace: {message}"))
 }
 
-fn render_titlebar(window: &mut Window) -> impl IntoElement {
+fn render_titlebar(
+    window: &mut Window,
+    app_menu_bar: Option<Entity<AppMenuBar>>,
+) -> impl IntoElement {
     let maximize_button = if window.is_maximized() {
         WindowsCaptionButton::Restore
     } else {
@@ -1043,6 +1092,11 @@ fn render_titlebar(window: &mut Window) -> impl IntoElement {
         })
         .when(!cfg!(target_os = "macos"), |titlebar| {
             titlebar
+                .children(
+                    app_menu_bar.map(|menu_bar| {
+                        div().h_full().w(px(300.0)).flex_shrink_0().child(menu_bar)
+                    }),
+                )
                 .child(
                     div()
                         .id("titlebar-drag")
@@ -1070,6 +1124,10 @@ fn render_titlebar(window: &mut Window) -> impl IntoElement {
                     true,
                 ))
         })
+}
+
+fn bell_notification_allowed(enabled: bool, window_active: bool) -> bool {
+    enabled && !window_active
 }
 
 impl PaneContainer {
@@ -1270,5 +1328,17 @@ impl PaneContainer {
                             .child(title),
                     )
             }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bell_notification_allowed;
+
+    #[test]
+    fn bell_notifications_follow_policy_and_window_focus() {
+        assert!(bell_notification_allowed(true, false));
+        assert!(!bell_notification_allowed(true, true));
+        assert!(!bell_notification_allowed(false, false));
     }
 }
