@@ -38,7 +38,7 @@ fn main() {
 
         #[cfg(windows)]
         {
-            let normal_window = open_normal_window(!windows_startup.is_embedding(), cx);
+            let normal_window = open_normal_window(windows_startup.show_normal_window(), cx);
             start_windows_application(windows_startup, normal_window, cx);
         }
         #[cfg(not(windows))]
@@ -114,9 +114,17 @@ enum WindowsStartup {
 
 #[cfg(windows)]
 impl WindowsStartup {
-    fn is_embedding(&self) -> bool {
-        matches!(self, Self::Embedding)
+    fn show_normal_window(&self) -> bool {
+        match self {
+            Self::Application { request, .. } => request_shows_normal_window(request),
+            Self::Embedding => false,
+        }
     }
+}
+
+#[cfg(windows)]
+fn request_shows_normal_window(request: &ActivationRequest) -> bool {
+    !matches!(request, ActivationRequest::OpenQuickTerminal { .. })
 }
 
 #[cfg(windows)]
@@ -535,6 +543,14 @@ mod tests {
                 profile_id: Some(ProfileId::new("powershell").unwrap()),
             }
         );
+    }
+
+    #[test]
+    fn cold_quick_activation_keeps_the_normal_window_hidden() {
+        assert!(!request_shows_normal_window(
+            &ActivationRequest::OpenQuickTerminal { profile_id: None }
+        ));
+        assert!(request_shows_normal_window(&ActivationRequest::Activate));
     }
 
     #[test]
