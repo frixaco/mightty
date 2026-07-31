@@ -225,8 +225,7 @@ impl TerminalWidget {
         let clipboard_writes = Rc::clone(&terminal_clipboard_writes);
         terminal
             .on_clipboard_write(move |write| {
-                let Some(text) =
-                    accepted_terminal_clipboard_text(terminal_clipboard_policy, &write)
+                let Some(text) = accepted_terminal_clipboard_text(terminal_clipboard_policy, write)
                 else {
                     return ClipboardWriteResult::Denied;
                 };
@@ -1086,7 +1085,7 @@ fn allowed_hyperlink(uri: &str) -> bool {
 
 fn accepted_terminal_clipboard_text(
     policy: TerminalClipboardPolicy,
-    write: &ClipboardWrite,
+    write: ClipboardWrite,
 ) -> Option<String> {
     if policy != TerminalClipboardPolicy::AllowText || write.location != ClipboardLocation::Standard
     {
@@ -1095,7 +1094,7 @@ fn accepted_terminal_clipboard_text(
     if write.contents.is_empty() {
         return Some(String::new());
     }
-    let content = write.contents.iter().find(|content| {
+    let content = write.contents.into_iter().find(|content| {
         content
             .mime
             .split(';')
@@ -1105,7 +1104,7 @@ fn accepted_terminal_clipboard_text(
     if content.data.len() > MAX_TERMINAL_CLIPBOARD_BYTES {
         return None;
     }
-    String::from_utf8(content.data.clone()).ok()
+    String::from_utf8(content.data).ok()
 }
 
 #[cfg(target_os = "windows")]
@@ -1319,22 +1318,22 @@ mod interaction_tests {
                 data: b"hello".to_vec(),
             }],
         };
-        assert_eq!(
-            accepted_terminal_clipboard_text(TerminalClipboardPolicy::Deny, &text_write),
-            None
-        );
-        assert_eq!(
-            accepted_terminal_clipboard_text(TerminalClipboardPolicy::AllowText, &text_write)
-                .as_deref(),
-            Some("hello")
-        );
-
         let primary_write = ClipboardWrite {
             location: ClipboardLocation::Primary,
             ..text_write.clone()
         };
         assert_eq!(
-            accepted_terminal_clipboard_text(TerminalClipboardPolicy::AllowText, &primary_write),
+            accepted_terminal_clipboard_text(TerminalClipboardPolicy::Deny, text_write.clone()),
+            None
+        );
+        assert_eq!(
+            accepted_terminal_clipboard_text(TerminalClipboardPolicy::AllowText, text_write)
+                .as_deref(),
+            Some("hello")
+        );
+
+        assert_eq!(
+            accepted_terminal_clipboard_text(TerminalClipboardPolicy::AllowText, primary_write),
             None
         );
     }
