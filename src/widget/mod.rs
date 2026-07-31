@@ -9,7 +9,7 @@ mod pty;
 mod render;
 
 use crate::action::{
-    ActionBinding, DispatchAppAction, chord_for_keystroke, default_action_bindings,
+    ActionBinding, AppAction, DispatchAppAction, chord_for_keystroke, default_action_bindings,
 };
 use crate::feedback;
 use crate::ghostty::{
@@ -501,7 +501,7 @@ impl TerminalWidget {
             return;
         }
 
-        if self.is_app_shortcut(&event.keystroke) {
+        if self.app_action_for_keystroke(&event.keystroke).is_some() {
             window.prevent_default();
             cx.stop_propagation();
             return;
@@ -516,33 +516,23 @@ impl TerminalWidget {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        let chord = chord_for_keystroke(keystroke);
-        let Some(binding) = self
-            .config
-            .action_bindings
-            .iter()
-            .find(|binding| binding.chord == chord)
-        else {
+        let Some(action) = self.app_action_for_keystroke(keystroke).cloned() else {
             return false;
         };
 
-        window.dispatch_action(
-            Box::new(DispatchAppAction {
-                action: binding.action.clone(),
-            }),
-            cx,
-        );
+        window.dispatch_action(Box::new(DispatchAppAction { action }), cx);
         window.prevent_default();
         cx.stop_propagation();
         true
     }
 
-    fn is_app_shortcut(&self, keystroke: &gpui::Keystroke) -> bool {
+    fn app_action_for_keystroke(&self, keystroke: &gpui::Keystroke) -> Option<&AppAction> {
         let chord = chord_for_keystroke(keystroke);
         self.config
             .action_bindings
             .iter()
-            .any(|binding| binding.chord == chord)
+            .find(|binding| binding.chord == chord)
+            .map(|binding| &binding.action)
     }
 
     fn send_encoded_key(

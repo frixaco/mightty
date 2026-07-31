@@ -516,7 +516,7 @@ fn validate_app_settings(settings: &AppSettings) -> Result<(), SettingsError> {
         ));
     }
     if quick.enabled {
-        validate_chord(&quick.hotkey)?;
+        normalize_chord(&quick.hotkey).map_err(SettingsError::new)?;
     }
     Ok(())
 }
@@ -666,12 +666,6 @@ fn resolve_key_bindings(bindings: Vec<ActionBinding>) -> Result<Vec<ActionBindin
         resolved.insert(binding.chord.clone(), binding);
     }
     Ok(resolved.into_values().collect())
-}
-
-fn validate_chord(chord: &str) -> Result<(), SettingsError> {
-    normalize_chord(chord)
-        .map(|_| ())
-        .map_err(SettingsError::new)
 }
 
 fn validate_environment_name(name: &str) -> Result<(), SettingsError> {

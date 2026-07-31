@@ -405,7 +405,7 @@ impl PaneContainer {
         };
         let query = palette.query.clone();
         let selected = palette.selected;
-        let commands = commands(self.settings.current(), self.action_context(window, cx));
+        let commands = self.palette_commands(window, cx);
         let matches = filtered_command_indices(&commands, &query);
         match event.keystroke.key.as_str() {
             "escape" => self.close_palette(cx),
