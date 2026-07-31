@@ -158,6 +158,15 @@ if (Test-Path -LiteralPath $resolvedStageRoot) {
 $assetDirectory = Join-Path $resolvedStageRoot "Assets"
 New-Item -ItemType Directory -Path $assetDirectory | Out-Null
 Copy-Item -LiteralPath $executable -Destination (Join-Path $resolvedStageRoot "mightty.exe")
+Copy-Item `
+    -LiteralPath (Join-Path $repositoryRoot "THIRD_PARTY_NOTICES.md") `
+    -Destination (Join-Path $resolvedStageRoot "THIRD_PARTY_NOTICES.md")
+& (Join-Path $PSScriptRoot "build-default-terminal-proxy.ps1") `
+    -Architecture $Architecture `
+    -OutputPath (Join-Path $resolvedStageRoot "MighttyTerminalProxy.dll")
+if ($LASTEXITCODE -ne 0) {
+    throw "The default-terminal proxy build failed."
+}
 
 $xmlPublisher = [System.Security.SecurityElement]::Escape($Publisher)
 $manifestTemplate = Get-Content -Raw (

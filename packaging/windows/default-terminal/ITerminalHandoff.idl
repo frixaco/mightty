@@ -1,0 +1,37 @@
+// This interface matches Windows Terminal's public ITerminalHandoff3 contract.
+// Microsoft Corporation licenses the source contract under the MIT license.
+
+import "unknwn.idl";
+
+typedef struct _TERMINAL_STARTUP_INFO
+{
+    BSTR pszTitle;
+    BSTR pszIconPath;
+    LONG iconIndex;
+    DWORD dwX;
+    DWORD dwY;
+    DWORD dwXSize;
+    DWORD dwYSize;
+    DWORD dwXCountChars;
+    DWORD dwYCountChars;
+    DWORD dwFillAttribute;
+    DWORD dwFlags;
+    WORD wShowWindow;
+} TERMINAL_STARTUP_INFO;
+
+[
+    object,
+    uuid(6F23DA90-15C5-4203-9DB0-64E73F1B1B00),
+    pointer_default(unique)
+]
+interface ITerminalHandoff3 : IUnknown
+{
+    HRESULT EstablishPtyHandoff(
+        [out, system_handle(sh_pipe)] HANDLE* in,
+        [out, system_handle(sh_pipe)] HANDLE* out,
+        [in, system_handle(sh_pipe)] HANDLE signal,
+        [in, system_handle(sh_file)] HANDLE reference,
+        [in, system_handle(sh_process)] HANDLE server,
+        [in, system_handle(sh_process)] HANDLE client,
+        [in] const TERMINAL_STARTUP_INFO* startupInfo);
+};

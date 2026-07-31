@@ -1,10 +1,12 @@
 <?xml version="1.0" encoding="utf-8"?>
 <Package
   xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+  xmlns:com="http://schemas.microsoft.com/appx/manifest/com/windows10"
   xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+  xmlns:uap3="http://schemas.microsoft.com/appx/manifest/uap/windows10/3"
   xmlns:uap5="http://schemas.microsoft.com/appx/manifest/uap/windows10/5"
   xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
-  IgnorableNamespaces="uap uap5 rescap">
+  IgnorableNamespaces="uap uap3 uap5 rescap">
   <Identity
     Name="{{PACKAGE_NAME}}"
     Publisher="{{PUBLISHER}}"
@@ -57,6 +59,48 @@
             <uap5:ExecutionAlias Alias="mightty.exe" />
           </uap5:AppExecutionAlias>
         </uap5:Extension>
+        <uap3:Extension Category="windows.appExtension">
+          <uap3:AppExtension
+            Name="com.microsoft.windows.console.host"
+            Id="MighttyConsoleHost"
+            DisplayName="mightty"
+            Description="Windows console host for mightty"
+            PublicFolder="Public">
+            <uap3:Properties>
+              <Clsid>{B23D10C0-E52E-411E-9D5B-C09FDF709C7D}</Clsid>
+            </uap3:Properties>
+          </uap3:AppExtension>
+        </uap3:Extension>
+        <uap3:Extension Category="windows.appExtension">
+          <uap3:AppExtension
+            Name="com.microsoft.windows.terminal.host"
+            Id="MighttyTerminalHost"
+            DisplayName="mightty"
+            Description="mightty default terminal host"
+            PublicFolder="Public">
+            <uap3:Properties>
+              <Clsid>{D4725759-69BD-469F-9819-F27E6C135ED5}</Clsid>
+            </uap3:Properties>
+          </uap3:AppExtension>
+        </uap3:Extension>
+        <com:Extension Category="windows.comInterface">
+          <com:ComInterface>
+            <com:ProxyStub
+              Id="E22C363C-12F1-483B-A3F0-E97F31AEEFCB"
+              DisplayName="mightty terminal handoff proxy"
+              Path="MighttyTerminalProxy.dll" />
+            <com:Interface
+              Id="6F23DA90-15C5-4203-9DB0-64E73F1B1B00"
+              ProxyStubClsid="E22C363C-12F1-483B-A3F0-E97F31AEEFCB" />
+          </com:ComInterface>
+        </com:Extension>
+        <com:Extension Category="windows.comServer">
+          <com:ComServer>
+            <com:ExeServer DisplayName="mightty" Executable="mightty.exe">
+              <com:Class Id="D4725759-69BD-469F-9819-F27E6C135ED5" />
+            </com:ExeServer>
+          </com:ComServer>
+        </com:Extension>
       </Extensions>
     </Application>
   </Applications>

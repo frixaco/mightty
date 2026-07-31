@@ -2,7 +2,8 @@
 
 mightty uses a per-user MSIX package. Windows installs and removes the package
 without administrator rights. The package registers `mightty.exe` and the
-`mightty:` protocol.
+`mightty:` protocol. The package also registers mightty as a default-terminal
+choice.
 
 The protocol accepts these links:
 
@@ -38,6 +39,27 @@ The script performs these actions:
 
 The updater manifest checks for a package update every four hours. Windows can
 also update the package in the background.
+
+## Select mightty as the default terminal
+
+Install the signed MSIX package first. Then open Windows Settings and select
+mightty under **System > For developers > Terminal**.
+
+Windows 11 22H2 supports this contract. Windows 10 22H2 requires build
+19045.3031 or later and Windows Terminal 1.17 or later.
+
+mightty accepts the public `ITerminalHandoff3` COM contract. The package
+includes its required proxy DLL. Portable builds do not register this contract.
+
+Use a clean Windows test user to run the signed-package smoke test:
+
+```powershell
+.\tools\test-windows-default-terminal.ps1 `
+  -Package .\mightty-0.1.0-x64.msix
+```
+
+The test preserves the two default-terminal registry values. It removes only
+the package and mightty process that the test creates.
 
 ## Publish a release
 
