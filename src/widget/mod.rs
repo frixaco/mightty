@@ -10,21 +10,24 @@ mod render;
 
 use crate::feedback;
 use crate::ghostty::{
-    RenderState, Scrollbar, SelectionDrag, SelectionGeometry, SelectionPoint, SelectionPress,
-    Terminal, TerminalOptions, ViewportScroll,
+    ClipboardLocation, ClipboardWrite, ClipboardWriteResult, RenderState, Scrollbar, SelectionDrag,
+    SelectionGeometry, SelectionPoint, SelectionPress, Terminal, TerminalOptions, ViewportScroll,
     key::{Action, Encoder, Event},
     mouse::{Action as MouseAction, Button as MouseButton, Encoder as MouseEncoder},
     mouse::{Event as MouseEvent, Geometry as MouseGeometry},
+    paste,
     render::{CellIterator, RowIterator},
     style::{Palette, RgbColor},
 };
-use crate::pane_container::{CopySelection, shortcut_action};
+use crate::pane_container::{CopySelection, PasteClipboard, shortcut_action};
 use crate::shell::PtySize;
 use gpui::{
     Bounds, ClipboardItem, Context, FocusHandle, KeyDownEvent, KeyUpEvent, Modifiers,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollWheelEvent, Size, Task,
     Timer, Window, px,
 };
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::OnceLock;
 use std::sync::{
     Arc,
@@ -40,6 +43,7 @@ pub(super) const TERMINAL_FONT_SIZE_PX: f32 = 16.0;
 const FEEDBACK_CAPTURE_KEY: &str = "f12";
 const CLICK_REPEAT_INTERVAL_NS: u64 = 500_000_000;
 const SCROLLBAR_MIN_THUMB_PX: f32 = 24.0;
+const MAX_TERMINAL_CLIPBOARD_BYTES: usize = 1024 * 1024;
 
 /// Cursor style options
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -48,6 +52,14 @@ pub enum CursorStyle {
     Block,
     Line,
     Underline,
+}
+
+/// Policy for clipboard writes requested by terminal output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TerminalClipboardPolicy {
+    #[default]
+    Deny,
+    AllowText,
 }
 
 /// Terminal widget configuration
@@ -60,6 +72,7 @@ pub struct TerminalConfig {
     pub cursor_style: CursorStyle,
     pub cursor_blink: bool,
     pub blink_interval: Duration,
+    pub terminal_clipboard_policy: TerminalClipboardPolicy,
 }
 
 impl Default for TerminalConfig {
@@ -72,6 +85,7 @@ impl Default for TerminalConfig {
             cursor_style: CursorStyle::Line,
             cursor_blink: true,
             blink_interval: Duration::from_millis(500),
+            terminal_clipboard_policy: TerminalClipboardPolicy::Deny,
         }
     }
 }
@@ -116,6 +130,8 @@ pub struct TerminalWidget {
     selecting: bool,
     reported_button: Option<MouseButton>,
     scrollbar_dragging: bool,
+    pending_paste: Option<String>,
+    terminal_clipboard_writes: Rc<RefCell<Vec<String>>>,
     theme: TerminalTheme,
     has_exited: bool,
 }
@@ -169,6 +185,7 @@ impl TerminalWidget {
             max_scrollback: config.scrollback,
         })
         .expect("Failed to create terminal");
+        let terminal_clipboard_writes = Rc::new(RefCell::new(Vec::new()));
 
         #[cfg(any(windows, unix))]
         let (pty_worker, pty_event_rx, pty_tx) = {
@@ -204,6 +221,19 @@ impl TerminalWidget {
                 }
             })
             .expect("Failed to configure terminal PTY responses");
+        let terminal_clipboard_policy = config.terminal_clipboard_policy;
+        let clipboard_writes = Rc::clone(&terminal_clipboard_writes);
+        terminal
+            .on_clipboard_write(move |write| {
+                let Some(text) =
+                    accepted_terminal_clipboard_text(terminal_clipboard_policy, &write)
+                else {
+                    return ClipboardWriteResult::Denied;
+                };
+                clipboard_writes.borrow_mut().push(text);
+                ClipboardWriteResult::Success
+            })
+            .expect("Failed to configure terminal clipboard policy");
         terminal
             .set_default_fg_color(Some(rgba_to_rgb(theme.foreground)))
             .and_then(|terminal| terminal.set_default_bg_color(Some(rgba_to_rgb(theme.background))))
@@ -250,6 +280,8 @@ impl TerminalWidget {
             selecting: false,
             reported_button: None,
             scrollbar_dragging: false,
+            pending_paste: None,
+            terminal_clipboard_writes,
             theme,
             has_exited,
         };
@@ -335,7 +367,7 @@ impl TerminalWidget {
 
                 this.update(cx, |this, cx| {
                     for event in events {
-                        this.apply_pty_event(event);
+                        this.apply_pty_event(event, cx);
                     }
                     if this.exit_flag.load(Ordering::Relaxed) {
                         this.mark_exited();
@@ -347,9 +379,14 @@ impl TerminalWidget {
         });
     }
 
-    fn apply_pty_event(&mut self, event: PtyEvent) {
+    fn apply_pty_event(&mut self, event: PtyEvent, cx: &mut Context<Self>) {
         match event {
-            PtyEvent::Output(data) => self.terminal.vt_write(&data),
+            PtyEvent::Output(data) => {
+                self.terminal.vt_write(&data);
+                for text in self.terminal_clipboard_writes.borrow_mut().drain(..) {
+                    cx.write_to_clipboard(ClipboardItem::new_string(text));
+                }
+            }
             PtyEvent::Exited => self.mark_exited(),
         }
     }
@@ -421,6 +458,17 @@ impl TerminalWidget {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.pending_paste.is_some() {
+            match event.keystroke.key.as_str() {
+                "enter" => self.confirm_pending_paste(cx),
+                "escape" => self.cancel_pending_paste(cx),
+                _ => {}
+            }
+            window.prevent_default();
+            cx.stop_propagation();
+            return;
+        }
+
         if self.dispatch_app_shortcut(&event.keystroke, window, cx) {
             return;
         }
@@ -439,6 +487,12 @@ impl TerminalWidget {
     }
 
     fn handle_key_up(&mut self, event: &KeyUpEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.pending_paste.is_some() {
+            window.prevent_default();
+            cx.stop_propagation();
+            return;
+        }
+
         if self.is_app_shortcut(&event.keystroke) {
             window.prevent_default();
             cx.stop_propagation();
@@ -843,6 +897,54 @@ impl TerminalWidget {
         }
     }
 
+    fn on_paste_clipboard(
+        &mut self,
+        _action: &PasteClipboard,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
+            return;
+        };
+        if text.is_empty() {
+            return;
+        }
+        if paste::is_safe(text.as_bytes()) {
+            self.write_paste(text.as_bytes(), cx);
+        } else {
+            self.pending_paste = Some(text);
+            cx.notify();
+        }
+    }
+
+    fn confirm_pending_paste(&mut self, cx: &mut Context<Self>) {
+        let Some(text) = self.pending_paste.take() else {
+            return;
+        };
+        self.write_paste(text.as_bytes(), cx);
+    }
+
+    fn cancel_pending_paste(&mut self, cx: &mut Context<Self>) {
+        if self.pending_paste.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    fn write_paste(&mut self, text: &[u8], cx: &mut Context<Self>) {
+        match self.terminal.encode_paste(text) {
+            Ok(bytes) => {
+                self.terminal.scroll_viewport(ViewportScroll::Bottom);
+                if let Err(error) = self.terminal.clear_selection() {
+                    eprintln!("Failed to clear terminal selection after paste: {error}");
+                }
+                self.send_pty_command(PtyCommand::Write(bytes));
+                self.reset_cursor_blink(cx);
+                cx.notify();
+            }
+            Err(error) => eprintln!("Failed to encode terminal paste: {error}"),
+        }
+    }
+
     fn selection_point(&self, position: Point<Pixels>) -> Option<SelectionPoint> {
         terminal_selection_point(position, self.layout_bounds?, self.cell_size, self.size)
     }
@@ -980,6 +1082,30 @@ fn allowed_hyperlink(uri: &str) -> bool {
         scheme.to_ascii_lowercase().as_str(),
         "http" | "https" | "file"
     ) && value.starts_with("//")
+}
+
+fn accepted_terminal_clipboard_text(
+    policy: TerminalClipboardPolicy,
+    write: &ClipboardWrite,
+) -> Option<String> {
+    if policy != TerminalClipboardPolicy::AllowText || write.location != ClipboardLocation::Standard
+    {
+        return None;
+    }
+    if write.contents.is_empty() {
+        return Some(String::new());
+    }
+    let content = write.contents.iter().find(|content| {
+        content
+            .mime
+            .split(';')
+            .next()
+            .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("text/plain"))
+    })?;
+    if content.data.len() > MAX_TERMINAL_CLIPBOARD_BYTES {
+        return None;
+    }
+    String::from_utf8(content.data.clone()).ok()
 }
 
 #[cfg(target_os = "windows")]
@@ -1182,5 +1308,34 @@ mod interaction_tests {
         assert!(!allowed_hyperlink("mailto:user@example.com"));
         assert!(!allowed_hyperlink("javascript://alert(1)"));
         assert!(!allowed_hyperlink("https://example.com\nunsafe"));
+    }
+
+    #[test]
+    fn terminal_clipboard_policy_accepts_only_standard_utf8_text() {
+        let text_write = ClipboardWrite {
+            location: ClipboardLocation::Standard,
+            contents: vec![crate::ghostty::ClipboardContent {
+                mime: "text/plain;charset=utf-8".to_string(),
+                data: b"hello".to_vec(),
+            }],
+        };
+        assert_eq!(
+            accepted_terminal_clipboard_text(TerminalClipboardPolicy::Deny, &text_write),
+            None
+        );
+        assert_eq!(
+            accepted_terminal_clipboard_text(TerminalClipboardPolicy::AllowText, &text_write)
+                .as_deref(),
+            Some("hello")
+        );
+
+        let primary_write = ClipboardWrite {
+            location: ClipboardLocation::Primary,
+            ..text_write.clone()
+        };
+        assert_eq!(
+            accepted_terminal_clipboard_text(TerminalClipboardPolicy::AllowText, &primary_write),
+            None
+        );
     }
 }

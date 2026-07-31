@@ -18,6 +18,7 @@ actions!(
         NewTab,
         CloseActive,
         CopySelection,
+        PasteClipboard,
         ToggleSidebar,
         Quit
     ]
@@ -90,6 +91,8 @@ impl PaneContainer {
             KeyBinding::new("ctrl-d", CloseActive, None),
             KeyBinding::new("ctrl-shift-c", CopySelection, None),
             KeyBinding::new("cmd-c", CopySelection, None),
+            KeyBinding::new("ctrl-shift-v", PasteClipboard, None),
+            KeyBinding::new("cmd-v", PasteClipboard, None),
             KeyBinding::new("cmd-q", Quit, None),
             KeyBinding::new("ctrl-b", ToggleSidebar, None),
             KeyBinding::new("ctrl-1", SelectTab { index: 0 }, None),
@@ -311,6 +314,7 @@ pub fn shortcut_action(keystroke: &gpui::Keystroke) -> Option<Box<dyn gpui::Acti
     if modifiers.platform && !modifiers.control && !modifiers.alt && !modifiers.shift {
         return match key {
             "c" => Some(Box::new(CopySelection)),
+            "v" => Some(Box::new(PasteClipboard)),
             "t" => Some(Box::new(NewTab)),
             "q" => Some(Box::new(Quit)),
             _ => None,
@@ -319,6 +323,9 @@ pub fn shortcut_action(keystroke: &gpui::Keystroke) -> Option<Box<dyn gpui::Acti
 
     if modifiers.control && modifiers.shift && !modifiers.alt && !modifiers.platform && key == "c" {
         return Some(Box::new(CopySelection));
+    }
+    if modifiers.control && modifiers.shift && !modifiers.alt && !modifiers.platform && key == "v" {
+        return Some(Box::new(PasteClipboard));
     }
 
     if !modifiers.control || modifiers.alt || modifiers.platform || modifiers.shift {
@@ -644,5 +651,7 @@ mod tests {
         assert_eq!(shortcut_name("ctrl-d"), Some(CloseActive.name()));
         assert_eq!(shortcut_name("ctrl-shift-c"), Some(CopySelection.name()));
         assert_eq!(shortcut_name("cmd-c"), Some(CopySelection.name()));
+        assert_eq!(shortcut_name("ctrl-shift-v"), Some(PasteClipboard.name()));
+        assert_eq!(shortcut_name("cmd-v"), Some(PasteClipboard.name()));
     }
 }

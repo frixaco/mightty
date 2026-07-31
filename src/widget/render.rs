@@ -332,6 +332,97 @@ impl Render for TerminalWidget {
                             .bg(gpui::rgba(0xffffff55)),
                     )
             });
+        let paste_confirmation = self.pending_paste.as_ref().map(|text| {
+            let line_count = text.lines().count().max(1);
+            let detail = format!("{line_count} lines, {} bytes", text.len());
+            div()
+                .absolute()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(gpui::rgba(0x000000aa))
+                .occlude()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|_this, _event: &MouseDownEvent, window, cx| {
+                        window.prevent_default();
+                        cx.stop_propagation();
+                    }),
+                )
+                .child(
+                    div()
+                        .w(px(420.0))
+                        .p(px(20.0))
+                        .rounded(px(8.0))
+                        .bg(gpui::rgb(0x202020))
+                        .text_color(gpui::white())
+                        .flex()
+                        .flex_col()
+                        .gap(px(12.0))
+                        .child(
+                            div()
+                                .text_size(px(16.0))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child("Confirm paste"),
+                        )
+                        .child(div().text_size(px(13.0)).child(
+                            "This paste can run commands. Review the source before you continue.",
+                        ))
+                        .child(
+                            div()
+                                .text_size(px(12.0))
+                                .text_color(gpui::rgb(0xa0a0a0))
+                                .child(detail),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .justify_end()
+                                .gap(px(8.0))
+                                .child(
+                                    div()
+                                        .id("cancel-unsafe-paste")
+                                        .px(px(14.0))
+                                        .py(px(8.0))
+                                        .rounded(px(4.0))
+                                        .bg(gpui::rgb(0x383838))
+                                        .hover(|style| style.bg(gpui::rgb(0x484848)))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(
+                                                |this, _event: &MouseDownEvent, window, cx| {
+                                                    this.cancel_pending_paste(cx);
+                                                    window.prevent_default();
+                                                    cx.stop_propagation();
+                                                },
+                                            ),
+                                        )
+                                        .child("Cancel"),
+                                )
+                                .child(
+                                    div()
+                                        .id("confirm-unsafe-paste")
+                                        .px(px(14.0))
+                                        .py(px(8.0))
+                                        .rounded(px(4.0))
+                                        .bg(gpui::rgb(0x0e639c))
+                                        .hover(|style| style.bg(gpui::rgb(0x1177bb)))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(
+                                                |this, _event: &MouseDownEvent, window, cx| {
+                                                    this.confirm_pending_paste(cx);
+                                                    window.prevent_default();
+                                                    cx.stop_propagation();
+                                                },
+                                            ),
+                                        )
+                                        .child("Paste"),
+                                ),
+                        ),
+                )
+        });
 
         div()
             .size_full()
@@ -340,6 +431,7 @@ impl Render for TerminalWidget {
             .overflow_hidden()
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(TerminalWidget::on_copy_selection))
+            .on_action(cx.listener(TerminalWidget::on_paste_clipboard))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 this.handle_key_down(event, window, cx)
             }))
@@ -420,6 +512,7 @@ impl Render for TerminalWidget {
                 .absolute()
                 .size_full(),
             )
+            .children(paste_confirmation)
     }
 }
 
