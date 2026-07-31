@@ -155,10 +155,10 @@ impl PaneContainer {
         startup_title: Option<String>,
         replace_existing: bool,
         cx: &mut Context<Self>,
-    ) {
+    ) -> bool {
         let replace_initial_tab = replace_existing && self.tabs.len() == 1;
         if !replace_initial_tab && self.tabs.len() >= MAX_SELECTABLE_TABS {
-            return;
+            return false;
         }
 
         let (config, profile_id, profile_title) = {
@@ -201,6 +201,7 @@ impl PaneContainer {
         }
         self.needs_focus = true;
         cx.notify();
+        true
     }
 
     fn on_terminal_event(
