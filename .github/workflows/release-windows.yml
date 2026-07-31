@@ -1,0 +1,90 @@
+name: Release Windows package
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-2025
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Install pinned tools
+        uses: jdx/mise-action@v3
+
+      - name: Check release version
+        shell: pwsh
+        run: |
+          $manifest = Get-Content -Raw Cargo.toml
+          $version = [regex]::Match(
+            $manifest,
+            '(?ms)^\[package\].*?^version\s*=\s*"(?<version>\d+\.\d+\.\d+)"'
+          ).Groups["version"].Value
+          if ("v$version" -ne "${{ github.ref_name }}") {
+            throw "Tag ${{ github.ref_name }} does not match Cargo version $version."
+          }
+
+      - name: Import signing certificate
+        id: certificate
+        shell: pwsh
+        env:
+          PFX_BASE64: ${{ secrets.WINDOWS_SIGNING_PFX_BASE64 }}
+          PFX_PASSWORD: ${{ secrets.WINDOWS_SIGNING_PFX_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:PFX_BASE64)) {
+            throw "WINDOWS_SIGNING_PFX_BASE64 is not configured."
+          }
+          $certificatePath = Join-Path $env:RUNNER_TEMP "mightty-signing.pfx"
+          [IO.File]::WriteAllBytes(
+            $certificatePath,
+            [Convert]::FromBase64String($env:PFX_BASE64)
+          )
+          try {
+            $password = ConvertTo-SecureString $env:PFX_PASSWORD -AsPlainText -Force
+            $certificate = Import-PfxCertificate `
+              -FilePath $certificatePath `
+              -CertStoreLocation "Cert:\CurrentUser\My" `
+              -Password $password
+            "thumbprint=$($certificate.Thumbprint)" >> $env:GITHUB_OUTPUT
+          }
+          finally {
+            Remove-Item -LiteralPath $certificatePath -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Build signed MSIX and updater
+        shell: pwsh
+        run: |
+          .\tools\package-windows.ps1 `
+            -Publisher "${{ secrets.WINDOWS_PACKAGE_PUBLISHER }}" `
+            -CertificateThumbprint "${{ steps.certificate.outputs.thumbprint }}" `
+            -ReleaseBaseUri "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}"
+
+      - name: Publish Windows release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/windows/*
+
+      - name: Remove signing certificate
+        if: always()
+        shell: pwsh
+        run: |
+          $thumbprint = "${{ steps.certificate.outputs.thumbprint }}"
+          if ($thumbprint -match "^[0-9A-Fa-f]{40}$") {
+            Remove-Item -LiteralPath "Cert:\CurrentUser\My\$thumbprint" `
+              -Force `
+              -ErrorAction SilentlyContinue
+          }

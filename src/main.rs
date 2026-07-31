@@ -21,6 +21,7 @@ use {
     mightty::profile::ProfileId,
     mightty::settings::{QuickTerminalSettings, ReloadOutcome},
     std::{cell::RefCell, ffi::OsString, rc::Rc, time::Duration},
+    url::Url,
 };
 
 fn main() {
@@ -120,6 +121,9 @@ fn parse_startup_request(
     let arguments = arguments.into_iter().collect::<Vec<_>>();
     match arguments.as_slice() {
         [] => Ok(ActivationRequest::Activate),
+        [uri] if uri.to_string_lossy().starts_with("mightty:") => {
+            parse_protocol_request(&uri.to_string_lossy())
+        }
         [option] if option == "--quick" => {
             Ok(ActivationRequest::OpenQuickTerminal { profile_id: None })
         }
@@ -135,6 +139,38 @@ fn parse_startup_request(
             "use no arguments, '--profile PROFILE', '--quick', or '--quick --profile PROFILE'"
                 .to_string(),
         ),
+    }
+}
+
+#[cfg(windows)]
+fn parse_protocol_request(value: &str) -> Result<ActivationRequest, String> {
+    let uri = Url::parse(value).map_err(|error| format!("invalid mightty link: {error}"))?;
+    if uri.scheme() != "mightty"
+        || !uri.username().is_empty()
+        || uri.password().is_some()
+        || uri.port().is_some()
+        || uri.fragment().is_some()
+        || !matches!(uri.path(), "" | "/")
+    {
+        return Err("invalid mightty link".to_string());
+    }
+
+    let operation = uri.host_str().unwrap_or("activate");
+    let parameters = uri.query_pairs().collect::<Vec<_>>();
+    match (operation, parameters.as_slice()) {
+        ("activate", []) => Ok(ActivationRequest::Activate),
+        ("quick", []) => Ok(ActivationRequest::OpenQuickTerminal { profile_id: None }),
+        ("profile", [(name, value)]) if name == "id" => Ok(ActivationRequest::OpenProfile {
+            profile_id: ProfileId::new(value.as_ref()).map_err(|error| error.to_string())?,
+        }),
+        ("quick", [(name, value)]) if name == "profile" => {
+            Ok(ActivationRequest::OpenQuickTerminal {
+                profile_id: Some(
+                    ProfileId::new(value.as_ref()).map_err(|error| error.to_string())?,
+                ),
+            })
+        }
+        _ => Err("use mightty://activate, mightty://quick, or a profile link".to_string()),
     }
 }
 
@@ -393,11 +429,34 @@ mod tests {
                 profile_id: Some(ProfileId::new("wsl:ubuntu").unwrap()),
             }
         );
+        assert_eq!(
+            parse_startup_request(["mightty://profile?id=wsl%3Aubuntu"].map(OsString::from))
+                .unwrap(),
+            ActivationRequest::OpenProfile {
+                profile_id: ProfileId::new("wsl:ubuntu").unwrap(),
+            }
+        );
+        assert_eq!(
+            parse_startup_request(["mightty://quick?profile=powershell"].map(OsString::from))
+                .unwrap(),
+            ActivationRequest::OpenQuickTerminal {
+                profile_id: Some(ProfileId::new("powershell").unwrap()),
+            }
+        );
     }
 
     #[test]
     fn rejects_invalid_windows_activation_arguments() {
         assert!(parse_startup_request(["--unknown"].map(OsString::from)).is_err());
         assert!(parse_startup_request(["--profile", "not valid"].map(OsString::from)).is_err());
+        assert!(
+            parse_startup_request(["mightty://profile?id=not%20valid"].map(OsString::from))
+                .is_err()
+        );
+        assert!(parse_startup_request(["mightty://quick/extra"].map(OsString::from)).is_err());
+        assert!(
+            parse_startup_request(["mightty://quick?profile=a&extra=b"].map(OsString::from))
+                .is_err()
+        );
     }
 }
