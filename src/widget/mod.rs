@@ -13,7 +13,8 @@ use crate::action::{
 };
 use crate::feedback;
 use crate::ghostty::{
-    ClipboardLocation, ClipboardWrite, ClipboardWriteResult, RenderState, Scrollbar, SelectionDrag,
+    ClipboardLocation, ClipboardWrite, ClipboardWriteResult,
+    PromptDirection as GhosttyPromptDirection, RenderState, Scrollbar, SelectionDrag,
     SelectionGeometry, SelectionPoint, SelectionPress, Terminal, TerminalOptions, ViewportScroll,
     key::{Action, Encoder, Event},
     mouse::{Action as MouseAction, Button as MouseButton, Encoder as MouseEncoder},
@@ -372,6 +373,41 @@ impl TerminalWidget {
 
     pub(crate) fn reported_title(&self) -> Option<&str> {
         self.reported_title.as_ref().and_then(Option::as_deref)
+    }
+
+    pub(crate) fn semantic_commands_available(&self) -> bool {
+        self.terminal.has_semantic_prompt().unwrap_or(false)
+    }
+
+    pub(crate) fn jump_to_prompt(
+        &mut self,
+        direction: GhosttyPromptDirection,
+        cx: &mut Context<Self>,
+    ) {
+        match self.terminal.jump_to_prompt(direction) {
+            Ok(true) => cx.notify(),
+            Ok(false) => {}
+            Err(error) => eprintln!("Failed to navigate semantic prompts: {error}"),
+        }
+    }
+
+    pub(crate) fn select_command_output(&mut self, cx: &mut Context<Self>) {
+        match self.terminal.select_command_output() {
+            Ok(true) => cx.notify(),
+            Ok(false) => {}
+            Err(error) => eprintln!("Failed to select command output: {error}"),
+        }
+    }
+
+    pub(crate) fn copy_command_output(&mut self, cx: &mut Context<Self>) {
+        match self.terminal.select_command_output() {
+            Ok(true) => {
+                self.copy_selection(cx);
+                cx.notify();
+            }
+            Ok(false) => {}
+            Err(error) => eprintln!("Failed to copy command output: {error}"),
+        }
     }
 
     fn schedule_cursor_blink(&mut self, cx: &mut Context<Self>) {

@@ -29,6 +29,11 @@ pub enum AppAction {
     Copy,
     Paste,
     Search,
+    JumpToPrompt {
+        direction: PromptDirection,
+    },
+    SelectCommandOutput,
+    CopyCommandOutput,
     ToggleSidebar,
     SelectTab {
         index: u8,
@@ -153,6 +158,34 @@ impl AppAction {
                 ActionCategory::Terminal,
                 &["ctrl-shift-f", "cmd-f"],
             ),
+            Self::JumpToPrompt {
+                direction: PromptDirection::Previous,
+            } => descriptor(
+                "jump_to_previous_prompt",
+                "Jump to previous prompt",
+                ActionCategory::Terminal,
+                &[],
+            ),
+            Self::JumpToPrompt {
+                direction: PromptDirection::Next,
+            } => descriptor(
+                "jump_to_next_prompt",
+                "Jump to next prompt",
+                ActionCategory::Terminal,
+                &[],
+            ),
+            Self::SelectCommandOutput => descriptor(
+                "select_command_output",
+                "Select preceding command output",
+                ActionCategory::Terminal,
+                &[],
+            ),
+            Self::CopyCommandOutput => descriptor(
+                "copy_command_output",
+                "Copy preceding command output",
+                ActionCategory::Terminal,
+                &[],
+            ),
             Self::ToggleSidebar => descriptor(
                 "toggle_sidebar",
                 "Toggle sidebar",
@@ -220,6 +253,11 @@ impl AppAction {
             Self::Search if !context.search_available => {
                 ActionAvailability::Unavailable("Terminal search is unavailable")
             }
+            Self::JumpToPrompt { .. } | Self::SelectCommandOutput | Self::CopyCommandOutput
+                if !context.semantic_commands_available =>
+            {
+                ActionAvailability::Unavailable("The active shell has no semantic prompt markers")
+            }
             Self::ToggleQuickTerminal if !context.quick_terminal_available => {
                 ActionAvailability::Unavailable("Quick terminal is unavailable")
             }
@@ -270,6 +308,14 @@ impl AppAction {
             Self::Copy,
             Self::Paste,
             Self::Search,
+            Self::JumpToPrompt {
+                direction: PromptDirection::Previous,
+            },
+            Self::JumpToPrompt {
+                direction: PromptDirection::Next,
+            },
+            Self::SelectCommandOutput,
+            Self::CopyCommandOutput,
             Self::ToggleSidebar,
             Self::MoveTab {
                 direction: Direction::Up,
@@ -302,6 +348,13 @@ pub enum Direction {
     Right,
     Up,
     Down,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptDirection {
+    Previous,
+    Next,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -337,6 +390,7 @@ pub struct ActionContext {
     pub pane_count: usize,
     pub tab_count: usize,
     pub has_local_working_directory: bool,
+    pub semantic_commands_available: bool,
     pub pane_management_available: bool,
     pub search_available: bool,
     pub quick_terminal_available: bool,

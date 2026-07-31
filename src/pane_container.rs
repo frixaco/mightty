@@ -10,9 +10,11 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use crate::action::{
-    ActionContext, AppAction, DispatchAppAction, SplitDirection as ActionSplitDirection,
+    ActionContext, AppAction, DispatchAppAction, PromptDirection as ActionPromptDirection,
+    SplitDirection as ActionSplitDirection,
 };
 use crate::command_palette::{PaletteCommand, commands, filtered_command_indices};
+use crate::ghostty::PromptDirection as GhosttyPromptDirection;
 use crate::profile::ProfileId;
 use crate::settings::{ReloadOutcome, SettingsStore};
 use crate::split::{Split, SplitAxis};
@@ -583,6 +585,25 @@ impl PaneContainer {
                     terminal.update(cx, |terminal, cx| terminal.paste_clipboard(cx));
                 }
             }
+            AppAction::JumpToPrompt { direction } => {
+                if let Some(terminal) = self.active_terminal(window, cx) {
+                    let direction = match direction {
+                        ActionPromptDirection::Previous => GhosttyPromptDirection::Previous,
+                        ActionPromptDirection::Next => GhosttyPromptDirection::Next,
+                    };
+                    terminal.update(cx, |terminal, cx| terminal.jump_to_prompt(direction, cx));
+                }
+            }
+            AppAction::SelectCommandOutput => {
+                if let Some(terminal) = self.active_terminal(window, cx) {
+                    terminal.update(cx, |terminal, cx| terminal.select_command_output(cx));
+                }
+            }
+            AppAction::CopyCommandOutput => {
+                if let Some(terminal) = self.active_terminal(window, cx) {
+                    terminal.update(cx, |terminal, cx| terminal.copy_command_output(cx));
+                }
+            }
             AppAction::ToggleSidebar => self.toggle_sidebar(cx),
             AppAction::SelectTab { index } => self.activate_tab(usize::from(index), cx),
             AppAction::MoveTab { direction } => self.move_active_tab(direction, cx),
@@ -635,17 +656,21 @@ impl PaneContainer {
         let has_selection = active_terminal
             .as_ref()
             .is_some_and(|terminal| terminal.read(cx).has_selection());
-        let has_local_working_directory = active_terminal.is_some_and(|terminal| {
+        let has_local_working_directory = active_terminal.as_ref().is_some_and(|terminal| {
             terminal
                 .read(cx)
                 .current_working_directory()
                 .is_some_and(|directory| directory.is_dir())
         });
+        let semantic_commands_available = active_terminal
+            .as_ref()
+            .is_some_and(|terminal| terminal.read(cx).semantic_commands_available());
         ActionContext {
             has_selection,
             pane_count,
             tab_count: self.tabs.len(),
             has_local_working_directory,
+            semantic_commands_available,
             pane_management_available: true,
             search_available: false,
             quick_terminal_available: false,

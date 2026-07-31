@@ -5,6 +5,7 @@
 
 mod error;
 mod selection;
+mod semantic;
 mod terminal;
 
 #[cfg(test)]
@@ -30,6 +31,7 @@ mod ffi;
 pub use error::{Error, Result};
 pub use render::RenderState;
 pub use selection::{SelectionDrag, SelectionGeometry, SelectionPoint, SelectionPress};
+pub use semantic::PromptDirection;
 pub use terminal::{
     ClipboardContent, ClipboardLocation, ClipboardWrite, ClipboardWriteResult, Scrollbar, Terminal,
     TerminalOptions, ViewportScroll,
