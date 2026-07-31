@@ -81,25 +81,11 @@ impl LayoutRect {
     }
 
     fn overlap_x(self, other: Self) -> f32 {
-        (self.x + self.width)
-            .min(other.x + other.width)
-            .saturating_sub_f32(self.x.max(other.x))
+        ((self.x + self.width).min(other.x + other.width) - self.x.max(other.x)).max(0.0)
     }
 
     fn overlap_y(self, other: Self) -> f32 {
-        (self.y + self.height)
-            .min(other.y + other.height)
-            .saturating_sub_f32(self.y.max(other.y))
-    }
-}
-
-trait SaturatingSubF32 {
-    fn saturating_sub_f32(self, other: Self) -> Self;
-}
-
-impl SaturatingSubF32 for f32 {
-    fn saturating_sub_f32(self, other: Self) -> Self {
-        (self - other).max(0.0)
+        ((self.y + self.height).min(other.y + other.height) - self.y.max(other.y)).max(0.0)
     }
 }
 
@@ -549,7 +535,7 @@ impl SplitNode {
         }
     }
 
-    fn pane_ids(&self) -> Vec<PaneId> {
+    pub(crate) fn pane_ids(&self) -> Vec<PaneId> {
         let mut pane_ids = Vec::new();
         self.collect_pane_ids(&mut pane_ids);
         pane_ids

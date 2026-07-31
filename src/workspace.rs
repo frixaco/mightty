@@ -155,7 +155,7 @@ impl WorkspaceTab {
         if self.title.trim().is_empty() {
             return Err(WorkspaceError::new("workspace tab title must not be empty"));
         }
-        let leaf_ids = pane_ids(&self.root);
+        let leaf_ids = self.root.pane_ids();
         let unique_leaf_ids = leaf_ids.iter().copied().collect::<BTreeSet<_>>();
         let pane_ids = self.panes.keys().copied().collect::<BTreeSet<_>>();
         if unique_leaf_ids.len() != leaf_ids.len() || unique_leaf_ids != pane_ids {
@@ -298,17 +298,6 @@ impl fmt::Display for WorkspaceError {
 }
 
 impl std::error::Error for WorkspaceError {}
-
-fn pane_ids(node: &SplitNode) -> Vec<PaneId> {
-    match node {
-        SplitNode::Leaf { pane_id } => vec![*pane_id],
-        SplitNode::Branch { first, second, .. } => {
-            let mut ids = pane_ids(first);
-            ids.extend(pane_ids(second));
-            ids
-        }
-    }
-}
 
 fn validate_ratios(node: &SplitNode) -> Result<(), WorkspaceError> {
     let SplitNode::Branch {
