@@ -88,6 +88,9 @@ safe live reload.
 
 See [Workspaces](docs/workspaces.md) for named layout save and restore.
 
+See [Shell integration](docs/shell-integration.md) for PowerShell and Bash
+prompt markers, directory inheritance, and semantic actions.
+
 ## Shell I/O
 
 Terminal I/O is wake-driven. `TerminalWidget` owns a `PtyWorker`; the platform

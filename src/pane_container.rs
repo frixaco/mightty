@@ -290,7 +290,7 @@ impl PaneContainer {
                     .map(|(pane_id, profile_id, terminal)| {
                         let working_directory = terminal
                             .read(cx)
-                            .current_working_directory()
+                            .workspace_working_directory()
                             .filter(|directory| {
                                 trusted_working_directory(directory) && directory.is_dir()
                             });
@@ -564,7 +564,7 @@ impl PaneContainer {
             AppAction::SplitFromCurrentDirectory { direction } => {
                 let working_directory = self
                     .active_terminal(window, cx)
-                    .and_then(|terminal| terminal.read(cx).current_working_directory())
+                    .and_then(|terminal| terminal.read(cx).reported_local_working_directory())
                     .filter(|directory| directory.is_dir());
                 if working_directory.is_some() {
                     let axis = match direction {
@@ -659,7 +659,7 @@ impl PaneContainer {
         let has_local_working_directory = active_terminal.as_ref().is_some_and(|terminal| {
             terminal
                 .read(cx)
-                .current_working_directory()
+                .reported_local_working_directory()
                 .is_some_and(|directory| directory.is_dir())
         });
         let semantic_commands_available = active_terminal

@@ -13,7 +13,14 @@ pub enum PromptDirection {
 
 impl Terminal {
     pub fn has_semantic_prompt(&self) -> Result<bool> {
-        Ok(!self.semantic_prompt_rows()?.is_empty())
+        let total_rows = self.total_rows()?;
+        let first_recent_row = total_rows.saturating_sub(usize::from(self.visible_rows()?));
+        for row in (first_recent_row..total_rows).rev() {
+            if self.row_is_primary_prompt(row)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     pub fn jump_to_prompt(&mut self, direction: PromptDirection) -> Result<bool> {
@@ -31,19 +38,52 @@ impl Terminal {
     }
 
     pub fn select_command_output(&mut self) -> Result<bool> {
+        let Some(selection) = self.preceding_command_output_selection()? else {
+            return Ok(false);
+        };
+        let mut start = ffi::PointCoordinate::default();
+        let result = unsafe {
+            ffi::ghostty_terminal_point_from_grid_ref(
+                self.as_raw(),
+                &raw const selection.start,
+                ffi::PointTag::SCREEN,
+                &raw mut start,
+            )
+        };
+        from_result(result)?;
+        let result = unsafe {
+            ffi::ghostty_terminal_set(
+                self.as_raw(),
+                ffi::TerminalOption::SELECTION,
+                std::ptr::from_ref(&selection).cast(),
+            )
+        };
+        from_result(result)?;
+        self.scroll_viewport(ViewportScroll::Row(start.y as usize));
+        Ok(true)
+    }
+
+    pub fn command_output_text(&self) -> Result<Option<String>> {
+        let Some(selection) = self.preceding_command_output_selection()? else {
+            return Ok(None);
+        };
+        self.format_selection_text(Some(&selection))
+    }
+
+    fn preceding_command_output_selection(&self) -> Result<Option<ffi::Selection>> {
         let cursor_row = self
             .scrollback_rows()?
             .checked_add(usize::from(self.cursor_y()?))
             .ok_or(Error::InvalidValue)?;
         let prompts = self.semantic_prompt_rows()?;
         let Some(current_prompt_index) = prompts.iter().rposition(|row| *row <= cursor_row) else {
-            return Ok(false);
+            return Ok(None);
         };
         let Some(previous_prompt) = current_prompt_index
             .checked_sub(1)
             .map(|index| prompts[index])
         else {
-            return Ok(false);
+            return Ok(None);
         };
         let current_prompt = prompts[current_prompt_index];
         let cols = self.cols()?;
@@ -62,29 +102,19 @@ impl Terminal {
                     )?
                 };
                 if has_text && semantic == ffi::CellSemanticContent::OUTPUT {
-                    return self.select_output_at(grid_ref);
+                    return self.output_selection_at(grid_ref);
                 }
             }
         }
-        Ok(false)
+        Ok(None)
     }
 
     fn semantic_prompt_rows(&self) -> Result<Vec<usize>> {
         let total_rows = self.total_rows()?;
         let mut prompts = Vec::new();
         for row in 0..total_rows {
-            let grid_ref = self.grid_ref_at_screen_point(0, row)?;
-            let mut raw_row = 0;
-            let result =
-                unsafe { ffi::ghostty_grid_ref_row(&raw const grid_ref, &raw mut raw_row) };
-            from_result(result)?;
-            let semantic = unsafe {
-                row_value::<ffi::RowSemanticPrompt::Type>(raw_row, ffi::RowData::SEMANTIC_PROMPT)?
-            };
-            match semantic {
-                ffi::RowSemanticPrompt::PROMPT => prompts.push(row),
-                ffi::RowSemanticPrompt::NONE | ffi::RowSemanticPrompt::PROMPT_CONTINUATION => {}
-                _ => return Err(Error::InvalidValue),
+            if self.row_is_primary_prompt(row)? {
+                prompts.push(row);
             }
         }
         Ok(prompts)
@@ -116,6 +146,10 @@ impl Terminal {
         unsafe { terminal_value(self, ffi::TerminalData::COLS) }
     }
 
+    fn visible_rows(&self) -> Result<u16> {
+        unsafe { terminal_value(self, ffi::TerminalData::ROWS) }
+    }
+
     fn viewport_active(&self) -> Result<bool> {
         unsafe { terminal_value(self, ffi::TerminalData::VIEWPORT_ACTIVE) }
     }
@@ -138,7 +172,22 @@ impl Terminal {
         Ok(grid_ref)
     }
 
-    fn select_output_at(&mut self, grid_ref: ffi::GridRef) -> Result<bool> {
+    fn row_is_primary_prompt(&self, row: usize) -> Result<bool> {
+        let grid_ref = self.grid_ref_at_screen_point(0, row)?;
+        let mut raw_row = 0;
+        let result = unsafe { ffi::ghostty_grid_ref_row(&raw const grid_ref, &raw mut raw_row) };
+        from_result(result)?;
+        let semantic = unsafe {
+            row_value::<ffi::RowSemanticPrompt::Type>(raw_row, ffi::RowData::SEMANTIC_PROMPT)?
+        };
+        match semantic {
+            ffi::RowSemanticPrompt::PROMPT => Ok(true),
+            ffi::RowSemanticPrompt::NONE | ffi::RowSemanticPrompt::PROMPT_CONTINUATION => Ok(false),
+            _ => Err(Error::InvalidValue),
+        }
+    }
+
+    fn output_selection_at(&self, grid_ref: ffi::GridRef) -> Result<Option<ffi::Selection>> {
         let mut selection = ffi::Selection {
             size: size_of::<ffi::Selection>(),
             ..Default::default()
@@ -147,33 +196,14 @@ impl Terminal {
             ffi::ghostty_terminal_select_output(self.as_raw(), grid_ref, &raw mut selection)
         };
         match result {
-            ffi::Result::NO_VALUE => return Ok(false),
+            ffi::Result::NO_VALUE => return Ok(None),
             ffi::Result::SUCCESS => {}
             other => {
                 from_result(other)?;
                 unreachable!("successful and missing semantic output handled above")
             }
         }
-        let mut start = ffi::PointCoordinate::default();
-        let result = unsafe {
-            ffi::ghostty_terminal_point_from_grid_ref(
-                self.as_raw(),
-                &raw const selection.start,
-                ffi::PointTag::SCREEN,
-                &raw mut start,
-            )
-        };
-        from_result(result)?;
-        let result = unsafe {
-            ffi::ghostty_terminal_set(
-                self.as_raw(),
-                ffi::TerminalOption::SELECTION,
-                std::ptr::from_ref(&selection).cast(),
-            )
-        };
-        from_result(result)?;
-        self.scroll_viewport(ViewportScroll::Row(start.y as usize));
-        Ok(true)
+        Ok(Some(selection))
     }
 }
 
@@ -241,6 +271,17 @@ mod tests {
 
         assert!(terminal.select_command_output().unwrap());
         assert_eq!(terminal.selected_text().unwrap().as_deref(), Some("two"));
+    }
+
+    #[test]
+    fn formats_command_output_without_changing_the_selection() {
+        let terminal = terminal_with_commands();
+
+        assert_eq!(
+            terminal.command_output_text().unwrap().as_deref(),
+            Some("two")
+        );
+        assert_eq!(terminal.selected_text().unwrap(), None);
     }
 
     #[test]

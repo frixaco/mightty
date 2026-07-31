@@ -136,6 +136,7 @@ pub struct TerminalWidget {
     terminal_effects: Rc<RefCell<PendingTerminalEffects>>,
     reported_title: Option<Option<String>>,
     reported_working_directory: Option<Option<String>>,
+    semantic_commands_available: bool,
     theme: TerminalTheme,
     has_exited: bool,
 }
@@ -151,8 +152,8 @@ impl EventEmitter<TerminalEvent> for TerminalWidget {}
 
 #[derive(Default)]
 struct PendingTerminalEffects {
-    title: Option<Option<String>>,
-    working_directory: Option<Option<String>>,
+    title: Option<crate::ghostty::Result<Option<String>>>,
+    working_directory: Option<crate::ghostty::Result<Option<String>>>,
     bell: bool,
 }
 
@@ -210,8 +211,15 @@ impl TerminalWidget {
 
         #[cfg(any(windows, unix))]
         let (pty_worker, pty_event_rx, pty_tx) = {
+            let launch = match crate::shell_integration::prepare_launch(&config.launch) {
+                Ok(launch) => launch,
+                Err(error) => {
+                    eprintln!("Failed to prepare shell integration: {error}");
+                    config.launch.clone()
+                }
+            };
             match PtyWorker::spawn(
-                config.launch.clone(),
+                launch,
                 config.initial_rows,
                 config.initial_cols,
                 Arc::clone(&exit_flag),
@@ -319,6 +327,7 @@ impl TerminalWidget {
             terminal_effects,
             reported_title: None,
             reported_working_directory: None,
+            semantic_commands_available: false,
             theme,
             has_exited,
         };
@@ -363,7 +372,14 @@ impl TerminalWidget {
             .is_ok_and(|text| text.is_some_and(|text| !text.is_empty()))
     }
 
-    pub(crate) fn current_working_directory(&self) -> Option<PathBuf> {
+    pub(crate) fn reported_local_working_directory(&self) -> Option<PathBuf> {
+        self.reported_working_directory
+            .as_ref()
+            .and_then(Option::as_deref)
+            .and_then(crate::shell_integration::local_working_directory)
+    }
+
+    pub(crate) fn workspace_working_directory(&self) -> Option<PathBuf> {
         match &self.reported_working_directory {
             Some(Some(report)) => crate::shell_integration::local_working_directory(report),
             Some(None) => None,
@@ -376,7 +392,7 @@ impl TerminalWidget {
     }
 
     pub(crate) fn semantic_commands_available(&self) -> bool {
-        self.terminal.has_semantic_prompt().unwrap_or(false)
+        self.semantic_commands_available
     }
 
     pub(crate) fn jump_to_prompt(
@@ -400,12 +416,9 @@ impl TerminalWidget {
     }
 
     pub(crate) fn copy_command_output(&mut self, cx: &mut Context<Self>) {
-        match self.terminal.select_command_output() {
-            Ok(true) => {
-                self.copy_selection(cx);
-                cx.notify();
-            }
-            Ok(false) => {}
+        match self.terminal.command_output_text() {
+            Ok(Some(text)) => cx.write_to_clipboard(ClipboardItem::new_string(text)),
+            Ok(None) => {}
             Err(error) => eprintln!("Failed to copy command output: {error}"),
         }
     }
@@ -477,6 +490,10 @@ impl TerminalWidget {
         match event {
             PtyEvent::Output(data) => {
                 self.terminal.vt_write(&data);
+                if !self.semantic_commands_available {
+                    self.semantic_commands_available =
+                        self.terminal.has_semantic_prompt().unwrap_or(false);
+                }
                 for text in self.terminal_clipboard_writes.borrow_mut().drain(..) {
                     cx.write_to_clipboard(ClipboardItem::new_string(text));
                 }
@@ -489,12 +506,22 @@ impl TerminalWidget {
     fn emit_terminal_effects(&mut self, cx: &mut Context<Self>) {
         let effects = std::mem::take(&mut *self.terminal_effects.borrow_mut());
         if let Some(title) = effects.title {
-            self.reported_title = Some(title.clone());
-            cx.emit(TerminalEvent::TitleChanged(title));
+            match title {
+                Ok(title) => {
+                    self.reported_title = Some(title.clone());
+                    cx.emit(TerminalEvent::TitleChanged(title));
+                }
+                Err(error) => eprintln!("Ignored invalid terminal title: {error}"),
+            }
         }
         if let Some(working_directory) = effects.working_directory {
-            self.reported_working_directory = Some(working_directory.clone());
-            cx.emit(TerminalEvent::WorkingDirectoryChanged(working_directory));
+            match working_directory {
+                Ok(working_directory) => {
+                    self.reported_working_directory = Some(working_directory.clone());
+                    cx.emit(TerminalEvent::WorkingDirectoryChanged(working_directory));
+                }
+                Err(error) => eprintln!("Ignored invalid terminal working directory: {error}"),
+            }
         }
         if effects.bell {
             cx.emit(TerminalEvent::Bell);

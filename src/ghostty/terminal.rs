@@ -270,12 +270,19 @@ impl Terminal {
     }
 
     pub fn selected_text(&self) -> Result<Option<String>> {
+        self.format_selection_text(None)
+    }
+
+    pub(super) fn format_selection_text(
+        &self,
+        selection: Option<&ffi::Selection>,
+    ) -> Result<Option<String>> {
         let options = ffi::TerminalSelectionFormatOptions {
             size: size_of::<ffi::TerminalSelectionFormatOptions>(),
             emit: ffi::FormatterFormat::PLAIN,
             unwrap: true,
             trim: true,
-            selection: std::ptr::null(),
+            selection: selection.map_or(std::ptr::null(), std::ptr::from_ref),
         };
         let mut required = 0_usize;
         let result = unsafe {
@@ -341,7 +348,7 @@ impl Terminal {
 
     pub fn on_title_changed(
         &mut self,
-        callback: impl FnMut(Option<String>) + 'static,
+        callback: impl FnMut(Result<Option<String>>) + 'static,
     ) -> Result<&mut Self> {
         self.callbacks.title_changed = Some(Box::new(callback));
         let callback: ffi::TerminalTitleChangedFn = Some(title_changed_trampoline);
@@ -354,7 +361,7 @@ impl Terminal {
 
     pub fn on_working_directory_changed(
         &mut self,
-        callback: impl FnMut(Option<String>) + 'static,
+        callback: impl FnMut(Result<Option<String>>) + 'static,
     ) -> Result<&mut Self> {
         self.callbacks.working_directory_changed = Some(Box::new(callback));
         let callback: ffi::TerminalPwdChangedFn = Some(working_directory_changed_trampoline);
@@ -466,7 +473,7 @@ impl Drop for Terminal {
 
 type PtyWriteCallback = dyn FnMut(&[u8]) + 'static;
 type BellCallback = dyn FnMut() + 'static;
-type MetadataCallback = dyn FnMut(Option<String>) + 'static;
+type MetadataCallback = dyn FnMut(Result<Option<String>>) + 'static;
 type ClipboardWriteCallback = dyn FnMut(ClipboardWrite) -> ClipboardWriteResult + 'static;
 
 #[derive(Default)]
@@ -509,9 +516,7 @@ unsafe extern "C" fn bell_trampoline(_terminal: ffi::Terminal, userdata: *mut c_
 }
 
 unsafe extern "C" fn title_changed_trampoline(terminal: ffi::Terminal, userdata: *mut c_void) {
-    let title = terminal_string(terminal, ffi::TerminalData::TITLE)
-        .ok()
-        .flatten();
+    let title = terminal_string(terminal, ffi::TerminalData::TITLE);
     invoke_callback(userdata, |callbacks| {
         if let Some(callback) = callbacks.title_changed.as_deref_mut() {
             callback(title);
@@ -523,9 +528,7 @@ unsafe extern "C" fn working_directory_changed_trampoline(
     terminal: ffi::Terminal,
     userdata: *mut c_void,
 ) {
-    let working_directory = terminal_string(terminal, ffi::TerminalData::PWD)
-        .ok()
-        .flatten();
+    let working_directory = terminal_string(terminal, ffi::TerminalData::PWD);
     invoke_callback(userdata, |callbacks| {
         if let Some(callback) = callbacks.working_directory_changed.as_deref_mut() {
             callback(working_directory);
@@ -578,7 +581,10 @@ fn terminal_string(
     let mut raw = MaybeUninit::<ffi::String>::uninit();
     let result = unsafe { ffi::ghostty_terminal_get(terminal, data, raw.as_mut_ptr().cast()) };
     from_result(result)?;
-    let raw = unsafe { raw.assume_init() };
+    owned_terminal_string(unsafe { raw.assume_init() })
+}
+
+fn owned_terminal_string(raw: ffi::String) -> Result<Option<String>> {
     if raw.len == 0 {
         return Ok(None);
     }
@@ -762,14 +768,46 @@ mod tests {
         assert_eq!(terminal.title().unwrap().as_deref(), Some("mightty test"));
         assert_eq!(
             titles.borrow().as_slice(),
-            &[Some("mightty test".to_string())]
+            &[Ok(Some("mightty test".to_string()))]
         );
         assert_eq!(
             directories.borrow().last(),
-            Some(&terminal.working_directory().unwrap())
+            Some(&terminal.working_directory())
         );
         assert_eq!(*bells.borrow(), 1);
         assert_eq!(clipboard.borrow()[0].contents[0].data.as_slice(), b"hello");
+    }
+
+    #[test]
+    fn ignores_invalid_utf8_metadata_and_accepts_the_next_valid_value() {
+        let titles = Rc::new(RefCell::new(Vec::new()));
+        let title_events = Rc::clone(&titles);
+        let mut terminal = selection_terminal(80, 24);
+        terminal
+            .on_title_changed(move |title| title_events.borrow_mut().push(title))
+            .unwrap();
+
+        terminal.vt_write(b"\x1b]2;first\x07\x1b]2;\xff\x07\x1b]2;second\x07");
+
+        assert_eq!(
+            titles.borrow().as_slice(),
+            &[
+                Ok(Some("first".to_string())),
+                Ok(Some("second".to_string()))
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_utf8_from_ghostty_metadata() {
+        let bytes = [0xff];
+        assert_eq!(
+            owned_terminal_string(ffi::String {
+                ptr: bytes.as_ptr(),
+                len: bytes.len(),
+            }),
+            Err(Error::InvalidValue)
+        );
     }
 
     #[test]
