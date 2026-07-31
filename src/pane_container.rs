@@ -642,7 +642,11 @@ impl PaneContainer {
                     cx,
                 );
             }
-            AppAction::Search => {}
+            AppAction::Search => {
+                if let Some(terminal) = self.active_terminal(window, cx) {
+                    terminal.update(cx, |terminal, cx| terminal.open_search(window, cx));
+                }
+            }
         }
     }
 
@@ -678,7 +682,7 @@ impl PaneContainer {
             has_local_working_directory,
             semantic_commands_available,
             pane_management_available: true,
-            search_available: false,
+            search_available: active_terminal.is_some(),
             quick_terminal_available: cfg!(windows)
                 && self.settings.current().app.quick_terminal.enabled,
         }

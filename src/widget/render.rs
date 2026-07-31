@@ -79,6 +79,15 @@ impl Render for TerminalWidget {
 
         let cell_size = self.cell_size;
         let selection_color = super::rgba_to_rgb(self.theme.selection);
+        let search_highlights =
+            self.search
+                .as_ref()
+                .and_then(|search| {
+                    self.terminal.scrollbar().ok().map(|scrollbar| {
+                        search.visible_highlights(scrollbar, self.size.0, self.size.1)
+                    })
+                })
+                .unwrap_or_default();
         let graphics = match self.graphics_renderer.frame(&self.terminal, cell_size) {
             Ok(frame) => frame,
             Err(error) => {
@@ -273,6 +282,21 @@ impl Render for TerminalWidget {
         }
 
         elements.extend(background_elements);
+        elements.extend(search_highlights.into_iter().map(|highlight| {
+            let color = if highlight.active {
+                gpui::rgba(0xffa500cc)
+            } else {
+                gpui::rgba(0xffd54f66)
+            };
+            div()
+                .absolute()
+                .left(cell_size.0 * f32::from(highlight.start_column))
+                .top(cell_size.1 * f32::from(highlight.row))
+                .w(cell_size.0 * f32::from(highlight.end_column - highlight.start_column + 1))
+                .h(cell_size.1)
+                .bg(color)
+                .into_any_element()
+        }));
         elements.extend(
             graphics
                 .below_text
@@ -459,6 +483,54 @@ impl Render for TerminalWidget {
                         ),
                 )
         });
+        let search_overlay = self.search.as_ref().map(|search| {
+            let query = if search.query.is_empty() {
+                "Type to search".to_string()
+            } else {
+                format!("{}│", search.query)
+            };
+            let diagnostic = search.diagnostic.as_ref().map(|diagnostic| {
+                div()
+                    .text_size(px(11.0))
+                    .text_color(gpui::rgb(0xff8a80))
+                    .child(diagnostic.clone())
+            });
+            div()
+                .absolute()
+                .top(px(10.0))
+                .right(px(18.0))
+                .w(px(420.0))
+                .p(px(10.0))
+                .rounded(px(6.0))
+                .bg(gpui::rgba(0x20242aee))
+                .border_1()
+                .border_color(gpui::rgb(0x4b5563))
+                .text_color(gpui::white())
+                .occlude()
+                .flex()
+                .flex_col()
+                .gap(px(5.0))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(div().text_size(px(13.0)).child(query))
+                        .child(
+                            div()
+                                .text_size(px(11.0))
+                                .text_color(gpui::rgb(0xaeb8c4))
+                                .child(search.result_label()),
+                        ),
+                )
+                .children(diagnostic)
+                .child(
+                    div()
+                        .text_size(px(10.0))
+                        .text_color(gpui::rgb(0x8c98a8))
+                        .child("Enter: next · Shift+Enter: previous · Esc: close"),
+                )
+        });
 
         div()
             .size_full()
@@ -547,6 +619,7 @@ impl Render for TerminalWidget {
                 .size_full(),
             )
             .children(paste_confirmation)
+            .children(search_overlay)
     }
 }
 

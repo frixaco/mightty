@@ -8,6 +8,7 @@ mod graphics;
 mod input;
 mod pty;
 mod render;
+mod search;
 
 use crate::action::{
     ActionBinding, AppAction, DispatchAppAction, PromptDirection, chord_for_keystroke,
@@ -15,8 +16,9 @@ use crate::action::{
 };
 use crate::feedback;
 use crate::ghostty::{
-    ClipboardLocation, ClipboardWrite, ClipboardWriteResult, RenderState, Scrollbar, SelectionDrag,
-    SelectionGeometry, SelectionPoint, SelectionPress, Terminal, TerminalOptions, ViewportScroll,
+    ClipboardLocation, ClipboardWrite, ClipboardWriteResult, RenderState, Scrollbar,
+    SearchDirection, SearchProgress, SelectionDrag, SelectionGeometry, SelectionPoint,
+    SelectionPress, Terminal, TerminalOptions, ViewportScroll,
     key::{Action, Encoder, Event},
     mouse::{Action as MouseAction, Button as MouseButton, Encoder as MouseEncoder},
     mouse::{Event as MouseEvent, Geometry as MouseGeometry},
@@ -117,6 +119,8 @@ pub struct TerminalWidget {
     row_iterator: RowIterator,
     cell_iterator: CellIterator,
     graphics_renderer: graphics::GraphicsRenderer,
+    search: Option<search::SearchOverlay>,
+    search_task: Task<()>,
     config: TerminalConfig,
     pty_tx: Option<flume::Sender<PtyCommand>>,
     exit_signal_tx: Option<flume::Sender<()>>,
@@ -314,6 +318,8 @@ impl TerminalWidget {
             row_iterator,
             cell_iterator,
             graphics_renderer,
+            search: None,
+            search_task: Task::ready(()),
             config,
             pty_tx,
             exit_signal_tx: None,
@@ -427,6 +433,125 @@ impl TerminalWidget {
         }
     }
 
+    pub(crate) fn open_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.search.is_none() {
+            self.search = Some(search::SearchOverlay::default());
+        }
+        self.focus_handle.focus(window);
+        cx.notify();
+    }
+
+    fn close_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.terminal.stop_search();
+        self.search = None;
+        self.search_task = Task::ready(());
+        self.focus_handle.focus(window);
+        cx.notify();
+    }
+
+    fn restart_search(&mut self, cx: &mut Context<Self>) {
+        let Some(search) = self.search.as_mut() else {
+            return;
+        };
+        search.revision = search.revision.wrapping_add(1);
+        search.ranges.clear();
+        search.active = None;
+        search.diagnostic = None;
+        search.step_scheduled = false;
+        if search.query.is_empty() {
+            search.progress = SearchProgress::Complete;
+            self.terminal.stop_search();
+            self.search_task = Task::ready(());
+            cx.notify();
+            return;
+        }
+
+        match self.terminal.start_search(&search.query) {
+            Ok(()) => {
+                search.progress = SearchProgress::Pending;
+                self.schedule_search_step(cx);
+            }
+            Err(error) => {
+                search.progress = SearchProgress::Complete;
+                search.diagnostic = Some(error.to_string());
+                cx.notify();
+            }
+        }
+    }
+
+    fn schedule_search_step(&mut self, cx: &mut Context<Self>) {
+        let Some(search) = self.search.as_mut() else {
+            return;
+        };
+        if search.query.is_empty() || search.step_scheduled {
+            return;
+        }
+        search.step_scheduled = true;
+        let revision = search.revision;
+        self.search_task = cx.spawn(async move |this, cx| {
+            Timer::after(Duration::from_millis(1)).await;
+            let Some(this) = this.upgrade() else {
+                return;
+            };
+            this.update(cx, |this, cx| {
+                let Some(search) = this.search.as_mut() else {
+                    return;
+                };
+                if search.revision != revision {
+                    return;
+                }
+                search.step_scheduled = false;
+
+                let progress = this.terminal.search_step();
+                let ranges = this.terminal.search_ranges();
+                let search = this.search.as_mut().expect("search remains open");
+                match (progress, ranges) {
+                    (Ok(progress), Ok(ranges)) => {
+                        search.progress = progress;
+                        search.ranges = ranges;
+                        if search
+                            .active
+                            .is_some_and(|active| !search.ranges.contains(&active))
+                        {
+                            search.active = None;
+                        }
+                        search.diagnostic = None;
+                        cx.notify();
+                        if progress == SearchProgress::Pending {
+                            this.schedule_search_step(cx);
+                        }
+                    }
+                    (Err(error), _) | (_, Err(error)) => {
+                        search.progress = SearchProgress::Complete;
+                        search.diagnostic = Some(error.to_string());
+                        cx.notify();
+                    }
+                }
+            })
+            .ok();
+        });
+    }
+
+    fn navigate_search(&mut self, direction: SearchDirection, cx: &mut Context<Self>) {
+        match self.terminal.search_select(direction) {
+            Ok(Some(range)) => {
+                self.terminal
+                    .scroll_viewport(ViewportScroll::Row(range.start.row as usize));
+                if let Some(search) = self.search.as_mut() {
+                    search.active = Some(range);
+                }
+                cx.notify();
+            }
+            Ok(None) => {}
+            Err(error) => {
+                if let Some(search) = self.search.as_mut() {
+                    search.diagnostic = Some(error.to_string());
+                }
+                cx.notify();
+            }
+        }
+    }
+
     fn schedule_cursor_blink(&mut self, cx: &mut Context<Self>) {
         if !self.config.cursor_blink {
             self.cursor_blink_phase = true;
@@ -494,6 +619,9 @@ impl TerminalWidget {
         match event {
             PtyEvent::Output(data) => {
                 self.terminal.vt_write(&data);
+                if self.search.is_some() {
+                    self.schedule_search_step(cx);
+                }
                 if !self.semantic_commands_available {
                     self.semantic_commands_available =
                         self.terminal.has_semantic_prompt().unwrap_or(false);
@@ -599,6 +727,46 @@ impl TerminalWidget {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.search.is_some() {
+            match event.keystroke.key.as_str() {
+                "escape" => self.close_search(window, cx),
+                "enter" => {
+                    let direction = if event.keystroke.modifiers.shift {
+                        SearchDirection::Previous
+                    } else {
+                        SearchDirection::Next
+                    };
+                    self.navigate_search(direction, cx);
+                }
+                "backspace" => {
+                    self.search
+                        .as_mut()
+                        .expect("search remains open")
+                        .query
+                        .pop();
+                    self.restart_search(cx);
+                }
+                _ if !event.keystroke.modifiers.control
+                    && !event.keystroke.modifiers.alt
+                    && !event.keystroke.modifiers.platform =>
+                {
+                    if let Some(text) = &event.keystroke.key_char {
+                        let search = self.search.as_mut().expect("search remains open");
+                        if search.query.len().saturating_add(text.len())
+                            <= search::MAX_SEARCH_QUERY_BYTES
+                        {
+                            search.query.push_str(text);
+                            self.restart_search(cx);
+                        }
+                    }
+                }
+                _ => {}
+            }
+            window.prevent_default();
+            cx.stop_propagation();
+            return;
+        }
+
         if self.pending_paste.is_some() {
             match event.keystroke.key.as_str() {
                 "enter" => self.confirm_pending_paste(cx),
@@ -628,7 +796,7 @@ impl TerminalWidget {
     }
 
     fn handle_key_up(&mut self, event: &KeyUpEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if self.pending_paste.is_some() {
+        if self.search.is_some() || self.pending_paste.is_some() {
             window.prevent_default();
             cx.stop_propagation();
             return;
