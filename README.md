@@ -86,6 +86,8 @@ The default shell is `pwsh.exe` on Windows. Unix uses `$SHELL`, falling back to
 See [Settings](docs/settings.md) for profiles, themes, fonts, key bindings, and
 safe live reload.
 
+See [Workspaces](docs/workspaces.md) for named layout save and restore.
+
 ## Shell I/O
 
 Terminal I/O is wake-driven. `TerminalWidget` owns a `PtyWorker`; the platform

@@ -8,6 +8,7 @@ pub mod profile;
 pub mod settings;
 pub mod shell;
 pub mod widget;
+pub mod workspace;
 
 pub mod pane_container;
 pub mod split;

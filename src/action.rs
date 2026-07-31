@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::profile::ProfileId;
+use crate::workspace::WorkspaceId;
 
 /// One application command shared by shortcuts, menus, palettes, and IPC.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -29,7 +30,16 @@ pub enum AppAction {
     SelectTab {
         index: u8,
     },
+    MoveTab {
+        direction: Direction,
+    },
     CommandPalette,
+    SaveWorkspace {
+        workspace_id: WorkspaceId,
+    },
+    RestoreWorkspace {
+        workspace_id: WorkspaceId,
+    },
     ToggleQuickTerminal,
     Quit,
 }
@@ -133,11 +143,35 @@ impl AppAction {
             Self::SelectTab { .. } => {
                 descriptor("select_tab", "Select tab", ActionCategory::Window, &[])
             }
+            Self::MoveTab {
+                direction: Direction::Up,
+            } => descriptor("move_tab_up", "Move tab up", ActionCategory::Window, &[]),
+            Self::MoveTab {
+                direction: Direction::Down,
+            } => descriptor(
+                "move_tab_down",
+                "Move tab down",
+                ActionCategory::Window,
+                &[],
+            ),
+            Self::MoveTab { .. } => descriptor("move_tab", "Move tab", ActionCategory::Window, &[]),
             Self::CommandPalette => descriptor(
                 "command_palette",
                 "Command palette",
                 ActionCategory::Window,
                 &["ctrl-shift-p", "cmd-shift-p"],
+            ),
+            Self::SaveWorkspace { .. } => descriptor(
+                "save_workspace",
+                "Save workspace",
+                ActionCategory::Application,
+                &[],
+            ),
+            Self::RestoreWorkspace { .. } => descriptor(
+                "restore_workspace",
+                "Restore workspace",
+                ActionCategory::Application,
+                &[],
             ),
             Self::ToggleQuickTerminal => descriptor(
                 "toggle_quick_terminal",
@@ -169,6 +203,9 @@ impl AppAction {
             }
             Self::ToggleQuickTerminal if !context.quick_terminal_available => {
                 ActionAvailability::Unavailable("Quick terminal is unavailable")
+            }
+            Self::MoveTab { .. } if context.tab_count < 2 => {
+                ActionAvailability::Unavailable("The window has only one tab")
             }
             _ => ActionAvailability::Available,
         }
@@ -206,7 +243,16 @@ impl AppAction {
             Self::Paste,
             Self::Search,
             Self::ToggleSidebar,
+            Self::MoveTab {
+                direction: Direction::Up,
+            },
+            Self::MoveTab {
+                direction: Direction::Down,
+            },
             Self::CommandPalette,
+            Self::SaveWorkspace {
+                workspace_id: WorkspaceId::default_workspace(),
+            },
             Self::ToggleQuickTerminal,
             Self::Quit,
         ]);
@@ -261,6 +307,7 @@ pub struct ActionDescriptor {
 pub struct ActionContext {
     pub has_selection: bool,
     pub pane_count: usize,
+    pub tab_count: usize,
     pub pane_management_available: bool,
     pub search_available: bool,
     pub quick_terminal_available: bool,
@@ -409,5 +456,19 @@ mod tests {
 
         assert_eq!(chord, "ctrl-shift-p");
         assert_eq!(chord_for_keystroke(&keystroke), chord);
+    }
+
+    #[test]
+    fn workspace_actions_keep_a_stable_serialized_id() {
+        let action = AppAction::RestoreWorkspace {
+            workspace_id: WorkspaceId::new("project-a").unwrap(),
+        };
+        let json = serde_json::to_string(&action).unwrap();
+
+        assert_eq!(
+            json,
+            r#"{"type":"restore_workspace","workspace_id":"project-a"}"#
+        );
+        assert_eq!(serde_json::from_str::<AppAction>(&json).unwrap(), action);
     }
 }

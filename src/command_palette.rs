@@ -2,6 +2,7 @@
 
 use crate::action::{ActionAvailability, ActionCategory, ActionContext, AppAction, SplitDirection};
 use crate::settings::ResolvedSettings;
+use crate::workspace::WorkspaceId;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PaletteCommand {
@@ -12,7 +13,11 @@ pub struct PaletteCommand {
     pub unavailable_reason: Option<&'static str>,
 }
 
-pub fn commands(settings: &ResolvedSettings, context: ActionContext) -> Vec<PaletteCommand> {
+pub fn commands(
+    settings: &ResolvedSettings,
+    context: ActionContext,
+    workspaces: &[WorkspaceId],
+) -> Vec<PaletteCommand> {
     let mut commands = AppAction::catalog()
         .into_iter()
         .filter(|action| !matches!(action, AppAction::CommandPalette))
@@ -43,6 +48,24 @@ pub fn commands(settings: &ResolvedSettings, context: ActionContext) -> Vec<Pale
                 profile_id: Some(profile.id.clone()),
             },
             Some(format!("Split down: {}", profile.label)),
+            settings,
+            context,
+        ));
+    }
+    for workspace_id in workspaces {
+        commands.push(command_for_action(
+            AppAction::SaveWorkspace {
+                workspace_id: workspace_id.clone(),
+            },
+            Some(format!("Save workspace: {workspace_id}")),
+            settings,
+            context,
+        ));
+        commands.push(command_for_action(
+            AppAction::RestoreWorkspace {
+                workspace_id: workspace_id.clone(),
+            },
+            Some(format!("Restore workspace: {workspace_id}")),
             settings,
             context,
         ));

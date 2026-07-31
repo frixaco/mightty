@@ -4,6 +4,7 @@ use gpui::{
     font, prelude::*, px,
 };
 use gpui_component::InteractiveElementExt;
+use std::collections::BTreeMap;
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -15,6 +16,10 @@ use crate::profile::ProfileId;
 use crate::settings::{ReloadOutcome, SettingsStore};
 use crate::split::{Split, SplitAxis};
 use crate::widget::{TerminalConfig, TerminalWidget};
+use crate::workspace::{
+    TabId, WorkspaceId, WorkspaceLayout, WorkspacePane, WorkspaceStore, WorkspaceTab,
+    trusted_working_directory,
+};
 
 const WINDOW_BACKGROUND: u32 = 0x000000;
 const WINDOW_HORIZONTAL_PADDING_PX: f32 = 8.0;
@@ -37,6 +42,7 @@ enum WindowsCaptionButton {
 }
 
 struct Tab {
+    id: TabId,
     split: Entity<Split>,
     title: String,
 }
@@ -53,6 +59,9 @@ pub struct PaneContainer {
     needs_focus: bool,
     settings: SettingsStore,
     settings_task: Task<()>,
+    workspace_store: WorkspaceStore,
+    workspace_ids: Vec<WorkspaceId>,
+    workspace_diagnostic: Option<String>,
     palette: Option<PaletteState>,
     palette_focus: FocusHandle,
     exit_tx: flume::Sender<()>,
@@ -78,6 +87,8 @@ impl PaneContainer {
         let (exit_tx, exit_rx) = flume::unbounded();
         let tab = Self::create_tab(config, profile_id, title, exit_tx.clone(), cx);
 
+        let workspace_store = WorkspaceStore::open_default();
+        let workspace_ids = workspace_store.list().unwrap_or_default();
         let mut container = Self {
             tabs: vec![tab],
             active_tab_index: 0,
@@ -85,6 +96,9 @@ impl PaneContainer {
             needs_focus: true,
             settings,
             settings_task: Task::ready(()),
+            workspace_store,
+            workspace_ids,
+            workspace_diagnostic: None,
             palette: None,
             palette_focus: cx.focus_handle(),
             exit_tx,
@@ -105,7 +119,11 @@ impl PaneContainer {
         let terminal = Self::create_terminal(config, exit_tx, cx);
         let split = cx.new(|_cx| Split::with_terminal(terminal, profile_id));
 
-        Tab { split, title }
+        Tab {
+            id: TabId::fresh(),
+            split,
+            title,
+        }
     }
 
     fn create_terminal(
@@ -192,6 +210,142 @@ impl PaneContainer {
         );
         self.tabs.push(tab);
         self.active_tab_index = self.tabs.len() - 1;
+        self.needs_focus = true;
+        cx.notify();
+    }
+
+    fn move_active_tab(&mut self, direction: crate::action::Direction, cx: &mut Context<Self>) {
+        let target = match direction {
+            crate::action::Direction::Up | crate::action::Direction::Left => {
+                self.active_tab_index.checked_sub(1)
+            }
+            crate::action::Direction::Down | crate::action::Direction::Right => {
+                (self.active_tab_index + 1 < self.tabs.len()).then_some(self.active_tab_index + 1)
+            }
+        };
+        let Some(target) = target else {
+            return;
+        };
+        self.tabs.swap(self.active_tab_index, target);
+        self.active_tab_index = target;
+        cx.notify();
+    }
+
+    fn workspace_layout(&self, workspace_id: WorkspaceId, cx: &Context<Self>) -> WorkspaceLayout {
+        let tabs = self
+            .tabs
+            .iter()
+            .map(|tab| {
+                let split = tab.split.read(cx);
+                let panes = split
+                    .pane_entities()
+                    .map(|(pane_id, profile_id, terminal)| {
+                        let working_directory = terminal
+                            .read(cx)
+                            .launch_working_directory()
+                            .filter(|directory| trusted_working_directory(directory));
+                        (
+                            pane_id,
+                            WorkspacePane {
+                                profile_id: profile_id.clone(),
+                                working_directory,
+                            },
+                        )
+                    })
+                    .collect::<BTreeMap<_, _>>();
+                WorkspaceTab {
+                    id: tab.id,
+                    title: tab.title.clone(),
+                    active_pane_id: split.active_pane_id(),
+                    root: split.topology().clone(),
+                    panes,
+                }
+            })
+            .collect();
+        WorkspaceLayout::new(workspace_id, self.tabs[self.active_tab_index].id, tabs)
+    }
+
+    fn save_workspace(&mut self, workspace_id: WorkspaceId, cx: &mut Context<Self>) {
+        let layout = self.workspace_layout(workspace_id.clone(), cx);
+        match self.workspace_store.save(&layout) {
+            Ok(path) => {
+                if !self.workspace_ids.contains(&workspace_id) {
+                    self.workspace_ids.push(workspace_id);
+                    self.workspace_ids.sort();
+                }
+                self.workspace_diagnostic = None;
+                eprintln!("Workspace saved to {}", path.display());
+            }
+            Err(error) => {
+                self.workspace_diagnostic = Some(format!("Cannot save workspace: {error}"));
+            }
+        }
+        cx.notify();
+    }
+
+    fn restore_workspace(&mut self, workspace_id: &WorkspaceId, cx: &mut Context<Self>) {
+        let layout = match self.workspace_store.load(workspace_id) {
+            Ok(layout) => layout,
+            Err(error) => {
+                self.workspace_diagnostic = Some(format!("Cannot restore workspace: {error}"));
+                cx.notify();
+                return;
+            }
+        };
+        let mut warnings = Vec::new();
+        let mut tabs = Vec::with_capacity(layout.tabs.len());
+        for saved_tab in layout.tabs {
+            let WorkspaceTab {
+                id,
+                title,
+                active_pane_id,
+                root,
+                panes,
+            } = saved_tab;
+            let mut runtime_panes = Vec::with_capacity(panes.len());
+            for (pane_id, pane) in panes {
+                let settings = self.settings.current();
+                let profile_id = if settings.profiles.contains_key(&pane.profile_id) {
+                    pane.profile_id
+                } else {
+                    warnings.push(format!(
+                        "Profile '{}' is missing; used '{}'",
+                        pane.profile_id, settings.default_profile
+                    ));
+                    settings.default_profile.clone()
+                };
+                let mut config = settings
+                    .terminal_config(Some(&profile_id))
+                    .expect("resolved workspace profile has a terminal configuration");
+                if let Some(directory) = pane.working_directory {
+                    if trusted_working_directory(&directory) && directory.is_dir() {
+                        config.launch.working_directory = Some(directory);
+                    } else {
+                        warnings.push(format!(
+                            "Working directory for pane {} is unavailable",
+                            pane_id.value()
+                        ));
+                    }
+                }
+                let terminal = Self::create_terminal(config, self.exit_tx.clone(), cx);
+                runtime_panes.push((pane_id, terminal, profile_id));
+            }
+            let split = Split::from_restored(root, runtime_panes, active_pane_id)
+                .expect("validated workspace topology must restore");
+            tabs.push(Tab {
+                id,
+                split: cx.new(|_cx| split),
+                title,
+            });
+        }
+        let active_tab_index = tabs
+            .iter()
+            .position(|tab| tab.id == layout.active_tab_id)
+            .expect("validated workspace active tab exists");
+        TabId::reserve_after(tabs.iter().map(|tab| tab.id));
+        self.tabs = tabs;
+        self.active_tab_index = active_tab_index;
+        self.workspace_diagnostic = (!warnings.is_empty()).then(|| warnings.join("; "));
         self.needs_focus = true;
         cx.notify();
     }
@@ -357,6 +511,7 @@ impl PaneContainer {
             }
             AppAction::ToggleSidebar => self.toggle_sidebar(cx),
             AppAction::SelectTab { index } => self.activate_tab(usize::from(index), cx),
+            AppAction::MoveTab { direction } => self.move_active_tab(direction, cx),
             AppAction::FocusPane { direction } => {
                 let split = self.active_split();
                 split.update(cx, |split, cx| {
@@ -379,6 +534,12 @@ impl PaneContainer {
                 });
             }
             AppAction::CommandPalette => self.open_palette(window, cx),
+            AppAction::SaveWorkspace { workspace_id } => {
+                self.save_workspace(workspace_id, cx);
+            }
+            AppAction::RestoreWorkspace { workspace_id } => {
+                self.restore_workspace(&workspace_id, cx);
+            }
             AppAction::Quit => cx.quit(),
             AppAction::Search | AppAction::ToggleQuickTerminal => {}
         }
@@ -402,6 +563,7 @@ impl PaneContainer {
         ActionContext {
             has_selection,
             pane_count,
+            tab_count: self.tabs.len(),
             pane_management_available: true,
             search_available: false,
             quick_terminal_available: false,
@@ -409,10 +571,20 @@ impl PaneContainer {
     }
 
     fn palette_commands(&self, window: &Window, cx: &mut Context<Self>) -> Vec<PaletteCommand> {
-        commands(self.settings.current(), self.action_context(window, cx))
+        commands(
+            self.settings.current(),
+            self.action_context(window, cx),
+            &self.workspace_ids,
+        )
     }
 
     fn open_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.workspace_store.list() {
+            Ok(workspaces) => self.workspace_ids = workspaces,
+            Err(error) => {
+                self.workspace_diagnostic = Some(format!("Cannot list workspaces: {error}"));
+            }
+        }
         self.palette = Some(PaletteState {
             query: String::new(),
             selected: 0,
@@ -602,6 +774,11 @@ impl Render for PaneContainer {
                     .diagnostic()
                     .map(|diagnostic| render_settings_diagnostic(diagnostic.to_string())),
             )
+            .children(
+                self.workspace_diagnostic
+                    .clone()
+                    .map(render_workspace_diagnostic),
+            )
             .child(
                 div()
                     .flex_1()
@@ -633,6 +810,16 @@ fn render_settings_diagnostic(message: String) -> impl IntoElement {
         .text_color(gpui::rgb(0xffffff))
         .text_size(px(12.0))
         .child(format!("Settings error: {message}"))
+}
+
+fn render_workspace_diagnostic(message: String) -> impl IntoElement {
+    div()
+        .px(px(10.0))
+        .py(px(6.0))
+        .bg(gpui::rgb(0x4c3414))
+        .text_color(gpui::rgb(0xffffff))
+        .text_size(px(12.0))
+        .child(format!("Workspace: {message}"))
 }
 
 fn render_titlebar(window: &mut Window) -> impl IntoElement {

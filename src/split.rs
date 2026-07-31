@@ -1,6 +1,6 @@
 //! Binary pane topology, pure layout geometry, and GPUI pane rendering.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use gpui::{
@@ -40,7 +40,7 @@ impl PaneId {
     }
 
     #[cfg(test)]
-    const fn test(value: u64) -> Self {
+    pub(crate) const fn test(value: u64) -> Self {
         Self(value)
     }
 }
@@ -173,6 +173,41 @@ impl Split {
         }
     }
 
+    pub fn from_restored(
+        root: SplitNode,
+        panes: Vec<(PaneId, Entity<TerminalWidget>, ProfileId)>,
+        active_pane_id: PaneId,
+    ) -> Result<Self, String> {
+        let panes = panes
+            .into_iter()
+            .map(|(pane_id, terminal, profile_id)| {
+                (
+                    pane_id,
+                    RuntimePane {
+                        terminal,
+                        profile_id,
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let topology_ids = root.pane_ids();
+        let unique_topology_ids = topology_ids.iter().copied().collect::<BTreeSet<_>>();
+        let runtime_ids = panes.keys().copied().collect::<BTreeSet<_>>();
+        if topology_ids.len() != unique_topology_ids.len() || unique_topology_ids != runtime_ids {
+            return Err("restored pane records do not match split topology".to_string());
+        }
+        if !panes.contains_key(&active_pane_id) {
+            return Err("restored active pane does not exist".to_string());
+        }
+        Ok(Self {
+            root,
+            panes,
+            active_pane_id,
+            zoomed_pane_id: None,
+            layout_bounds: None,
+        })
+    }
+
     pub fn pane_count(&self) -> usize {
         self.panes.len()
     }
@@ -185,6 +220,14 @@ impl Split {
         self.panes
             .iter()
             .map(|(pane_id, pane)| (*pane_id, &pane.profile_id))
+    }
+
+    pub fn pane_entities(
+        &self,
+    ) -> impl Iterator<Item = (PaneId, &ProfileId, Entity<TerminalWidget>)> {
+        self.panes
+            .iter()
+            .map(|(pane_id, pane)| (*pane_id, &pane.profile_id, pane.terminal.clone()))
     }
 
     pub fn active_pane_id(&self) -> PaneId {

@@ -31,6 +31,7 @@ use gpui::{
 };
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::OnceLock;
 use std::sync::{
@@ -322,6 +323,10 @@ impl TerminalWidget {
         self.terminal
             .selected_text()
             .is_ok_and(|text| text.is_some_and(|text| !text.is_empty()))
+    }
+
+    pub(crate) fn launch_working_directory(&self) -> Option<PathBuf> {
+        self.config.launch.working_directory.clone()
     }
 
     fn schedule_cursor_blink(&mut self, cx: &mut Context<Self>) {
