@@ -5,7 +5,6 @@ use std::ffi::OsStr;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::Duration;
 
 use serde::de::{MapAccess, Visitor};
@@ -218,7 +217,7 @@ enum FileObservation {
 /// Owns the last valid settings and rejects invalid reloads atomically.
 pub struct SettingsStore {
     path: PathBuf,
-    current: Arc<ResolvedSettings>,
+    current: ResolvedSettings,
     diagnostic: Option<SettingsDiagnostic>,
     last_observation: FileObservation,
     last_discovered: Vec<LaunchProfile>,
@@ -270,7 +269,7 @@ impl SettingsStore {
 
         Self {
             path,
-            current: Arc::new(current),
+            current,
             diagnostic,
             last_observation: observation,
             last_discovered: discovered,
@@ -278,8 +277,8 @@ impl SettingsStore {
         }
     }
 
-    pub fn current(&self) -> Arc<ResolvedSettings> {
-        Arc::clone(&self.current)
+    pub fn current(&self) -> &ResolvedSettings {
+        &self.current
     }
 
     pub fn diagnostic(&self) -> Option<&SettingsDiagnostic> {
@@ -302,11 +301,12 @@ impl SettingsStore {
             return ReloadOutcome::Unchanged;
         }
 
-        self.last_observation = observation.clone();
-        self.last_discovered = discovered.clone();
-        match resolve_observation(&observation, &self.path, discovered) {
+        let resolved = resolve_observation(&observation, &self.path, discovered.clone());
+        self.last_observation = observation;
+        self.last_discovered = discovered;
+        match resolved {
             Ok(settings) => {
-                self.current = Arc::new(settings);
+                self.current = settings;
                 self.diagnostic = None;
                 self.generation = self.generation.saturating_add(1);
                 ReloadOutcome::Applied {
@@ -766,9 +766,8 @@ fn resolve_executable(path: &Path, directory: &Path) -> Option<PathBuf> {
             .parent()
             .is_some_and(|parent| !parent.as_os_str().is_empty())
     {
-        return resolve_config_path(path.to_path_buf(), directory)
-            .is_file()
-            .then(|| resolve_config_path(path.to_path_buf(), directory));
+        let path = resolve_config_path(path.to_path_buf(), directory);
+        return path.is_file().then_some(path);
     }
     find_in_path(path.as_os_str())
 }
