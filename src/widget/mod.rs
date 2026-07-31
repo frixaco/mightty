@@ -562,6 +562,13 @@ impl TerminalWidget {
     }
 
     fn navigate_search(&mut self, direction: SearchDirection, cx: &mut Context<Self>) {
+        if self
+            .search
+            .as_ref()
+            .is_none_or(|search| search.query.is_empty())
+        {
+            return;
+        }
         match self.terminal.search_select(direction) {
             Ok(Some(range)) => {
                 self.terminal
