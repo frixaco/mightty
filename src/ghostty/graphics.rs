@@ -656,7 +656,13 @@ mod tests {
             (storage_generation, image_generation)
         };
 
-        terminal.vt_write(b"\x1b_Ga=t,t=d,f=24,i=1,s=1,v=2;AAAAAAAA\x1b\\");
+        terminal.vt_write(
+            concat!(
+                "\x1b_Ga=t,t=d,f=24,i=1,s=1,v=2;AAAAAAAA\x1b\\",
+                "\x1b_Ga=p,i=1,p=1;\x1b\\"
+            )
+            .as_bytes(),
+        );
         let replacement_generation = {
             let graphics = terminal.graphics().unwrap();
             assert!(graphics.generation().unwrap() > storage_generation);

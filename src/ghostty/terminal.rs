@@ -88,16 +88,25 @@ impl Terminal {
         }
 
         let mut raw = std::ptr::null_mut();
-        let raw_options = ffi::TerminalOptions {
-            cols: options.cols,
-            rows: options.rows,
-            max_scrollback: options.max_scrollback,
+        let result = unsafe {
+            ffi::ghostty_terminal_new(std::ptr::null(), &raw mut raw, options.cols, options.rows)
         };
-        let result =
-            unsafe { ffi::ghostty_terminal_new(std::ptr::null(), &raw mut raw, raw_options) };
         from_result(result)?;
 
         let raw = NonNull::new(raw).ok_or(Error::InvalidValue)?;
+        let result = unsafe {
+            ffi::ghostty_terminal_set(
+                raw.as_ptr(),
+                ffi::TerminalOption::SCROLLBACK_MAX_LINES,
+                std::ptr::from_ref(&options.max_scrollback).cast(),
+            )
+        };
+        if let Err(error) = from_result(result) {
+            unsafe {
+                ffi::ghostty_terminal_free(raw.as_ptr());
+            }
+            return Err(error);
+        }
         let selection_gesture = match SelectionGesture::new() {
             Ok(gesture) => gesture,
             Err(error) => {
@@ -449,10 +458,16 @@ impl Terminal {
     }
 
     fn mode(&self, mode: ffi::Mode) -> Result<bool> {
-        let mut value = false;
-        let result = unsafe { ffi::ghostty_terminal_mode_get(self.as_raw(), mode, &raw mut value) };
+        let mut config = ffi::TerminalModeConfig { mode, value: false };
+        let result = unsafe {
+            ffi::ghostty_terminal_get(
+                self.as_raw(),
+                ffi::TerminalData::MODE,
+                std::ptr::from_mut(&mut config).cast(),
+            )
+        };
         from_result(result)?;
-        Ok(value)
+        Ok(config.value)
     }
 
     /// `T` must be the output type documented for `data`.

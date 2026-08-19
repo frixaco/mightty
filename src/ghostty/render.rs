@@ -67,8 +67,13 @@ impl Snapshot<'_> {
             size: size_of::<ffi::RenderStateColors>(),
             ..Default::default()
         };
-        let result =
-            unsafe { ffi::ghostty_render_state_colors_get(self.state.raw.as_ptr(), &raw mut raw) };
+        let result = unsafe {
+            ffi::ghostty_render_state_get(
+                self.state.raw.as_ptr(),
+                ffi::RenderStateData::COLORS,
+                std::ptr::from_mut(&mut raw).cast(),
+            )
+        };
         from_result(result)?;
         Ok(Colors {
             background: raw.background.into(),

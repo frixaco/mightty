@@ -418,7 +418,13 @@ mod tests {
         let first = renderer.frame(&terminal, (px(10.0), px(20.0))).unwrap();
         let first_image = first.above_text[0].image.clone();
 
-        terminal.vt_write(b"\x1b_Ga=t,t=d,f=24,i=1,s=1,v=2;AAAAAAAA\x1b\\");
+        terminal.vt_write(
+            concat!(
+                "\x1b_Ga=t,t=d,f=24,i=1,s=1,v=2;AAAAAAAA\x1b\\",
+                "\x1b_Ga=p,i=1,p=1;\x1b\\"
+            )
+            .as_bytes(),
+        );
         let replacement = renderer.frame(&terminal, (px(10.0), px(20.0))).unwrap();
 
         assert!(!Arc::ptr_eq(&first_image, &replacement.above_text[0].image));
