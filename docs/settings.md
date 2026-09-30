@@ -4,6 +4,13 @@ mightty reads one JSON settings file. It checks the file for changes every two
 seconds. A valid change affects new panes. An invalid change keeps the last
 valid settings active and shows an error in the window.
 
+Launch-profile discovery is shared across windows and refreshed in the background
+every 30 seconds. WSL enumeration has a three-second timeout; a failed refresh
+keeps the last successful profile list. Newly installed distributions may take
+one refresh interval to appear. File polling never waits for WSL.
+The first settings load seeds the discovery cache with the same bounded call,
+so an existing WSL default profile can resolve before the first pane starts.
+
 The default file is `%APPDATA%\mightty\settings.json` on Windows. Unix uses
 `$XDG_CONFIG_HOME/mightty/settings.json` or `~/.config/mightty/settings.json`.
 

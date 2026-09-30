@@ -14,6 +14,8 @@ param(
 
     [string] $ReleaseBaseUri,
 
+    [uri] $AppInstallerUri,
+
     [uri] $TimestampUri = "http://timestamp.digicert.com",
 
     [string] $OutputDirectory
@@ -100,6 +102,12 @@ if ([string]::IsNullOrWhiteSpace($ReleaseBaseUri)) {
     $ReleaseBaseUri = "https://github.com/frixaco/mightty/releases/download/v$version"
 }
 $ReleaseBaseUri = $ReleaseBaseUri.TrimEnd("/")
+if ($null -eq $AppInstallerUri) {
+    $AppInstallerUri = "https://github.com/frixaco/mightty/releases/latest/download/mightty-$Architecture.appinstaller"
+}
+if (-not $AppInstallerUri.IsAbsoluteUri -or $AppInstallerUri.Scheme -ne "https") {
+    throw "AppInstallerUri must be an absolute HTTPS update feed URI."
+}
 if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
     $OutputDirectory = Join-Path $repositoryRoot "artifacts\windows"
 }
@@ -187,7 +195,7 @@ Write-PackageIcon (Join-Path $assetDirectory "Wide310x150Logo.png") 310 150
 New-Item -ItemType Directory -Force -Path $OutputDirectory | Out-Null
 $packageFileName = "mightty-$version-$Architecture.msix"
 $packagePath = Join-Path $OutputDirectory $packageFileName
-$appInstallerPath = Join-Path $OutputDirectory "mightty.appinstaller"
+$appInstallerPath = Join-Path $OutputDirectory "mightty-$Architecture.appinstaller"
 if (Test-Path -LiteralPath $packagePath) {
     Remove-Item -LiteralPath $packagePath -Force
 }
@@ -208,17 +216,9 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 $packageUri = "$ReleaseBaseUri/$packageFileName"
-$appInstallerUri = "$ReleaseBaseUri/mightty.appinstaller"
-$installerTemplate = Get-Content -Raw (
-    Join-Path $repositoryRoot "packaging\windows\Mightty.appinstaller.in"
-)
-$installer = $installerTemplate.
-    Replace("{{PACKAGE_NAME}}", $PackageName).
-    Replace("{{PUBLISHER}}", $xmlPublisher).
-    Replace("{{VERSION}}", $manifestVersion).
-    Replace("{{ARCHITECTURE}}", $Architecture).
-    Replace("{{PACKAGE_URI}}", $packageUri).
-    Replace("{{APPINSTALLER_URI}}", $appInstallerUri)
+$installer = & (Join-Path $PSScriptRoot "new-windows-appinstaller.ps1") `
+    -PackageName $PackageName -Publisher $Publisher -Version $version `
+    -Architecture $Architecture -PackageUri $packageUri -AppInstallerUri $AppInstallerUri
 Set-Content -LiteralPath $appInstallerPath -Value $installer -Encoding utf8
 
 Write-Host "Created and verified $packagePath"

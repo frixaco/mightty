@@ -14,6 +14,8 @@ shell I/O through a forkpty-backed bridge.
 - Scrollback, selection, mouse reporting, safe paste, hyperlinks, a scrollbar,
   and full-scrollback search.
 - Typed profiles, themes, fonts, key bindings, and safe settings reload.
+- Native text composition with local preedit and cursor-positioned candidates;
+  search and command-palette queries use native text fields.
 - One typed action model for shortcuts, native menus, and the command palette.
 - Binary pane splits with divider drag, directional focus, resize, and zoom.
 - Named workspace save and restore with fresh shell processes.

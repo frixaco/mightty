@@ -72,6 +72,8 @@ pub struct PaneContainer {
     workspace_diagnostic: Option<String>,
     palette: Option<PaletteState>,
     palette_focus: FocusHandle,
+    palette_input: Option<Entity<gpui_component::input::InputState>>,
+    palette_input_subscription: Option<gpui::Subscription>,
     exit_tx: flume::Sender<()>,
     exit_task: Task<()>,
 }
@@ -125,6 +127,8 @@ impl PaneContainer {
             workspace_diagnostic: None,
             palette: None,
             palette_focus: cx.focus_handle(),
+            palette_input: None,
+            palette_input_subscription: None,
             exit_tx,
             exit_task: Task::ready(()),
         };
@@ -812,12 +816,30 @@ impl PaneContainer {
             query: String::new(),
             selected: 0,
         });
-        self.palette_focus.focus(window);
+        let input = cx.new(|cx| {
+            gpui_component::input::InputState::new(window, cx).placeholder("Type a command…")
+        });
+        self.palette_input_subscription =
+            Some(
+                cx.subscribe_in(&input, window, |this, input, event, _window, cx| {
+                    if let gpui_component::input::InputEvent::Change = event
+                        && let Some(palette) = this.palette.as_mut()
+                    {
+                        palette.query = input.read(cx).value().to_string();
+                        palette.selected = 0;
+                        cx.notify();
+                    }
+                }),
+            );
+        input.update(cx, |input, cx| input.focus(window, cx));
+        self.palette_input = Some(input);
         cx.notify();
     }
 
     fn close_palette(&mut self, cx: &mut Context<Self>) {
         self.palette = None;
+        self.palette_input = None;
+        self.palette_input_subscription = None;
         self.needs_focus = true;
         cx.notify();
     }
@@ -828,6 +850,15 @@ impl PaneContainer {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.handle_palette_navigation(&event.keystroke.key, window, cx);
+    }
+
+    fn handle_palette_navigation(
+        &mut self,
+        key: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(palette) = &self.palette else {
             return;
         };
@@ -835,14 +866,8 @@ impl PaneContainer {
         let selected = palette.selected;
         let commands = self.palette_commands(window, cx);
         let matches = filtered_command_indices(&commands, &query);
-        match event.keystroke.key.as_str() {
+        match key {
             "escape" => self.close_palette(cx),
-            "backspace" => {
-                let palette = self.palette.as_mut().expect("palette remains open");
-                palette.query.pop();
-                palette.selected = 0;
-                cx.notify();
-            }
             "up" => {
                 let palette = self.palette.as_mut().expect("palette remains open");
                 palette.selected = palette.selected.saturating_sub(1);
@@ -862,18 +887,7 @@ impl PaneContainer {
                     self.dispatch_app_action(action, window, cx);
                 }
             }
-            _ if !event.keystroke.modifiers.control
-                && !event.keystroke.modifiers.alt
-                && !event.keystroke.modifiers.platform =>
-            {
-                if let Some(text) = &event.keystroke.key_char {
-                    let palette = self.palette.as_mut().expect("palette remains open");
-                    palette.query.push_str(text);
-                    palette.selected = 0;
-                    cx.notify();
-                }
-            }
-            _ => {}
+            _ => return,
         }
         window.prevent_default();
         cx.stop_propagation();
@@ -1139,7 +1153,6 @@ impl PaneContainer {
         let commands = self.palette_commands(window, cx);
         let matches = filtered_command_indices(&commands, &palette.query);
         let selected = palette.selected.min(matches.len().saturating_sub(1));
-        let query = palette.query.clone();
 
         div()
             .absolute()
@@ -1154,6 +1167,21 @@ impl PaneContainer {
             .bg(gpui::rgba(0x00000099))
             .occlude()
             .track_focus(&self.palette_focus)
+            .capture_action(
+                cx.listener(|this, _: &gpui_component::input::MoveUp, window, cx| {
+                    this.handle_palette_navigation("up", window, cx);
+                }),
+            )
+            .capture_action(
+                cx.listener(|this, _: &gpui_component::input::MoveDown, window, cx| {
+                    this.handle_palette_navigation("down", window, cx);
+                }),
+            )
+            .capture_action(
+                cx.listener(|this, _: &gpui_component::input::Enter, window, cx| {
+                    this.handle_palette_navigation("enter", window, cx);
+                }),
+            )
             .on_key_down(cx.listener(Self::handle_palette_key_down))
             .on_key_up(cx.listener(Self::handle_palette_key_up))
             .on_mouse_down(
@@ -1188,11 +1216,11 @@ impl PaneContainer {
                             .border_color(gpui::rgb(0x303030))
                             .text_size(px(15.0))
                             .text_color(gpui::rgb(0xf2f2f2))
-                            .child(if query.is_empty() {
-                                "Type a command…".to_string()
-                            } else {
-                                format!("{query}▏")
-                            }),
+                            .children(
+                                self.palette_input
+                                    .as_ref()
+                                    .map(gpui_component::input::Input::new),
+                            ),
                     )
                     .children(
                         matches
@@ -1333,12 +1361,62 @@ impl PaneContainer {
 
 #[cfg(test)]
 mod tests {
-    use super::bell_notification_allowed;
+    use super::*;
 
     #[test]
     fn bell_notifications_follow_policy_and_window_focus() {
         assert!(bell_notification_allowed(true, false));
         assert!(!bell_notification_allowed(true, true));
         assert!(!bell_notification_allowed(false, false));
+    }
+
+    #[gpui::test]
+    fn palette_native_input_preserves_query_editing_and_navigation(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext;
+        use std::{cell::RefCell, rc::Rc};
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::widget::init(cx);
+        });
+        let slot = Rc::new(RefCell::new(None));
+        let build_slot = slot.clone();
+        let (_root, cx) = cx.add_window_view(move |window, cx| {
+            let container = cx.new(|cx| {
+                PaneContainer::new_without_titlebar(
+                    SettingsStore::open(
+                        std::env::temp_dir()
+                            .join(format!("mightty-palette-test-{}.json", std::process::id())),
+                    ),
+                    cx,
+                )
+            });
+            build_slot.replace(Some(container.clone()));
+            gpui_component::Root::new(container, window, cx)
+        });
+        let container = slot.borrow().clone().unwrap();
+        cx.refresh().unwrap();
+        cx.update_window_entity(&container, |container, window, cx| {
+            container.open_palette(window, cx)
+        });
+        cx.refresh().unwrap();
+        cx.simulate_input("日本😀");
+        cx.run_until_parked();
+        cx.update_window_entity(&container, |container, _, _| {
+            assert_eq!(container.palette.as_ref().unwrap().query, "日本😀")
+        });
+        cx.simulate_keystrokes("ctrl-a");
+        cx.simulate_input("sidebar");
+        cx.run_until_parked();
+        cx.simulate_keystrokes("down up");
+        let visible = cx.update_window_entity(&container, |container, _, _| {
+            assert_eq!(container.palette.as_ref().unwrap().query, "sidebar");
+            assert_eq!(container.palette.as_ref().unwrap().selected, 0);
+            container.sidebar_visible
+        });
+        cx.simulate_keystrokes("enter");
+        cx.update_window_entity(&container, |container, _, _| {
+            assert!(container.palette.is_none());
+            assert_eq!(container.sidebar_visible, !visible);
+        });
     }
 }

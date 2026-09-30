@@ -9,6 +9,7 @@ mod input;
 mod pty;
 mod render;
 mod search;
+mod text_input;
 
 use crate::action::{
     ActionBinding, AppAction, DispatchAppAction, PromptDirection, chord_for_keystroke,
@@ -31,9 +32,9 @@ use crate::profile::LaunchSpec;
 use crate::shell::PtyParts;
 use crate::shell::PtySize;
 use gpui::{
-    App, Bounds, ClipboardItem, Context, EventEmitter, FocusHandle, KeyBinding, KeyDownEvent,
-    KeyUpEvent, Keystroke, Modifiers, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
-    ScrollWheelEvent, Size, Task, Timer, Window, px,
+    App, AppContext, Bounds, ClipboardItem, Context, EventEmitter, FocusHandle, KeyBinding,
+    KeyDownEvent, KeyUpEvent, Keystroke, Modifiers, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    Pixels, Point, ScrollWheelEvent, Size, Task, Timer, Window, px,
 };
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
@@ -144,10 +145,20 @@ pub struct TerminalWidget {
     output_task: Task<()>,
     cursor_blink_task: Task<()>,
     focus_handle: FocusHandle,
+    preedit: String,
+    composing: bool,
+    preedit_selection: std::ops::Range<usize>,
+    pending_text_key: Option<(Action, Keystroke)>,
+    pressed_keys: std::collections::HashSet<String>,
+    search_input: Option<gpui::Entity<gpui_component::input::InputState>>,
+    search_input_subscription: Option<gpui::Subscription>,
+    blur_subscription: Option<gpui::Subscription>,
     cursor_blink_phase: bool,
     size: (u16, u16),
     layout_bounds: Option<Bounds<Pixels>>,
     cell_size: (Pixels, Pixels),
+    font_metrics_key: Option<(String, f32, f32)>,
+    geometry_dirty: bool,
     pending_scroll_y: f32,
     selecting: bool,
     reported_button: Option<MouseButton>,
@@ -370,10 +381,20 @@ impl TerminalWidget {
             output_task: Task::ready(()),
             cursor_blink_task: Task::ready(()),
             focus_handle: cx.focus_handle(),
+            preedit: String::new(),
+            composing: false,
+            preedit_selection: 0..0,
+            pending_text_key: None,
+            pressed_keys: std::collections::HashSet::new(),
+            search_input: None,
+            search_input_subscription: None,
+            blur_subscription: None,
             cursor_blink_phase: true,
             size,
             layout_bounds: None,
             cell_size: (px(9.6), px(19.2)),
+            font_metrics_key: None,
+            geometry_dirty: true,
             pending_scroll_y: 0.0,
             selecting: false,
             reported_button: None,
@@ -478,14 +499,38 @@ impl TerminalWidget {
     pub(crate) fn open_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.search.is_none() {
             self.search = Some(search::SearchOverlay::default());
+            let input = cx.new(|cx| {
+                gpui_component::input::InputState::new(window, cx)
+                    .placeholder("Type to search")
+                    .validate(|text, _| text.len() <= search::MAX_SEARCH_QUERY_BYTES)
+            });
+            self.search_input_subscription =
+                Some(
+                    cx.subscribe_in(&input, window, |this, input, event, _window, cx| {
+                        if let gpui_component::input::InputEvent::Change = event
+                            && let Some(search) = this.search.as_mut()
+                        {
+                            search.query = input.read(cx).value().to_string();
+                            this.restart_search(cx);
+                        }
+                    }),
+                );
+            self.search_input = Some(input);
         }
-        self.focus_handle.focus(window);
+        if let Some(input) = &self.search_input {
+            input.update(cx, |input, cx| input.focus(window, cx));
+        }
+        self.preedit.clear();
+        self.composing = false;
+        self.pending_text_key = None;
         cx.notify();
     }
 
     fn close_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.terminal.stop_search();
         self.search = None;
+        self.search_input = None;
+        self.search_input_subscription = None;
         self.search_task = Task::ready(());
         self.focus_handle.focus(window);
         cx.notify();
@@ -743,7 +788,7 @@ impl TerminalWidget {
 
     fn resize_to_size(&mut self, size: Size<Pixels>, cx: &mut Context<Self>) {
         let (cols, rows) = self.calculate_dimensions(size);
-        if cols != self.size.0 || rows != self.size.1 {
+        if self.geometry_dirty || cols != self.size.0 || rows != self.size.1 {
             let cell_width: f32 = self.cell_size.0.into();
             let cell_height: f32 = self.cell_size.1.into();
             if self
@@ -752,6 +797,7 @@ impl TerminalWidget {
                 .is_ok()
             {
                 self.size = (cols, rows);
+                self.geometry_dirty = false;
                 self.send_pty_command(PtyCommand::Resize(PtySize::new(rows, cols)));
                 cx.notify();
             }
@@ -774,6 +820,9 @@ impl TerminalWidget {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.composing {
+            return;
+        }
         if self.search.is_some() {
             match event.keystroke.key.as_str() {
                 "escape" => self.close_search(window, cx),
@@ -785,29 +834,7 @@ impl TerminalWidget {
                     };
                     self.navigate_search(direction, cx);
                 }
-                "backspace" => {
-                    self.search
-                        .as_mut()
-                        .expect("search remains open")
-                        .query
-                        .pop();
-                    self.restart_search(cx);
-                }
-                _ if !event.keystroke.modifiers.control
-                    && !event.keystroke.modifiers.alt
-                    && !event.keystroke.modifiers.platform =>
-                {
-                    if let Some(text) = &event.keystroke.key_char {
-                        let search = self.search.as_mut().expect("search remains open");
-                        if search.query.len().saturating_add(text.len())
-                            <= search::MAX_SEARCH_QUERY_BYTES
-                        {
-                            search.query.push_str(text);
-                            self.restart_search(cx);
-                        }
-                    }
-                }
-                _ => {}
+                _ => return,
             }
             window.prevent_default();
             cx.stop_propagation();
@@ -839,11 +866,17 @@ impl TerminalWidget {
         } else {
             Action::Press
         };
+        if text_input::uses_native_text(&event.keystroke) {
+            self.pending_text_key = Some((action, event.keystroke.clone()));
+            return;
+        }
         self.send_encoded_key(action, &event.keystroke, cx);
+        window.prevent_default();
+        cx.stop_propagation();
     }
 
     fn handle_key_up(&mut self, event: &KeyUpEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if self.search.is_some() || self.pending_paste.is_some() {
+        if self.search.is_some() || self.pending_paste.is_some() || self.composing {
             window.prevent_default();
             cx.stop_propagation();
             return;
@@ -855,10 +888,19 @@ impl TerminalWidget {
             return;
         }
 
-        self.send_encoded_key(Action::Release, &event.keystroke, cx);
+        if self
+            .pressed_keys
+            .remove(&input::key_identity(&event.keystroke))
+        {
+            self.send_encoded_key(Action::Release, &event.keystroke, cx);
+        }
     }
 
     fn handle_tab_action(&mut self, _: &ForwardTab, window: &mut Window, cx: &mut Context<Self>) {
+        if self.composing || self.search.is_some() || self.pending_paste.is_some() {
+            cx.propagate();
+            return;
+        }
         self.send_encoded_key(
             Action::Press,
             &Keystroke {
@@ -878,6 +920,10 @@ impl TerminalWidget {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.composing || self.search.is_some() || self.pending_paste.is_some() {
+            cx.propagate();
+            return;
+        }
         self.send_encoded_key(
             Action::Press,
             &Keystroke {
@@ -925,6 +971,9 @@ impl TerminalWidget {
         keystroke: &gpui::Keystroke,
         cx: &mut Context<Self>,
     ) {
+        if action != Action::Release {
+            self.pressed_keys.insert(input::key_identity(keystroke));
+        }
         if let Some(vt_bytes) = input::encode_key_event(
             &mut self.key_encoder,
             &mut self.key_event,

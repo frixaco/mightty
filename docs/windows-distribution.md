@@ -35,10 +35,17 @@ The script performs these actions:
 2. It builds the locked release target.
 3. It creates the MSIX package with `MakeAppx`.
 4. It signs and timestamps the package with `SignTool`.
-5. It verifies the signature and writes `mightty.appinstaller`.
+5. It verifies the signature and writes `mightty-x64.appinstaller` (or
+   `mightty-arm64.appinstaller`).
 
 The updater manifest checks for a package update every four hours. Windows can
 also update the package in the background.
+
+The manifest's self URI is a stable architecture-specific feed under
+`releases/latest/download`; the MSIX URI points to its immutable versioned
+release. For another hosting service, pass both `-ReleaseBaseUri` (packages)
+and `-AppInstallerUri` (the stable HTTPS feed). Install through the AppInstaller
+file to enable update discovery.
 
 ## Select mightty as the default terminal
 
@@ -75,6 +82,16 @@ file as one base64 string before you store it in the repository secret.
 
 The workflow pins each external action to an immutable commit. It removes the
 signing certificate before it verifies or uploads release artifacts.
+
+Artifacts are uploaded to a draft first. Publishing the complete release advances
+the stable feed only for a version at least as new as the current stable release.
+A failed upload leaves the previous feed available. Existing installations using
+an old tag-specific manifest must open the new AppInstaller once to switch feeds;
+their settings and workspaces remain in the same locations.
+
+Run `tools/test-windows-appinstaller.ps1` to check manifest generation and feed
+continuity without a signing certificate. Actual automatic-update verification
+still requires two signed releases and a clean Windows user or VM.
 
 `verify-windows-release.ps1` verifies the signature, package identity,
 default-terminal registrations, required payloads, and updater metadata. The

@@ -13,7 +13,9 @@ param(
     [ValidateSet("x64", "arm64")]
     [string] $Architecture = "x64",
 
-    [string] $PackageName = "Mightty.Terminal"
+    [string] $PackageName = "Mightty.Terminal",
+
+    [uri] $ExpectedAppInstallerUri
 )
 
 Set-StrictMode -Version Latest
@@ -51,7 +53,7 @@ $repositoryRoot = Split-Path -Parent $PSScriptRoot
 $resolvedArtifacts = [IO.Path]::GetFullPath($ArtifactsDirectory)
 $packageFileName = "mightty-$Version-$Architecture.msix"
 $packagePath = Join-Path $resolvedArtifacts $packageFileName
-$appInstallerPath = Join-Path $resolvedArtifacts "mightty.appinstaller"
+$appInstallerPath = Join-Path $resolvedArtifacts "mightty-$Architecture.appinstaller"
 foreach ($path in @($packagePath, $appInstallerPath)) {
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
         throw "Release artifact does not exist: $path"
@@ -208,8 +210,11 @@ try {
     $appInstallerUri = [uri] $appInstaller.DocumentElement.GetAttribute("Uri")
     if (-not $appInstallerUri.IsAbsoluteUri -or
         [IO.Path]::GetFileName($appInstallerUri.AbsolutePath) -cne
-            "mightty.appinstaller") {
-        throw "The updater manifest URI does not identify mightty.appinstaller."
+            "mightty-$Architecture.appinstaller") {
+        throw "The updater manifest URI does not identify mightty-$Architecture.appinstaller."
+    }
+    if ($null -ne $ExpectedAppInstallerUri) {
+        Require-Equal -Actual $appInstallerUri.AbsoluteUri -Expected $ExpectedAppInstallerUri.AbsoluteUri -Field "Stable updater feed URI"
     }
     $packageUri = [uri] $mainPackage.GetAttribute("Uri")
     if (-not $packageUri.IsAbsoluteUri -or

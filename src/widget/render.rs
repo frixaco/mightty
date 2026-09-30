@@ -82,6 +82,41 @@ impl Render for TerminalWidget {
         #[cfg(test)]
         reset_render_stage_trace();
 
+        if self.blur_subscription.is_none() {
+            self.blur_subscription =
+                Some(cx.on_blur(&self.focus_handle, window, |this, _window, cx| {
+                    this.preedit.clear();
+                    this.composing = false;
+                    this.preedit_selection = 0..0;
+                    this.pending_text_key = None;
+                    this.pressed_keys.clear();
+                    cx.notify();
+                }));
+        }
+
+        let metrics_key = (
+            self.config.font_family.clone(),
+            self.config.font_size_px,
+            window.scale_factor(),
+        );
+        if self.font_metrics_key.as_ref() != Some(&metrics_key) {
+            let font = gpui::font(self.config.font_family.clone());
+            let text_system = window.text_system();
+            let font_id = text_system.resolve_font(&font);
+            let font_size = px(self.config.font_size_px);
+            let advance = text_system
+                .ch_advance(font_id, font_size)
+                .unwrap_or(font_size * 0.6)
+                .max(px(1.0));
+            let height = (text_system.ascent(font_id, font_size)
+                + text_system.descent(font_id, font_size))
+            .max(font_size)
+            .ceil();
+            self.cell_size = (advance, height);
+            self.font_metrics_key = Some(metrics_key);
+            self.geometry_dirty = true;
+        }
+
         let layout_size = self
             .layout_bounds
             .map_or_else(|| window.viewport_size(), |bounds| bounds.size);
@@ -360,6 +395,29 @@ impl Render for TerminalWidget {
         record_render_stage(format!("cell text count={}", text_elements.len()));
         elements.extend(text_elements);
 
+        if !self.preedit.is_empty()
+            && let Ok(Some(cursor)) = snapshot.cursor_viewport()
+        {
+            let (x, y) = cell_position(cursor.y, cursor.x, cell_size);
+            elements.push(
+                div()
+                    .absolute()
+                    .left(x)
+                    .top(y)
+                    .h(cell_size.1)
+                    .font_family(self.config.font_family.clone())
+                    .text_size(px(self.config.font_size_px))
+                    .line_height(cell_size.1)
+                    .whitespace_nowrap()
+                    .bg(rgb_to_rgba(colors.background))
+                    .text_color(rgb_to_rgba(colors.foreground))
+                    .border_b_1()
+                    .border_color(rgb_to_rgba(colors.foreground))
+                    .child(self.preedit.clone())
+                    .into_any_element(),
+            );
+        }
+
         let is_focused = self.focus_handle.is_focused(window);
         let cursor_visible = is_focused && (self.cursor_blink_phase || !self.config.cursor_blink);
 
@@ -415,6 +473,8 @@ impl Render for TerminalWidget {
         );
 
         let entity = cx.entity();
+        let input_entity = entity.clone();
+        let input_focus = self.focus_handle.clone();
         let track_height: f32 = layout_size.height.into();
         let scrollbar = self
             .terminal
@@ -553,11 +613,6 @@ impl Render for TerminalWidget {
                 )
         });
         let search_overlay = self.search.as_ref().map(|search| {
-            let query = if search.query.is_empty() {
-                "Type to search".to_string()
-            } else {
-                format!("{}│", search.query)
-            };
             let diagnostic = search.diagnostic.as_ref().map(|diagnostic| {
                 div()
                     .text_size(px(11.0))
@@ -584,7 +639,11 @@ impl Render for TerminalWidget {
                         .flex()
                         .items_center()
                         .justify_between()
-                        .child(div().text_size(px(13.0)).child(query))
+                        .children(
+                            self.search_input
+                                .as_ref()
+                                .map(gpui_component::input::Input::new),
+                        )
                         .child(
                             div()
                                 .text_size(px(11.0))
@@ -608,6 +667,23 @@ impl Render for TerminalWidget {
             .overflow_hidden()
             .key_context(TERMINAL_KEY_CONTEXT)
             .track_focus(&self.focus_handle)
+            .capture_action(cx.listener(
+                |this, event: &gpui_component::input::Enter, _window, cx| {
+                    if this.search.is_some() {
+                        this.navigate_search(
+                            if event.secondary {
+                                crate::ghostty::SearchDirection::Previous
+                            } else {
+                                crate::ghostty::SearchDirection::Next
+                            },
+                            cx,
+                        );
+                        cx.stop_propagation();
+                    } else {
+                        cx.propagate();
+                    }
+                },
+            ))
             .on_action(cx.listener(Self::handle_tab_action))
             .on_action(cx.listener(Self::handle_tab_prev_action))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
@@ -685,7 +761,13 @@ impl Render for TerminalWidget {
                             this.update_layout_bounds(bounds, cx);
                         });
                     },
-                    |_, _, _, _| {},
+                    move |bounds, _, window, cx| {
+                        window.handle_input(
+                            &input_focus,
+                            gpui::ElementInputHandler::new(bounds, input_entity.clone()),
+                            cx,
+                        );
+                    },
                 )
                 .absolute()
                 .size_full(),
@@ -1299,6 +1381,164 @@ mod tests {
             actual,
             include_str!("fixtures/kitty-graphics-render.golden").replace("\r\n", "\n")
         );
+    }
+
+    #[gpui::test]
+    fn native_text_commits_once_and_preedit_never_reaches_the_pty(cx: &mut TestAppContext) {
+        use gpui::EntityInputHandler;
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::widget::init(cx);
+        });
+        let (pty_tx, pty_rx) = flume::unbounded();
+        let slot = Rc::new(RefCell::new(None));
+        let build_slot = slot.clone();
+        let (_root, cx) = cx.add_window_view(move |window, cx| {
+            let widget = cx.new(|cx| {
+                TerminalWidget::with_pty(
+                    TerminalConfig {
+                        cursor_blink: false,
+                        ..Default::default()
+                    },
+                    Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    None,
+                    None,
+                    Some(pty_tx),
+                    cx,
+                )
+            });
+            build_slot.replace(Some(widget.clone()));
+            let fixture = cx.new(|cx| TerminalTabFixture {
+                terminal: widget,
+                next_focus: cx.focus_handle(),
+            });
+            Root::new(fixture, window, cx)
+        });
+        let widget = slot.borrow().clone().unwrap();
+        cx.update_window_entity(&widget, |widget, window, _| {
+            window.activate_window();
+            widget.request_focus(window);
+        });
+        cx.refresh().unwrap();
+        while pty_rx.try_recv().is_ok() {}
+        cx.simulate_keystrokes("a");
+        let writes = pty_rx
+            .try_iter()
+            .filter_map(|command| match command {
+                PtyCommand::Write(bytes) => Some(bytes),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(writes, vec![b"a".to_vec()]);
+        cx.update_window_entity(&widget, |widget, window, cx| {
+            widget.replace_and_mark_text_in_range(None, "日本😀", Some(2..2), window, cx);
+            assert!(pty_rx.try_recv().is_err());
+            let candidate = widget.input_cursor_bounds().unwrap();
+            assert!(widget.layout_bounds.unwrap().contains(&candidate.origin));
+            widget.unmark_text(window, cx);
+            assert!(pty_rx.try_recv().is_err());
+            widget.replace_and_mark_text_in_range(None, "日本", None, window, cx);
+            widget.replace_text_in_range(None, "日本", window, cx);
+            assert!(widget.preedit.is_empty());
+        });
+        let writes = pty_rx
+            .try_iter()
+            .filter_map(|command| match command {
+                PtyCommand::Write(bytes) => Some(bytes),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(writes, vec!["日本".as_bytes().to_vec()]);
+
+        cx.update_window_entity(&widget, |widget, window, cx| {
+            widget.terminal.vt_write(b"\x1b[>11u");
+            let key = gpui::Keystroke::parse("a").unwrap();
+            widget.handle_key_down(
+                &KeyDownEvent {
+                    keystroke: key.clone(),
+                    is_held: false,
+                },
+                window,
+                cx,
+            );
+            assert!(pty_rx.try_recv().is_err());
+            widget.replace_text_in_range(None, "a", window, cx);
+            widget.handle_key_up(&KeyUpEvent { keystroke: key }, window, cx);
+        });
+        let writes = pty_rx
+            .try_iter()
+            .filter_map(|command| match command {
+                PtyCommand::Write(bytes) => Some(bytes),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(writes, vec![b"\x1b[97u".to_vec(), b"\x1b[97;1:3u".to_vec()]);
+        cx.update_window_entity(&widget, |widget, window, cx| {
+            widget.replace_and_mark_text_in_range(None, "", Some(0..0), window, cx);
+            assert_eq!(widget.marked_text_range(window, cx), Some(0..0));
+            widget.replace_and_mark_text_in_range(None, "日本", None, window, cx);
+            window.blur();
+        });
+        cx.refresh().unwrap();
+        cx.run_until_parked();
+        cx.update_window_entity(&widget, |widget, window, _| {
+            assert!(!widget.composing);
+            assert!(widget.preedit.is_empty());
+            widget.request_focus(window);
+        });
+        assert!(pty_rx.try_recv().is_err());
+
+        cx.update_window_entity(&widget, |widget, window, cx| widget.open_search(window, cx));
+        cx.refresh().unwrap();
+        cx.simulate_input("日本😀");
+        cx.run_until_parked();
+        cx.update_window_entity(&widget, |widget, _, _| {
+            assert_eq!(widget.search.as_ref().unwrap().query, "日本😀");
+        });
+        assert!(
+            pty_rx
+                .try_iter()
+                .all(|command| !matches!(command, PtyCommand::Write(_)))
+        );
+        cx.simulate_keystrokes("escape");
+        cx.update_window_entity(&widget, |widget, _, _| assert!(widget.search.is_none()));
+    }
+
+    #[gpui::test]
+    fn configured_font_size_changes_grid_and_candidate_geometry(cx: &mut TestAppContext) {
+        let (widget, cx) = cx.add_window_view(|_, cx| {
+            TerminalWidget::with_pty(
+                TerminalConfig {
+                    cursor_blink: false,
+                    ..Default::default()
+                },
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                None,
+                None,
+                None,
+                cx,
+            )
+        });
+        cx.simulate_resize(size(px(800.0), px(600.0)));
+        cx.refresh().unwrap();
+        cx.run_until_parked();
+        let (small_cells, small_grid) = cx.update_window_entity(&widget, |widget, _, cx| {
+            let metrics = (widget.cell_size, widget.size);
+            widget.config.font_size_px = 32.0;
+            cx.notify();
+            metrics
+        });
+        cx.refresh().unwrap();
+        cx.run_until_parked();
+        cx.update_window_entity(&widget, |widget, _, _| {
+            assert!(widget.cell_size.0 > small_cells.0);
+            assert!(widget.cell_size.1 > small_cells.1);
+            assert!(widget.size.0 < small_grid.0 && widget.size.1 < small_grid.1);
+            assert_eq!(
+                widget.input_cursor_bounds().unwrap().size,
+                size(widget.cell_size.0, widget.cell_size.1)
+            );
+        });
     }
 
     fn format_fixture_bounds(label: &str, bounds: Bounds<Pixels>) -> String {

@@ -26,6 +26,18 @@ pub enum PtyRead {
     Eof,
 }
 
+/// Interrupt synchronous I/O on a worker without transferring pipe ownership.
+pub(crate) fn cancel_io(thread: &std::thread::JoinHandle<()>) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        // JoinHandle keeps the native thread handle alive throughout this call.
+        unsafe { windows_sys::Win32::System::IO::CancelSynchronousIo(thread.as_raw_handle()) };
+    }
+    #[cfg(unix)]
+    let _ = thread; // Unix workers poll a cancellation flag on nonblocking fds.
+}
+
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]

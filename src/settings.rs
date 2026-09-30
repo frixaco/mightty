@@ -763,16 +763,60 @@ fn find_in_path(executable: &OsStr) -> Option<PathBuf> {
 }
 
 pub fn discover_profiles() -> Vec<LaunchProfile> {
-    platform_profiles()
+    use std::sync::{Mutex, OnceLock};
+    use std::time::Instant;
+
+    struct Discovery {
+        profiles: Vec<LaunchProfile>,
+        pending: Option<std::sync::mpsc::Receiver<Option<Vec<LaunchProfile>>>>,
+        refreshed: Option<Instant>,
+    }
+    static DISCOVERY: OnceLock<Mutex<Discovery>> = OnceLock::new();
+    let mut discovery = DISCOVERY
+        .get_or_init(|| {
+            Mutex::new(Discovery {
+                // Seed once during initial settings load so a configured WSL
+                // default/override resolves before the first pane is launched.
+                // Subsequent polling and additional windows only read the cache.
+                profiles: refresh_profiles().unwrap_or_else(platform_profiles),
+                pending: None,
+                refreshed: Some(Instant::now()),
+            })
+        })
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(pending) = &discovery.pending {
+        match pending.try_recv() {
+            Ok(profiles) => {
+                if let Some(profiles) = profiles {
+                    discovery.profiles = profiles;
+                }
+                discovery.pending = None;
+                discovery.refreshed = Some(Instant::now());
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                discovery.pending = None;
+                discovery.refreshed = Some(Instant::now());
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
+    }
+    if discovery.pending.is_none()
+        && discovery
+            .refreshed
+            .is_none_or(|time| time.elapsed() >= Duration::from_secs(30))
+    {
+        let (tx, rx) = std::sync::mpsc::channel();
+        discovery.pending = Some(rx);
+        std::thread::spawn(move || {
+            let _ = tx.send(refresh_profiles());
+        });
+    }
+    discovery.profiles.clone()
 }
 
 #[cfg(windows)]
 fn platform_profiles() -> Vec<LaunchProfile> {
-    use std::os::windows::process::CommandExt;
-    use std::process::Command;
-
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-
     let mut profiles = Vec::new();
     if let Some(pwsh) = find_in_path(OsStr::new("pwsh.exe")) {
         profiles.push(LaunchProfile::complete("powershell", "PowerShell", pwsh));
@@ -796,14 +840,22 @@ fn platform_profiles() -> Vec<LaunchProfile> {
         }
     }
 
-    if let Some(wsl) = find_in_path(OsStr::new("wsl.exe"))
-        && let Ok(output) = Command::new(&wsl)
+    profiles
+}
+
+#[cfg(windows)]
+fn refresh_profiles() -> Option<Vec<LaunchProfile>> {
+    use std::os::windows::process::CommandExt;
+    use std::process::Command;
+
+    let mut profiles = platform_profiles();
+    if let Some(wsl) = find_in_path(OsStr::new("wsl.exe")) {
+        let mut command = Command::new(&wsl);
+        command
             .args(["--list", "--quiet"])
-            .creation_flags(CREATE_NO_WINDOW)
-            .output()
-        && output.status.success()
-    {
-        for distribution in decode_wsl_names(&output.stdout) {
+            .creation_flags(0x0800_0000);
+        let output = discovery_output(&mut command, Duration::from_secs(3)).ok()?;
+        for distribution in decode_wsl_names(&output) {
             let id = ProfileId::new(format!("wsl:{}", stable_profile_component(&distribution)))
                 .expect("encoded WSL profile ID is valid");
             profiles.push(LaunchProfile {
@@ -817,7 +869,63 @@ fn platform_profiles() -> Vec<LaunchProfile> {
             });
         }
     }
-    profiles
+    Some(profiles)
+}
+
+#[cfg(not(windows))]
+fn refresh_profiles() -> Option<Vec<LaunchProfile>> {
+    Some(platform_profiles())
+}
+
+/// Capture discovery output without a pipe reader that could outlive a timeout.
+#[cfg(windows)]
+fn discovery_output(command: &mut std::process::Command, timeout: Duration) -> io::Result<Vec<u8>> {
+    use std::io::{Read, Seek};
+    use std::process::Stdio;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Instant;
+    static NEXT_CAPTURE: AtomicU64 = AtomicU64::new(0);
+    struct Capture(PathBuf);
+    impl Drop for Capture {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+    let capture = Capture(std::env::temp_dir().join(format!(
+        "mightty-discovery-{}-{}.tmp",
+        std::process::id(),
+        NEXT_CAPTURE.fetch_add(1, Ordering::Relaxed)
+    )));
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&capture.0)?;
+    let mut child = command
+        .stdout(Stdio::from(file.try_clone()?))
+        .stderr(Stdio::null())
+        .spawn()?;
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            result => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(result.err().unwrap_or_else(|| {
+                    io::Error::new(io::ErrorKind::TimedOut, "profile discovery timed out")
+                }));
+            }
+        }
+    };
+    if !status.success() {
+        return Err(io::Error::other("profile discovery failed"));
+    }
+    file.rewind()?;
+    let mut output = Vec::new();
+    file.take(256 * 1024).read_to_end(&mut output)?;
+    Ok(output)
 }
 
 #[cfg(windows)]
@@ -1060,5 +1168,37 @@ mod tests {
         assert!(store.diagnostic().is_some());
 
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn discovery_timeout_kills_and_reaps_a_stalled_process() {
+        use std::os::windows::process::CommandExt;
+        let mut command = std::process::Command::new("powershell.exe");
+        command
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Start-Sleep -Seconds 10",
+            ])
+            .creation_flags(0x0800_0000);
+        let start = std::time::Instant::now();
+        let error = discovery_output(&mut command, Duration::from_millis(100)).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn discovery_captures_output_without_a_pipe_reader() {
+        use std::os::windows::process::CommandExt;
+        let mut command = std::process::Command::new("cmd.exe");
+        command
+            .args(["/D", "/C", "echo mightty-profile-probe"])
+            .creation_flags(0x0800_0000);
+        let output = discovery_output(&mut command, Duration::from_secs(2)).unwrap();
+        assert!(String::from_utf8_lossy(&output).contains("mightty-profile-probe"));
     }
 }

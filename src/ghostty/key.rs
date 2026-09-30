@@ -21,6 +21,27 @@ pub struct Event {
 }
 
 impl Encoder {
+    /// Encode a native text commit using the terminal's current keyboard mode.
+    /// Text commits have no physical key identity; each Unicode scalar is an
+    /// independent text event. Preedit text must never be passed here.
+    pub fn encode_text(&mut self, terminal: &Terminal, text: &str) -> Result<Vec<u8>> {
+        self.set_options_from_terminal(terminal);
+        let mut event = Event::new()?;
+        event
+            .set_action(Action::Press)
+            .set_key(Key::Unidentified)
+            .set_mods(Mods::empty())
+            .set_consumed_mods(Mods::empty())
+            .set_composing(false);
+        let mut output = Vec::with_capacity(text.len().max(64));
+        for character in text.chars() {
+            event
+                .set_unshifted_codepoint(character)
+                .set_utf8(Some(character.to_string()));
+            self.encode_to_vec(&event, &mut output)?;
+        }
+        Ok(output)
+    }
     pub fn new() -> Result<Self> {
         let mut raw = std::ptr::null_mut();
         let result = unsafe { ffi::ghostty_key_encoder_new(std::ptr::null(), &raw mut raw) };
@@ -372,6 +393,28 @@ impl BitOrAssign for Mods {
 mod tests {
     use super::*;
     use crate::ghostty::TerminalOptions;
+
+    #[test]
+    fn encodes_unicode_commits_and_respects_extended_keyboard_mode() {
+        let mut terminal = Terminal::new(TerminalOptions {
+            cols: 80,
+            rows: 24,
+            max_scrollback: 0,
+        })
+        .unwrap();
+        let mut encoder = Encoder::new().unwrap();
+        let text = "日本😀e\u{301}";
+        assert_eq!(
+            encoder.encode_text(&terminal, text).unwrap(),
+            text.as_bytes()
+        );
+        assert!(encoder.encode_text(&terminal, "").unwrap().is_empty());
+        terminal.vt_write(b"\x1b[>1u");
+        assert_eq!(
+            encoder.encode_text(&terminal, text).unwrap(),
+            text.as_bytes()
+        );
+    }
 
     #[test]
     fn encodes_text_and_terminal_navigation_keys() {

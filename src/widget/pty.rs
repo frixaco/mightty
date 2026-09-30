@@ -39,6 +39,8 @@ pub(super) struct PtyWorker {
     command_tx: flume::Sender<PtyCommand>,
     control_thread: Option<JoinHandle<()>>,
     reader_thread: Option<JoinHandle<()>>,
+    stopping: Arc<AtomicBool>,
+    stop_reader: Arc<AtomicBool>,
 }
 
 #[cfg(not(any(windows, unix)))]
@@ -62,6 +64,9 @@ impl PtyWorker {
     ) -> (Self, flume::Receiver<PtyEvent>) {
         let (command_tx, command_rx) = flume::unbounded::<PtyCommand>();
         let (event_tx, event_rx) = flume::bounded::<PtyEvent>(OUTPUT_QUEUE_CAPACITY);
+        let stopping = Arc::new(AtomicBool::new(false));
+        let stop_reader = Arc::new(AtomicBool::new(false));
+        let control_stopping = stopping.clone();
 
         let mut input = parts.input;
         let mut control = parts.control;
@@ -69,13 +74,21 @@ impl PtyWorker {
         let control_event_tx = event_tx.clone();
         let control_thread = std::thread::spawn(move || {
             while let Ok(command) = command_rx.recv() {
+                if control_stopping.load(Ordering::Acquire) {
+                    break;
+                }
                 let result = match command {
-                    PtyCommand::Write(data) => input.write_all(&data),
+                    PtyCommand::Write(data) => {
+                        input.write_all_interruptible(&data, &control_stopping)
+                    }
                     PtyCommand::Resize(size) => control.resize(size),
                     PtyCommand::Shutdown => break,
                 };
 
                 if let Err(err) = result {
+                    if control_stopping.load(Ordering::Acquire) {
+                        break;
+                    }
                     eprintln!("ConPTY command failed: {err}");
                     control_exit_flag.store(true, Ordering::Relaxed);
                     let _ = control_event_tx.try_send(PtyEvent::Exited);
@@ -88,20 +101,32 @@ impl PtyWorker {
 
         let mut output = parts.output;
         let reader_exit_flag = Arc::clone(&exit_flag);
+        let reader_stopping = stopping.clone();
+        let reader_cancel = stop_reader.clone();
         let reader_thread = std::thread::spawn(move || {
             let mut buf = [0u8; READ_BUFFER_SIZE];
 
             loop {
-                match output.read(&mut buf) {
+                match output.read_interruptible(&mut buf, &reader_cancel) {
                     Ok(PtyRead::Data(0)) => {}
                     Ok(PtyRead::Data(n)) => {
-                        if event_tx.send(PtyEvent::Output(buf[..n].to_vec())).is_err() {
-                            break;
+                        let mut event = PtyEvent::Output(buf[..n].to_vec());
+                        // Keep draining ConPTY during close, even when the UI no longer
+                        // consumes output. ClosePseudoConsole needs its output reader.
+                        while !reader_stopping.load(Ordering::Acquire) {
+                            match event_tx.send_timeout(event, std::time::Duration::from_millis(20))
+                            {
+                                Ok(()) => break,
+                                Err(flume::SendTimeoutError::Timeout(returned)) => event = returned,
+                                Err(flume::SendTimeoutError::Disconnected(_)) => break,
+                            }
                         }
                     }
                     Ok(PtyRead::Eof) => break,
                     Err(err) => {
-                        eprintln!("ConPTY output read failed: {err}");
+                        if !reader_cancel.load(Ordering::Acquire) {
+                            eprintln!("PTY output read failed: {err}");
+                        }
                         break;
                     }
                 }
@@ -116,6 +141,8 @@ impl PtyWorker {
                 command_tx,
                 control_thread: Some(control_thread),
                 reader_thread: Some(reader_thread),
+                stopping,
+                stop_reader,
             },
             event_rx,
         )
@@ -126,13 +153,25 @@ impl PtyWorker {
     }
 
     pub(super) fn shutdown(&mut self) {
+        self.stopping.store(true, Ordering::Release);
         let _ = self.command_tx.send(PtyCommand::Shutdown);
 
         if let Some(handle) = self.control_thread.take() {
+            // Retry cancellation to cover shutdown racing with entry into a
+            // synchronous OS write. The flag prevents any subsequent writes.
+            while !handle.is_finished() {
+                crate::shell::cancel_io(&handle);
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
             let _ = handle.join();
         }
 
+        self.stop_reader.store(true, Ordering::Release);
         if let Some(handle) = self.reader_thread.take() {
+            while !handle.is_finished() {
+                crate::shell::cancel_io(&handle);
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
             let _ = handle.join();
         }
     }
@@ -146,5 +185,82 @@ impl PtyWorker {
 impl Drop for PtyWorker {
     fn drop(&mut self) {
         self.shutdown();
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+    use std::os::windows::io::{FromRawHandle, OwnedHandle};
+    use std::time::{Duration, Instant};
+    use windows_sys::Win32::Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    fn process_handle() -> OwnedHandle {
+        unsafe {
+            let process = GetCurrentProcess();
+            let mut handle = std::ptr::null_mut();
+            assert_ne!(
+                DuplicateHandle(
+                    process,
+                    process,
+                    process,
+                    &mut handle,
+                    0,
+                    0,
+                    DUPLICATE_SAME_ACCESS
+                ),
+                0
+            );
+            OwnedHandle::from_raw_handle(handle)
+        }
+    }
+
+    #[test]
+    fn shutdown_interrupts_stalled_handoff_input_and_output() {
+        let (parts, _unread_input, _open_output) = PtyParts::from_handoff(
+            process_handle(),
+            process_handle(),
+            process_handle(),
+            process_handle(),
+        )
+        .unwrap();
+        let (mut worker, receiver) = PtyWorker::from_parts(parts, Arc::new(AtomicBool::new(false)));
+        worker
+            .command_tx()
+            .send(PtyCommand::Write(vec![b'a'; 1024 * 1024]))
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        drop(receiver);
+        let start = Instant::now();
+        worker.shutdown();
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "shutdown waited for the pipe peer"
+        );
+        // The test process handle is observed, never terminated by handoff close.
+    }
+
+    #[test]
+    fn shutdown_discards_queued_input_even_if_receiver_stays_connected() {
+        let (parts, _unread_input, _open_output) = PtyParts::from_handoff(
+            process_handle(),
+            process_handle(),
+            process_handle(),
+            process_handle(),
+        )
+        .unwrap();
+        let (mut worker, _receiver) =
+            PtyWorker::from_parts(parts, Arc::new(AtomicBool::new(false)));
+        for _ in 0..16 {
+            worker
+                .command_tx()
+                .send(PtyCommand::Write(vec![b'a'; 128 * 1024]))
+                .unwrap();
+        }
+        let start = Instant::now();
+        worker.shutdown();
+        assert!(start.elapsed() < Duration::from_secs(1));
+        worker.shutdown(); // Also safe when Drop calls it again.
     }
 }

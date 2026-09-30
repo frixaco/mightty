@@ -477,12 +477,38 @@ fn create_process_with_pty(
 }
 
 impl PtyInput {
+    pub fn write_all_interruptible(
+        &mut self,
+        data: &[u8],
+        stopping: &std::sync::atomic::AtomicBool,
+    ) -> Result<(), PtyError> {
+        for chunk in data.chunks(32 * 1024) {
+            if stopping.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(PtyError::from_io(
+                    "write terminal input",
+                    io::Error::new(io::ErrorKind::Interrupted, "session closing"),
+                ));
+            }
+            self.write_all(chunk)?;
+        }
+        Ok(())
+    }
     pub fn write_all(&mut self, data: &[u8]) -> Result<(), PtyError> {
         write_all_to_handle(self.handle.raw(), data, "write to terminal input pipe")
     }
 }
 
 impl PtyOutput {
+    pub fn read_interruptible(
+        &mut self,
+        buf: &mut [u8],
+        stopping: &std::sync::atomic::AtomicBool,
+    ) -> Result<PtyRead, PtyError> {
+        if stopping.load(std::sync::atomic::Ordering::Acquire) {
+            return Ok(PtyRead::Eof);
+        }
+        self.read(buf)
+    }
     pub fn read(&mut self, buf: &mut [u8]) -> Result<PtyRead, PtyError> {
         if buf.is_empty() {
             return Ok(PtyRead::Data(0));

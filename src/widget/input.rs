@@ -95,6 +95,15 @@ fn unshifted_codepoint(keystroke: &gpui::Keystroke) -> char {
     }
 }
 
+pub(super) fn key_identity(keystroke: &gpui::Keystroke) -> String {
+    let codepoint = unshifted_codepoint(keystroke);
+    if codepoint == '\0' {
+        keystroke.key.clone()
+    } else {
+        codepoint.to_string()
+    }
+}
+
 fn consumed_mods(key: &str, mods: Mods, text: Option<&str>, ucp: char) -> Mods {
     let Some(t) = text else {
         return Mods::empty();
@@ -154,7 +163,7 @@ fn convert_to_ghostty_key(keystroke: &gpui::Keystroke) -> Key {
         "f11" => Key::F11,
         "f12" => Key::F12,
         _ if keystroke.key.len() == 1 => {
-            let c = keystroke.key.chars().next().unwrap_or('?');
+            let c = unshifted_codepoint(keystroke);
             match c.to_ascii_lowercase() {
                 'a'..='z' => match c {
                     'a' => Key::A,
@@ -228,4 +237,33 @@ pub(super) fn convert_modifiers(modifiers: &gpui::Modifiers) -> Mods {
         mods |= Mods::SUPER;
     }
     mods
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn shifted_keys_keep_the_same_identity_for_release() {
+        for (shifted, plain, key) in [
+            ("A", "a", Key::A),
+            ("!", "1", Key::Digit1),
+            ("?", "/", Key::Slash),
+        ] {
+            let shifted = gpui::Keystroke {
+                key: shifted.to_string(),
+                key_char: None,
+                modifiers: gpui::Modifiers {
+                    shift: true,
+                    ..Default::default()
+                },
+            };
+            let plain = gpui::Keystroke {
+                key: plain.to_string(),
+                key_char: None,
+                modifiers: Default::default(),
+            };
+            assert_eq!(key_identity(&shifted), key_identity(&plain));
+            assert_eq!(convert_to_ghostty_key(&shifted), key);
+        }
+    }
 }

@@ -8,6 +8,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: windows-release
+  cancel-in-progress: false
+
 jobs:
   windows:
     runs-on: windows-2025
@@ -36,6 +40,22 @@ jobs:
           ).Groups["version"].Value
           if ("v$version" -ne "${{ github.ref_name }}") {
             throw "Tag ${{ github.ref_name }} does not match Cargo version $version."
+          }
+
+      - name: Protect already published releases
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          $draft = gh release view $env:RELEASE_TAG --json isDraft --jq .isDraft 2>&1
+          if ($LASTEXITCODE -eq 0) {
+            if ([string] $draft -ne "true") {
+              throw "This tag already has a published release; do not replace its assets."
+            }
+          } elseif (($draft -join " ") -notmatch "release not found|HTTP 404") {
+            throw "Cannot check the existing release: $draft"
           }
 
       - name: Import signing certificate
@@ -71,7 +91,8 @@ jobs:
           .\tools\package-windows.ps1 `
             -Publisher "${{ secrets.WINDOWS_PACKAGE_PUBLISHER }}" `
             -CertificateThumbprint "${{ steps.certificate.outputs.thumbprint }}" `
-            -ReleaseBaseUri "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}"
+            -ReleaseBaseUri "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}" `
+            -AppInstallerUri "https://github.com/${{ github.repository }}/releases/latest/download/mightty-x64.appinstaller"
 
       - name: Remove signing certificate
         if: always()
@@ -96,9 +117,35 @@ jobs:
             -ArtifactsDirectory .\artifacts\windows `
             -Publisher "${{ secrets.WINDOWS_PACKAGE_PUBLISHER }}" `
             -Version $version `
-            -Architecture x64
+            -Architecture x64 `
+            -ExpectedAppInstallerUri "https://github.com/${{ github.repository }}/releases/latest/download/mightty-x64.appinstaller"
 
       - name: Publish Windows release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
+          draft: true
           files: artifacts/windows/*
+
+      - name: Publish complete release and advance stable feed
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          $version = [version] $env:RELEASE_TAG.Substring(1)
+          $latestTag = gh api "repos/$env:GH_REPO/releases/latest" --jq .tag_name 2>&1
+          $advance = $false
+          if ($LASTEXITCODE -ne 0) {
+            if (($latestTag -join " ") -notmatch "HTTP 404") {
+              throw "Cannot determine the current stable release: $latestTag"
+            }
+            $advance = $true
+          }
+          if (-not $advance) {
+            $latestVersion = [version] ([string] $latestTag).TrimStart("v")
+            $advance = $version -ge $latestVersion
+          }
+          $latest = if ($advance) { "true" } else { "false" }
+          gh release edit $env:RELEASE_TAG --draft=false "--latest=$latest"
+          if ($LASTEXITCODE -ne 0) { throw "Release publication failed." }

@@ -132,7 +132,28 @@ impl PtyParts {
             }
         }
 
-        let input_fd = duplicate_fd(master_fd, "duplicate PTY input fd")?;
+        // O_NONBLOCK is shared by the duplicated master descriptors. Polling
+        // allows input and output workers to observe shutdown without fd races.
+        unsafe {
+            let flags = libc::fcntl(master_fd, libc::F_GETFL);
+            if flags < 0 || libc::fcntl(master_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
+                close_fd(master_fd);
+                libc::kill(child_pid, libc::SIGKILL);
+                libc::waitpid(child_pid, ptr::null_mut(), 0);
+                return Err(PtyError::io("set nonblocking PTY"));
+            }
+        }
+        let input_fd = match duplicate_fd(master_fd, "duplicate PTY input fd") {
+            Ok(fd) => fd,
+            Err(err) => {
+                close_fd(master_fd);
+                unsafe {
+                    libc::kill(child_pid, libc::SIGKILL);
+                    libc::waitpid(child_pid, ptr::null_mut(), 0);
+                }
+                return Err(err);
+            }
+        };
         let output_fd = match duplicate_fd(master_fd, "duplicate PTY output fd") {
             Ok(fd) => fd,
             Err(err) => {
@@ -140,6 +161,7 @@ impl PtyParts {
                 close_fd(master_fd);
                 unsafe {
                     libc::kill(child_pid, libc::SIGKILL);
+                    libc::waitpid(child_pid, ptr::null_mut(), 0);
                 }
                 return Err(err);
             }
@@ -165,9 +187,23 @@ impl PtyParts {
 
 impl PtyInput {
     pub fn write_all(&mut self, data: &[u8]) -> Result<(), PtyError> {
+        self.write_all_interruptible(data, &std::sync::atomic::AtomicBool::new(false))
+    }
+
+    pub fn write_all_interruptible(
+        &mut self,
+        data: &[u8],
+        stopping: &std::sync::atomic::AtomicBool,
+    ) -> Result<(), PtyError> {
         let mut written_total = 0usize;
 
         while written_total < data.len() {
+            if stopping.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(PtyError::from_io(
+                    "write PTY",
+                    io::Error::new(io::ErrorKind::Interrupted, "session closing"),
+                ));
+            }
             let remaining = &data[written_total..];
             let bytes_written =
                 unsafe { libc::write(self.master_fd, remaining.as_ptr().cast(), remaining.len()) };
@@ -184,9 +220,9 @@ impl PtyInput {
             let error = io::Error::last_os_error();
             match error.raw_os_error() {
                 Some(libc::EINTR) => continue,
-                Some(libc::EAGAIN) => thread::sleep(SHUTDOWN_POLL),
-                #[cfg(any(target_os = "linux", target_os = "android"))]
-                Some(libc::EWOULDBLOCK) => thread::sleep(SHUTDOWN_POLL),
+                Some(code) if code == libc::EAGAIN || code == libc::EWOULDBLOCK => {
+                    wait_for_ready(self.master_fd, libc::POLLOUT)?;
+                }
                 _ => return Err(PtyError::from_io("write to PTY master", error)),
             }
         }
@@ -204,11 +240,22 @@ impl Drop for PtyInput {
 
 impl PtyOutput {
     pub fn read(&mut self, buf: &mut [u8]) -> Result<PtyRead, PtyError> {
+        self.read_interruptible(buf, &std::sync::atomic::AtomicBool::new(false))
+    }
+
+    pub fn read_interruptible(
+        &mut self,
+        buf: &mut [u8],
+        stopping: &std::sync::atomic::AtomicBool,
+    ) -> Result<PtyRead, PtyError> {
         if buf.is_empty() {
             return Ok(PtyRead::Data(0));
         }
 
         loop {
+            if stopping.load(std::sync::atomic::Ordering::Acquire) {
+                return Ok(PtyRead::Eof);
+            }
             let bytes_read =
                 unsafe { libc::read(self.master_fd, buf.as_mut_ptr().cast(), buf.len()) };
 
@@ -223,9 +270,9 @@ impl PtyOutput {
             let error = io::Error::last_os_error();
             match error.raw_os_error() {
                 Some(libc::EINTR) => continue,
-                Some(libc::EAGAIN) => continue,
-                #[cfg(any(target_os = "linux", target_os = "android"))]
-                Some(libc::EWOULDBLOCK) => continue,
+                Some(code) if code == libc::EAGAIN || code == libc::EWOULDBLOCK => {
+                    wait_for_ready(self.master_fd, libc::POLLIN)?;
+                }
                 Some(libc::EIO) => return Ok(PtyRead::Eof),
                 _ => return Err(PtyError::from_io("read from PTY master", error)),
             }
@@ -238,6 +285,23 @@ impl Drop for PtyOutput {
         close_fd(self.master_fd);
         self.master_fd = INVALID_FD;
     }
+}
+
+fn wait_for_ready(fd: RawFd, events: libc::c_short) -> Result<(), PtyError> {
+    let mut descriptor = libc::pollfd {
+        fd,
+        events,
+        revents: 0,
+    };
+    // Readiness wakes immediately on data. The timeout bounds cancellation
+    // latency without closing a descriptor that another thread is using.
+    if unsafe { libc::poll(&mut descriptor, 1, 100) } < 0 {
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(PtyError::from_io("poll PTY", error));
+        }
+    }
+    Ok(())
 }
 
 impl PtyControl {
