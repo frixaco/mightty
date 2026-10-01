@@ -3,7 +3,11 @@ use gpui::{
     KeyUpEvent, MouseButton, MouseDownEvent, Render, Task, Timer, Window, WindowControlArea, div,
     font, prelude::*, px,
 };
-use gpui_component::{InteractiveElementExt, menu::AppMenuBar};
+use gpui_component::{
+    InteractiveElementExt,
+    button::{Button, ButtonVariants},
+    menu::AppMenuBar,
+};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -1255,6 +1259,42 @@ impl Render for PaneContainer {
             self.app_menu_bar = Some(AppMenuBar::new(window, cx));
         }
         let app_menu_bar = self.app_menu_bar.clone();
+        let sidebar_toggle = Button::new("sidebar-toggle")
+            .ghost()
+            .w(px(34.0))
+            .h(px(28.0))
+            .p_0()
+            .mx(px(3.0))
+            .tooltip(if self.sidebar_visible {
+                "Hide sidebar"
+            } else {
+                "Show sidebar"
+            })
+            .child(
+                div()
+                    .w(px(18.0))
+                    .h(px(14.0))
+                    .border_1()
+                    .border_color(gpui::rgb(0xb0b0b0))
+                    .rounded(px(2.0))
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .w(px(5.0))
+                            .h_full()
+                            .border_r_1()
+                            .border_color(gpui::rgb(0xb0b0b0))
+                            .when(self.sidebar_visible, |icon| icon.bg(gpui::rgb(0xb0b0b0))),
+                    ),
+            )
+            .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                window.prevent_default();
+                cx.stop_propagation();
+            })
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.dispatch_app_action(AppAction::ToggleSidebar, window, cx);
+            }))
+            .into_any_element();
         let palette = self
             .palette
             .as_ref()
@@ -1269,7 +1309,7 @@ impl Render for PaneContainer {
             .on_action(cx.listener(Self::on_app_action))
             .children(
                 self.titlebar_visible
-                    .then(|| render_titlebar(window, app_menu_bar)),
+                    .then(|| render_titlebar(window, app_menu_bar, sidebar_toggle)),
             )
             .children(
                 self.settings
@@ -1343,6 +1383,7 @@ fn render_workspace_diagnostic(message: String) -> impl IntoElement {
 fn render_titlebar(
     window: &mut Window,
     app_menu_bar: Option<Entity<AppMenuBar>>,
+    sidebar_toggle: AnyElement,
 ) -> impl IntoElement {
     let maximize_button = if window.is_maximized() {
         WindowsCaptionButton::Restore
@@ -1357,24 +1398,26 @@ fn render_titlebar(
         .items_center()
         .bg(gpui::rgb(WINDOW_BACKGROUND))
         .when(cfg!(target_os = "macos"), |titlebar| {
-            titlebar
-                .child(
-                    div()
-                        .id("mac-traffic-light-space")
-                        .h_full()
-                        .w(px(MAC_TRAFFIC_LIGHT_SPACER_PX))
-                        .flex_shrink_0()
-                        .window_control_area(WindowControlArea::Drag)
-                        .on_double_click(|_, window, _| window.titlebar_double_click()),
-                )
-                .child(
-                    div()
-                        .id("titlebar-drag")
-                        .h_full()
-                        .flex_1()
-                        .window_control_area(WindowControlArea::Drag)
-                        .on_double_click(|_, window, _| window.titlebar_double_click()),
-                )
+            titlebar.child(
+                div()
+                    .id("mac-traffic-light-space")
+                    .h_full()
+                    .w(px(MAC_TRAFFIC_LIGHT_SPACER_PX))
+                    .flex_shrink_0()
+                    .window_control_area(WindowControlArea::Drag)
+                    .on_double_click(|_, window, _| window.titlebar_double_click()),
+            )
+        })
+        .child(sidebar_toggle)
+        .when(cfg!(target_os = "macos"), |titlebar| {
+            titlebar.child(
+                div()
+                    .id("titlebar-drag")
+                    .h_full()
+                    .flex_1()
+                    .window_control_area(WindowControlArea::Drag)
+                    .on_double_click(|_, window, _| window.titlebar_double_click()),
+            )
         })
         .when(!cfg!(target_os = "macos"), |titlebar| {
             titlebar

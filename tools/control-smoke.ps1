@@ -32,6 +32,23 @@ try {
     $state = Invoke-Control @('state')
     if ($state.windows.Count -ne 1) { throw 'Isolated startup opened unexpected windows' }
     $pane = $state.windows[0].tabs[0].panes[0].pane_id
+    if ($UiOnly) {
+        $null = Invoke-Control @('window', 'focus', '--window', 'w1')
+        $shown = Invoke-Control @('snapshot', '--window', 'w1', '--frame', 'next', '--out', $caseDirectory)
+        $click = @(@{ type = 'pointer'; event = 'press'; button = 'left'; x = 20; y = 17 }, @{ type = 'pointer'; event = 'release'; button = 'left'; x = 20; y = 17 })
+        $click | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $caseDirectory 'sidebar-click.json') -Encoding utf8NoBOM
+        $null = Invoke-Control @('ui', 'input', '--window', 'w1', '--file', (Join-Path $caseDirectory 'sidebar-click.json'))
+        if ((Invoke-Control @('state', '--window', 'w1')).sidebar_visible) { throw 'Sidebar button did not hide the sidebar' }
+        $hidden = Invoke-Control @('snapshot', '--window', 'w1', '--frame', 'next', '--out', $caseDirectory)
+        $null = Invoke-Control @('ui', 'input', '--window', 'w1', '--file', (Join-Path $caseDirectory 'sidebar-click.json'))
+        if (!(Invoke-Control @('state', '--window', 'w1')).sidebar_visible) { throw 'Sidebar button did not restore the sidebar' }
+        $null = Invoke-Control @('ui', 'key', '--window', 'w1', '--key', 'b', '--mod', 'ctrl')
+        if ((Invoke-Control @('state', '--window', 'w1')).sidebar_visible) { throw 'Sidebar shortcut did not hide the sidebar' }
+        $null = Invoke-Control @('snapshot', '--window', 'w1', '--frame', 'next', '--out', $caseDirectory)
+        $null = Invoke-Control @('ui', 'input', '--window', 'w1', '--file', (Join-Path $caseDirectory 'sidebar-click.json'))
+        if (!(Invoke-Control @('state', '--window', 'w1')).sidebar_visible) { throw 'Sidebar button did not follow the keyboard toggle' }
+        Write-Output "Sidebar shown: $($shown.image); hidden: $($hidden.image)"
+    }
     if ($SnapshotOnly) {
         $null = Invoke-Control @('window', 'focus', '--window', 'w1')
         $null = Invoke-Control @('snapshot', '--window', 'w1', '--frame', 'next', '--out', $caseDirectory)
