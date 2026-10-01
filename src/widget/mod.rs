@@ -137,6 +137,7 @@ pub struct TerminalWidget {
     cell_iterator: CellIterator,
     graphics_renderer: graphics::GraphicsRenderer,
     search: Option<search::SearchOverlay>,
+    search_restore_focus: Option<gpui::WeakFocusHandle>,
     search_task: Task<()>,
     config: TerminalConfig,
     pty_tx: Option<pty::PtySender>,
@@ -382,6 +383,7 @@ impl TerminalWidget {
             cell_iterator,
             graphics_renderer,
             search: None,
+            search_restore_focus: None,
             search_task: Task::ready(()),
             config,
             pty_tx,
@@ -511,6 +513,12 @@ impl TerminalWidget {
     }
 
     pub(crate) fn open_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.prepare_search(true, window, cx);
+    }
+    fn prepare_search(&mut self, focus: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if focus && self.search_restore_focus.is_none() {
+            self.search_restore_focus = window.focused(cx).map(|focus| focus.downgrade());
+        }
         if self.search.is_none() {
             self.search = Some(search::SearchOverlay::default());
             let input = cx.new(|cx| {
@@ -531,7 +539,7 @@ impl TerminalWidget {
                 );
             self.search_input = Some(input);
         }
-        if let Some(input) = &self.search_input {
+        if focus && let Some(input) = &self.search_input {
             input.update(cx, |input, cx| input.focus(window, cx));
         }
         self.preedit.clear();
@@ -546,7 +554,11 @@ impl TerminalWidget {
         self.search_input = None;
         self.search_input_subscription = None;
         self.search_task = Task::ready(());
-        self.focus_handle.focus(window);
+        self.search_restore_focus
+            .take()
+            .and_then(|focus| focus.upgrade())
+            .unwrap_or_else(|| self.focus_handle.clone())
+            .focus(window);
         cx.notify();
     }
 

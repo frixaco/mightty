@@ -78,6 +78,7 @@ pub struct PaneContainer {
     workspace_ids: Vec<WorkspaceId>,
     workspace_diagnostic: Option<String>,
     palette: Option<PaletteState>,
+    palette_restore_focus: Option<gpui::WeakFocusHandle>,
     palette_focus: FocusHandle,
     palette_input: Option<Entity<gpui_component::input::InputState>>,
     palette_input_subscription: Option<gpui::Subscription>,
@@ -229,7 +230,7 @@ impl PaneContainer {
             "layout_token":self.window_layout_token(window,cx),
             "dpi_scale":window.scale_factor(),"os_focused":window.is_window_active(),
             "active_tab_id":format!("t{}",self.tabs[self.active_tab_index].id.value()),
-            "sidebar_visible":self.sidebar_visible,"palette_open":self.palette.is_some(),"settings_generation":self.settings.generation().to_string(),
+            "sidebar_visible":self.sidebar_visible,"palette_open":self.palette.is_some(),"palette":self.palette.as_ref().map(|palette|json!({"query":palette.query,"selected":palette.selected})),"settings_generation":self.settings.generation().to_string(),
             "tabs":self.tabs.iter().map(|tab| {let split=tab.split.read(cx);json!({"tab_id":format!("t{}",tab.id.value()),"title":tab.title,"fallback_title":tab.default_title,
                 "selected_pane_id":format!("p{}",split.active_pane_id().value()),"zoomed_pane_id":split.zoomed_pane_id().map(|p|format!("p{}",p.value())),"topology":control::topology(split.topology()),"layout_token":split.layout_token(tab.id),
                 "panes":split.pane_entities().map(|(id,profile,terminal)|{let mut state=terminal.read(cx).control_state();state["pane_id"]=json!(format!("p{}",id.value()));state["profile_id"]=json!(profile.as_str());state["output_cursor"]=json!(format!("{}:p{}:{}",crate::control::instance_id(),id.value(),state["output_seq"].as_str().unwrap()));state}).collect::<Vec<_>>()})}).collect::<Vec<_>>()})
@@ -309,6 +310,7 @@ impl PaneContainer {
             workspace_ids,
             workspace_diagnostic: None,
             palette: None,
+            palette_restore_focus: None,
             palette_focus: cx.focus_handle(),
             palette_input: None,
             palette_input_subscription: None,
@@ -1025,6 +1027,9 @@ impl PaneContainer {
     }
 
     fn open_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.palette.is_none() {
+            self.palette_restore_focus = window.focused(cx).map(|focus| focus.downgrade());
+        }
         match self.workspace_store.list() {
             Ok(workspaces) => self.workspace_ids = workspaces,
             Err(error) => {
@@ -1055,11 +1060,20 @@ impl PaneContainer {
         cx.notify();
     }
 
-    fn close_palette(&mut self, cx: &mut Context<Self>) {
+    fn close_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.palette = None;
         self.palette_input = None;
         self.palette_input_subscription = None;
-        self.needs_focus = true;
+        if let Some(focus) = self
+            .palette_restore_focus
+            .take()
+            .and_then(|focus| focus.upgrade())
+        {
+            focus.focus(window);
+            self.needs_focus = false;
+        } else {
+            self.needs_focus = true;
+        }
         cx.notify();
     }
 
@@ -1086,7 +1100,7 @@ impl PaneContainer {
         let commands = self.palette_commands(window, cx);
         let matches = filtered_command_indices(&commands, &query);
         match key {
-            "escape" => self.close_palette(cx),
+            "escape" => self.close_palette(window, cx),
             "up" => {
                 let palette = self.palette.as_mut().expect("palette remains open");
                 palette.selected = palette.selected.saturating_sub(1);
@@ -1102,7 +1116,7 @@ impl PaneContainer {
                     && commands[*command_index].unavailable_reason.is_none()
                 {
                     let action = commands[*command_index].action.clone();
-                    self.close_palette(cx);
+                    self.close_palette(window, cx);
                     self.dispatch_app_action(action, window, cx);
                 }
             }
@@ -1423,7 +1437,7 @@ impl PaneContainer {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _event: &MouseDownEvent, window, cx| {
-                    this.close_palette(cx);
+                    this.close_palette(window, cx);
                     window.prevent_default();
                     cx.stop_propagation();
                 }),
@@ -1496,7 +1510,7 @@ impl PaneContainer {
                                             MouseButton::Left,
                                             cx.listener(
                                                 move |this, _event: &MouseDownEvent, window, cx| {
-                                                    this.close_palette(cx);
+                                                    this.close_palette(window, cx);
                                                     this.dispatch_app_action(
                                                         action.clone(),
                                                         window,

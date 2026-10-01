@@ -66,7 +66,7 @@ impl PaneContainer {
         )
     }
 
-    fn check_layout(
+    pub fn check_layout(
         &self,
         request: &Request,
         index: Option<usize>,
@@ -260,6 +260,71 @@ impl PaneContainer {
         cx: &mut Context<Self>,
     ) -> Result<Value, ControlError> {
         match request.op.as_str() {
+            "ui.sidebar" => {
+                self.check_layout(request, None, window, cx)?;
+                self.sidebar_visible = control::bool_arg(request, "visible", self.sidebar_visible)?;
+                self.establish_layout(window, cx);
+                cx.notify();
+                Ok(self.control_state(window, cx))
+            }
+            "ui.palette" => {
+                self.check_layout(request, None, window, cx)?;
+                let open = control::bool_arg(request, "open", self.palette.is_some())?;
+                let query = control::string_arg(request, "query")?;
+                if query.is_some_and(|query| query.len() > 4096) {
+                    return Err(ControlError::new(
+                        "invalid_argument",
+                        "query exceeds 4096 bytes",
+                    ));
+                }
+                if !open && query.is_some() {
+                    return Err(ControlError::new(
+                        "invalid_argument",
+                        "query requires an open palette",
+                    ));
+                }
+                if open {
+                    if self.palette.is_none() {
+                        self.open_palette(window, cx);
+                    }
+                    if let Some(query) = query {
+                        if let Some(palette) = &mut self.palette {
+                            palette.query = query.into();
+                            palette.selected = 0;
+                        }
+                        if let Some(input) = &self.palette_input {
+                            input.update(cx, |input, cx| {
+                                input.set_value(query.to_string(), window, cx)
+                            });
+                        }
+                    }
+                } else {
+                    self.close_palette(window, cx);
+                }
+                cx.notify();
+                Ok(self.control_state(window, cx))
+            }
+            "ui.search" => {
+                let (index, _, terminal) = self.targeted_terminal(request, cx)?;
+                self.check_layout(request, Some(index), window, cx)?;
+                let open = control::bool_arg(
+                    request,
+                    "open",
+                    terminal.read(cx).control_state()["search_open"] == true,
+                )?;
+                let query = control::string_arg(request, "query")?;
+                if query.is_some_and(|query| query.len() > 4096) || (!open && query.is_some()) {
+                    return Err(ControlError::new(
+                        "invalid_argument",
+                        "query requires open search and at most 4096 bytes",
+                    ));
+                }
+                let visible = index == self.active_tab_index;
+                terminal.update(cx, |terminal, cx| {
+                    terminal.control_search(open, query, visible, window, cx)
+                });
+                Ok(self.tab_result(index, window, cx))
+            }
             "tab.new" => {
                 self.check_layout(request, None, window, cx)?;
                 if self.tabs.len() >= MAX_SELECTABLE_TABS {

@@ -1,4 +1,4 @@
-param([string]$Executable = "$PSScriptRoot/../target/debug/mightty.exe")
+param([string]$Executable = "$PSScriptRoot/../target/debug/mightty.exe", [switch]$UiOnly)
 $ErrorActionPreference = 'Stop'
 $Executable = (Resolve-Path -LiteralPath $Executable).Path
 $caseDirectory = Join-Path ([System.IO.Path]::GetTempPath()) ('mightty-control-' + [guid]::NewGuid())
@@ -8,7 +8,7 @@ New-Item -ItemType Directory -Path $caseDirectory | Out-Null
     profiles = @(@{ id = 'fixture'; label = 'Control fixture'; executable = 'pwsh.exe'; arguments = @('-NoLogo', '-NoProfile') })
     terminal = @{ cursor_blink = $false }
 } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $caseDirectory 'settings.json') -Encoding utf8NoBOM
-$application = Start-Process -FilePath $Executable -ArgumentList @('--test-instance', '--data-dir', ('"' + $caseDirectory + '"')) -PassThru -WindowStyle Hidden
+$application = Start-Process -FilePath $Executable -ArgumentList @('--test-instance', '--data-dir', ('"' + $caseDirectory + '"')) -PassThru -WindowStyle Hidden -RedirectStandardOutput (Join-Path $caseDirectory 'stdout.log') -RedirectStandardError (Join-Path $caseDirectory 'stderr.log')
 try {
     $deadline = [datetime]::UtcNow.AddSeconds(20)
     do {
@@ -21,12 +21,39 @@ try {
     if ($instance.Count -ne 1) { throw 'Isolated instance was not discovered' }
     function Invoke-Control([string[]]$Command) {
         $response = & $Executable ctl @Command --instance $instance[0].instance_id --json | ConvertFrom-Json
-        if (!$response.ok) { throw ($response.error | ConvertTo-Json -Depth 8) }
+        if (!$response.ok) { throw ("Command: $($Command -join ' '); " + ($response.error | ConvertTo-Json -Depth 8) + "; logs: $caseDirectory") }
         $response.result
     }
     $state = Invoke-Control @('state')
     if ($state.windows.Count -ne 1) { throw 'Isolated startup opened unexpected windows' }
     $pane = $state.windows[0].tabs[0].panes[0].pane_id
+    $null = Invoke-Control @('ui', 'sidebar', '--window', 'w1', '--visible', 'false')
+    $sidebar = Invoke-Control @('state', '--window', 'w1')
+    if ($sidebar.sidebar_visible) { throw 'Sidebar desired state failed' }
+    $null = Invoke-Control @('ui', 'sidebar', '--window', 'w1', '--visible', 'true')
+    $uiSteps = @(@{ type = 'key'; key = 'p'; modifiers = @('ctrl', 'shift') }, @{ type = 'text'; text = 'split' })
+    $uiSteps | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $caseDirectory 'ui-input.json') -Encoding utf8NoBOM
+    $uiResult = Invoke-Control @('ui', 'input', '--window', 'w1', '--file', (Join-Path $caseDirectory 'ui-input.json'))
+    $uiResult | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $caseDirectory 'ui-result.json') -Encoding utf8NoBOM
+    $palette = Invoke-Control @('state', '--window', 'w1')
+    if (!$palette.palette_open -or $palette.palette.query -ne 'split') { $palette | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath (Join-Path $caseDirectory 'ui-state.json') -Encoding utf8NoBOM; throw "Normal UI shortcut/text routing failed; artifacts: $caseDirectory" }
+    $null = Invoke-Control @('ui', 'key', '--window', 'w1', '--key', 'escape')
+    $null = Invoke-Control @('ui', 'search', '--pane', $pane, '--open', 'true', '--query', 'fixture')
+    $search = Invoke-Control @('state', '--pane', $pane)
+    if ($search.search.query -ne 'fixture') { throw 'Search desired state failed' }
+    $null = Invoke-Control @('ui', 'search', '--pane', $pane, '--open', 'false')
+    $split = Invoke-Control @('pane', 'split', '--pane', $pane, '--direction', 'right')
+    $left = @($split.panes | Where-Object pane_id -eq $pane)[0].computed_bounds
+    $x = $left.x + $left.width + 2
+    $y = $left.y + $left.height / 2
+    $drag = @(@{ type = 'pointer'; event = 'move'; x = $x; y = $y }, @{ type = 'pointer'; event = 'press'; button = 'left'; x = $x; y = $y }, @{ type = 'pointer'; event = 'move'; x = $x + 8; y = $y }, @{ type = 'pointer'; event = 'move'; x = $x + 40; y = $y }, @{ type = 'pointer'; event = 'release'; button = 'left'; x = $x + 40; y = $y })
+    $drag | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $caseDirectory 'drag.json') -Encoding utf8NoBOM
+    $windowState = Invoke-Control @('state', '--window', 'w1')
+    $null = Invoke-Control @('ui', 'input', '--window', 'w1', '--if-layout', $windowState.layout_token, '--file', (Join-Path $caseDirectory 'drag.json'))
+    $dragged = Invoke-Control @('state', '--tab', $split.tab_id)
+    if ($dragged.layout_token -eq $split.layout_token) { throw 'Real divider drag did not change layout' }
+    $null = Invoke-Control @('pane', 'close', '--pane', $split.new_pane_id)
+    if ($UiOnly) { Write-Output "UI control passed; artifacts: $caseDirectory"; return }
     $null = Invoke-Control @('capabilities')
     $null = Invoke-Control @('profiles')
     $text = Invoke-Control @('pane', 'read', '--pane', $pane, '--tail', '100')

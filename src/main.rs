@@ -665,6 +665,65 @@ impl WindowsApplication {
                     && panes.read(cx).control_contains(&request.target, cx)
             })
             .collect::<Vec<_>>();
+        if matches!(
+            request.op.as_str(),
+            "ui.key" | "ui.text" | "ui.pointer" | "ui.input"
+        ) && let [(_, handle, panes)] = targets.as_slice()
+        {
+            let handle = gpui::AnyWindowHandle::from(*handle);
+            let registration = handle
+                .update(cx, |_, window, cx| {
+                    if request.target.tab_id.is_some() || request.target.pane_id.is_some() {
+                        return Err(ControlError::new(
+                            "invalid_target",
+                            "UI injection targets a window",
+                        ));
+                    }
+                    panes.read(cx).check_layout(request, None, window, cx)?;
+                    mightty::ui_control::prepare(request, window, cx)
+                })
+                .map_err(|e| ControlError::new("window_closed", e.to_string()))
+                .and_then(|r| r);
+            let mut sequence = match registration {
+                Ok(sequence) => sequence,
+                Err(error) => return Some(reply(request, self.control_revision, Err(error))),
+            };
+            let request = request.clone();
+            let deadline = dispatch.deadline;
+            let sender = dispatch.reply.clone();
+            let revision = self.control_revision;
+            cx.spawn(async move |cx| {
+                loop {
+                    let cancelled =
+                        sender.is_disconnected() || std::time::Instant::now() >= deadline;
+                    let progress = handle
+                        .update(cx, |_, window, cx| {
+                            if cancelled {
+                                Err(sequence.cancel(window, cx))
+                            } else {
+                                sequence.next(window, cx)
+                            }
+                        })
+                        .map_err(|e| ControlError::new("window_closed", e.to_string()))
+                        .and_then(|r| r);
+                    let completion = match progress {
+                        Ok(false) => None,
+                        Ok(true) => Some(Ok(sequence.result())),
+                        Err(error) => Some(Err(error)),
+                    };
+                    if let Some(result) = completion {
+                        let response = reply(&request, revision, result);
+                        mightty::diagnostics::record_control(&request, &response);
+                        let _ = sender.try_send(response);
+                        break;
+                    }
+                    // Let GPUI activate subscriptions and finish normal input/focus effects between steps.
+                    Timer::after(Duration::from_millis(15)).await;
+                }
+            })
+            .detach();
+            return None;
+        }
         if request.op == "wait"
             && let [(_, handle, panes)] = targets.as_slice()
         {
@@ -736,7 +795,7 @@ impl WindowsApplication {
             return None;
         }
         let result = match targets.as_slice() {
-            [(id, handle, panes)] => handle
+            [(id, handle, panes)] => gpui::AnyWindowHandle::from(*handle)
                 .update(cx, |_, window, cx| {
                     panes.update(cx, |panes, cx| panes.control_dispatch(request, window, cx))
                 })
@@ -822,7 +881,14 @@ impl WindowsApplication {
         if result.is_ok()
             && !matches!(
                 request.op.as_str(),
-                "state" | "profiles" | "capabilities" | "pane.read"
+                "state"
+                    | "profiles"
+                    | "capabilities"
+                    | "pane.read"
+                    | "ui.key"
+                    | "ui.text"
+                    | "ui.pointer"
+                    | "ui.input"
             )
             && let [(_, _, panes)] = targets.as_slice()
         {

@@ -47,7 +47,7 @@ impl TerminalWidget {
             "lifecycle":if self.has_exited {"output_ended"} else {"running"},"output_eof":self.output_eof,"io_error":self.io_error,"processes":self.pty_worker.as_ref().and_then(|worker|worker.root_process()).map(|root|root.state()).unwrap_or(serde_json::json!({"availability":"unavailable"})),
             "font":{"family":self.config.font_family,"size_px":self.config.font_size_px},
             "viewport":self.terminal.scrollbar().ok().map(|s|json!({"offset":s.offset,"length":s.len,"total":s.total})),
-            "selection":self.has_selection(),"search_open":self.search.is_some()})
+            "selection":self.has_selection(),"search_open":self.search.is_some(),"search":self.search.as_ref().map(|search|json!({"query":search.query,"progress":format!("{:?}",search.progress),"matches":search.ranges.len(),"diagnostic":search.diagnostic}))})
     }
 
     pub fn control_read(

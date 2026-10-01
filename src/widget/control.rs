@@ -5,6 +5,36 @@ use crate::ghostty::{ViewportScroll, key::Action};
 use serde_json::{Value, json};
 
 impl TerminalWidget {
+    pub fn control_search(
+        &mut self,
+        open: bool,
+        query: Option<&str>,
+        visible: bool,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        if open {
+            self.prepare_search(visible, window, cx);
+            if let Some(query) = query {
+                self.search.as_mut().unwrap().query = query.into();
+                if let Some(input) = &self.search_input {
+                    input.update(cx, |input, cx| {
+                        input.set_value(query.to_string(), window, cx)
+                    });
+                }
+                self.restart_search(cx);
+            }
+        } else if visible {
+            self.close_search(window, cx);
+        } else {
+            self.terminal.stop_search();
+            self.search = None;
+            self.search_input = None;
+            self.search_input_subscription = None;
+            self.search_task = gpui::Task::ready(());
+            cx.notify();
+        }
+    }
     pub fn control_input(
         &mut self,
         request: &Request,

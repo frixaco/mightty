@@ -318,6 +318,24 @@ pub const OPERATIONS: &[(&str, &[&str])] = &[
     ("window.resize", &["width", "height"]),
     ("window.focus", &[]),
     ("events", &[]),
+    ("ui.sidebar", &["visible"]),
+    ("ui.palette", &["open", "query"]),
+    ("ui.search", &["open", "query"]),
+    ("ui.key", &["key", "modifiers", "event"]),
+    ("ui.text", &["text"]),
+    (
+        "ui.pointer",
+        &[
+            "event",
+            "x",
+            "y",
+            "button",
+            "modifiers",
+            "delta_x",
+            "delta_y",
+        ],
+    ),
+    ("ui.input", &["steps"]),
     (
         "wait",
         &[
@@ -561,7 +579,7 @@ fn parse_cli(arguments: Vec<String>) -> Result<(Request, Option<String>, bool), 
             "file" => {
                 let text = read_utf8(&value, MAX_INPUT_BYTES)?;
                 match op.as_str() {
-                    "pane.send-text" => {
+                    "pane.send-text" | "ui.text" => {
                         args.insert("text".into(), json!(text));
                     }
                     "pane.input" | "ui.input" => {
@@ -603,7 +621,8 @@ fn parse_cli(arguments: Vec<String>) -> Result<(Request, Option<String>, bool), 
                     ),
                 );
             }
-            "ratio" | "delta_px" | "rows" | "width" | "height" => {
+            "ratio" | "delta_px" | "rows" | "width" | "height" | "x" | "y" | "delta_x"
+            | "delta_y" => {
                 args.insert(
                     name,
                     json!(value.parse::<f64>().map_err(|_| "expected finite number")?),
