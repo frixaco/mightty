@@ -22,7 +22,11 @@ Windows remains the primary target, with a Unix shell bridge available behind th
 src/
 ├── main.rs              # Binary entry point, window setup, font loading
 ├── lib.rs               # Library module exports
-├── feedback.rs          # JSON and PNG feedback capture support
+├── control.rs           # CLI, protocol, schemas, and control transport
+├── diagnostics.rs       # Persistence, process observations, and logs
+├── snapshot.rs          # GPU frame acquisition and diagnostic bundles
+├── ui_control.rs        # Normal GPUI event/text injection
+├── feedback.rs          # Serializable terminal/frame capture data
 ├── pane_container.rs    # Tabs, sidebar, top-level pane actions, and key bindings
 ├── split.rs             # Orientation-aware terminal split tree
 ├── widget/
@@ -36,6 +40,7 @@ src/
 │   ├── terminal.rs      # Terminal ownership and PTY callback
 │   ├── selection.rs     # Ghostty selection gesture state and event bridge
 │   ├── render.rs        # Snapshot and lending render iterators
+│   ├── diagnostics.rs   # Non-consuming bounded terminal observations
 │   ├── key.rs           # Key event and encoder ownership
 │   ├── style.rs         # Renderer-facing colors and styles
 │   ├── error.rs         # C result conversion
@@ -54,6 +59,8 @@ Important non-source paths:
 - `fonts/JetBrainsMono/`: ignored local font files embedded by `src/main.rs`;
   the regular, bold, italic, and bold-italic mono faces are required.
 - `captures/`: generated at runtime by feedback capture and intentionally not part of source.
+- `vendor/gpui/`: GPUI 0.2.2 Cargo patch for normal input dispatch and bounded
+  Direct3D capture; see `MIGHTTY-PATCH.md` before changing it.
 
 ## Build System
 
@@ -90,8 +97,13 @@ requirement because `build.rs` validates the submodule revision.
 - `Cmd+Q` quits on macOS.
 - Exited panes are removed when more than one pane exists.
 - `Ctrl+Shift+F12` writes a feedback capture under `captures/`.
-  - JSON terminal-state capture is cross-platform.
-  - PNG window capture is Windows-only.
+  - On Windows, this is a retained presented-frame GPU bundle with PNG,
+    matching terminal/frame data, live state, environment, and diagnostics.
+  - Other backends do not implement pixel capture.
+- `mightty ctl capabilities --json` documents Windows control operations and
+  limits; explicit pane/tab/window IDs fail when stale rather than falling back.
+- `mightty --test-instance --data-dir PATH` starts a disposable real GUI with
+  isolated settings/storage and no global hotkeys or default-terminal COM server.
 
 ## Key APIs
 
@@ -141,6 +153,9 @@ mise exec -- cargo clippy --all-targets -- -D warnings
 mise exec -- cargo test
 mise exec -- cargo run
 mise exec -- cargo build --release
+pwsh -NoProfile -File tools/control-smoke.ps1
+pwsh -NoProfile -File tools/control-smoke.ps1 -SnapshotOnly
+mise exec -- cargo run --example capture_fidelity
 
 # Requires libclang; run after changing the Ghostty revision or headers.
 mise exec -- cargo run --manifest-path tools/ghostty-bindings/Cargo.toml

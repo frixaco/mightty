@@ -1,11 +1,11 @@
 # CLI control and diagnostics design
 
-Status: Implementation in progress. Instance discovery, capabilities, profiles,
-live state, bounded active-buffer viewport/tail reads, isolated GUI startup,
-targeted tab/pane operations, launch overrides, guarded background layout, and
-ordered PTY input with write/resize acknowledgements are implemented. The remaining commands and capture contracts below are the
-implementation target. Run `pwsh -NoProfile -File tools/control-smoke.ps1` against
-the debug build for a disposable real-GUI inspection check.
+Status: Implemented on Windows, protocol version 1. Control, persisted state,
+waits/events, UI injection, and presented/next/offscreen GPU captures are available.
+`capabilities --json` is the reference for supported arguments and limits.
+Unix control transport and pixel capture remain unsupported. Optional resolved
+font-face/glyph-cluster and measured title-extent diagnostics are unavailable;
+captured pixels still preserve the actual rendering.
 
 Add a local control and diagnostics API, exposed through `mightty ctl`, so users
 and AI agents can control the running application, inspect persisted state, and
@@ -26,13 +26,12 @@ Build on the existing owners and services:
 | [`AppAction`](../src/action.rs) | Adapt existing shortcuts, menus, and palette intents to those operations |
 | `TerminalWidget` and safe Ghostty wrappers | Own terminal interaction and prepare immutable presentation data |
 | [Activation transport](../src/application/windows/instance.rs) | Supply the Windows user/session access restrictions for a separate control endpoint |
-| Application diagnostics | Project owned state, coalesce persistence, sample processes, and coordinate bounded captures |
-| [Feedback capture](../src/feedback.rs) | Use the same capture service for the CLI and feedback shortcut |
+| [Diagnostics](../src/diagnostics.rs) | Project owned state, coalesce persistence, and sample processes |
+| [Capture coordinator](../src/snapshot.rs) | Acquire GPU frames and publish bundles for the CLI and feedback shortcut |
 
-Existing actions mostly target the active pane, the activation pipe has no
-application-result reply, and Windows PNG feedback copies a screen rectangle
-that can include an overlapping application. The design replaces these
-limitations without adding a second application model.
+Targeted operations share the existing owners with UI actions. A separate control
+endpoint returns application results; GPU feedback replaces screen-rectangle
+capture, so an overlapping application cannot contaminate the PNG.
 
 These guarantees apply across the API:
 
@@ -171,9 +170,10 @@ the receiving focus target and dispatch outcome, without claiming an
 unacknowledged PTY write. Terminal text never implicitly presses Enter; unmet
 paste-policy requirements fail instead of opening an unattended confirmation.
 
-Pointer events support move, button press/release, and wheel input with explicit
-buttons/modifiers. Coordinates are logical pixels relative to the window client
-origin. A window layout token guards against stale hit regions. `ui input`
+Pointer sequences support move, button press/release, and wheel input with explicit
+buttons/modifiers. The single `ui pointer` command supports move/wheel; held keys
+and button drags use `ui input`. Coordinates are logical pixels relative to the
+window client origin. A window layout token guards against stale hit regions. `ui input`
 takes a window target and a JSON step file (`--file PATH` or stdin with
 `--file -`) for real divider drags and selections; validate balanced transitions and release only the sequence's synthetic held state on
 failure. Injection does not move the system pointer and does not test native
@@ -366,7 +366,8 @@ Keep observation identifiers distinct:
 | --- | --- |
 | `revision` | Published GPUI state change, including output batches/process observations |
 | `output_seq` | Cumulative PTY bytes applied to that runtime pane's Ghostty terminal; never resets |
-| `frame_id` | Prepared presentation data, including cursor phase and overlays |
+| `frame_id` | Successful native presentation identity; repeated presents can reuse a scene |
+| `frame_revision` | Immutable prepared scene revision, including cursor phase and overlays; its domain distinguishes presented and offscreen preparation |
 | `layout_token` | Relevant window/tab topology and geometry generation |
 
 `events` atomically subscribes and obtains initial state at revision R, then
@@ -401,8 +402,8 @@ Application instance
 
 Keep these title stages distinct:
 
-1. Shell-reported title from Ghostty, with observation time and known source
-   limit; this does not preserve unlimited raw OSC bytes.
+1. Shell-reported title from Ghostty, with observation time and its 2047-byte
+   source limit; this does not preserve unlimited raw OSC bytes.
 2. Normalized title and applied transformations: currently remove controls, limit
    to 128 Unicode scalar values, and trim. Record which rules changed the value.
 3. Chosen tab title, source pane/profile, and fallback reason.
@@ -410,6 +411,8 @@ Keep these title stages distinct:
 
 Record each pane's effective configuration, launch settings generation, and
 subsequent live-applied fields. Current settings need not describe older panes.
+Existing panes retain their launch font/theme/configuration; action bindings
+carry the generation of the last applied reload.
 Include resolved profile/executable/argv; directory fields identify configured,
 shell-reported local, or remote sources and retain existing launch-path trust
 rules. Environment inspection exposes names/availability by default; fixtures
@@ -417,9 +420,10 @@ provide their known values for reproduction.
 
 ### Lifecycle and processes
 
-Distinguish process exit, output EOF, I/O failure, launch failure, and user close.
-The current PTY bridge collapses EOF/failure into `PtyEvent::Exited`; EOF alone
-cannot supply an exit code, nor does a finished shell command imply root exit.
+The PTY bridge distinguishes output EOF from I/O failure. A retained root-process
+watch observes exit independently; EOF alone cannot supply an exit code, nor
+does a finished shell command imply root exit. Launch failures and user close
+have separate diagnostics/removal reasons.
 
 Before auto-removal, notify waiters and publish a retained outcome keyed by pane:
 removal reason, nullable exit code, process identity, final output sequence, and
@@ -446,7 +450,7 @@ diagnostics/
   <instance-id>/
     state.json
     events.ndjson
-    captures/
+    events.previous.ndjson
 ```
 
 One writer atomically replaces `state.json` with the latest owned metadata
@@ -471,7 +475,10 @@ rewrite scrollback or export the full environment.
 `state --json` is live. `state --saved --instance ID` reads local persisted data
 without contacting the application. Without a selector, saved mode ignores
 inherited live context and chooses the latest recorded startup, reporting source,
-instance, and timestamps.
+instance, and timestamps. `--data-dir` selects isolated storage. Saved mode reads
+the full instance; it does not resolve live pane/tab aliases or subtree selectors.
+Requested captures live under `--out`; the feedback shortcut defaults to
+`captures/` in the application's working directory.
 
 ## Snapshotting
 
@@ -492,7 +499,7 @@ mightty ctl snapshot --pane p7 --frame presented --out .\captures
 | Mode | Contract |
 | --- | --- |
 | `presented` | Acquire the latest retained successfully presented frame without requesting redraw |
-| `next` | Request a redraw and wait for rendering, presentation, and readback |
+| `next` | Request a redraw and wait for a newly prepared scene to be successfully presented and read back |
 | `offscreen` | Render current immutable tab/pane presentation data through the live painter |
 
 For tab/pane targets, `presented` and `next` crop the window frame at the target
@@ -515,8 +522,9 @@ a historical retained frame; absent data returns `frame_unavailable`.
 For `next`, hidden/minimized windows return `not_presentable`; presentation
 timeouts are explicit.
 
-Retain only the latest surface and matching immutable presentation data per
-window, under an advertised memory budget. Reuse shared render data and GPU
+Retain the latest successful surface and matching immutable presentation data per
+window, using two bounded GPU textures to preserve it while preparing the next
+frame. Reuse shared render data and GPU
 resources instead of reading pixels to CPU or copying the full application tree
 on every paint. Budget eviction makes the frame unavailable. There is no frame
 history recorder.
@@ -535,15 +543,15 @@ within the deadline or returns `layout_unavailable`/the sizing error. It never
 repairs geometry by resizing a PTY. Use current terminal contents and logical
 selection/overlay state without simulating OS focus.
 
-The [current renderer](../src/widget/render.rs) also updates geometry and resizes
-the terminal. Separate those lifecycle effects from preparation/painting, and
-extract owned presentation data through safe Ghostty interfaces, retaining fonts,
-graphics, colors, and overlays.
+Geometry and PTY sizing run independently of painting. Safe Ghostty observation
+prepares owned data without consuming the live renderer's dirty state. Offscreen
+captures paint that data through the same terminal painter in a hidden scratch
+window, without presenting or changing the live tab.
 
-GPU support is the principal technical uncertainty. Prototype retained-frame
-readback, next-frame capture, and hidden rendering before fixing the extraction
-boundary. Measure retention/copy overhead and establish any required GPUI changes;
-do not replace retained-frame capture with redraw if support is difficult.
+The [local GPUI 0.2.2 patch](../vendor/gpui/MIGHTTY-PATCH.md) exposes normal UI
+dispatch/text commit and immutable scene metadata, retains Direct3D 11 surfaces
+only after successful presentation, and latches worker readback. It reports
+copy-submission/readback time; GPU execution time is unavailable.
 
 ### Bundle and consistency
 
@@ -551,7 +559,7 @@ Each request creates a uniquely named bundle:
 
 | Artifact | Contents |
 | --- | --- |
-| `manifest.json` | Versions, mode, target IDs, frame ID/time, dimensions, DPI, frame/live revisions, output cursors, artifact availability/status |
+| `manifest.json` | Versions, mode, target IDs, frame ID/time, dimensions, DPI, logical crop bounds/source dimensions, frame/live revisions, output cursors, artifact availability/status |
 | `image.png` | Pixels of the selected frame or crop |
 | `frame.json` | Matching cells, presentation metadata, labels/bounds, styles, layout tokens, available shaping diagnostics |
 | `state.json` | Current application metadata with its own revision/observation time |
@@ -562,8 +570,9 @@ Each request creates a uniquely named bundle:
 Pixels and frame metadata describe the same presentation. Current state may be
 newer; unavailable historical fields remain explicitly unavailable rather than
 being filled with current values. Cells preserve widths, continuations, blanks
-and their styles, and wrapping. The [existing serializer](../src/widget/capture.rs)
-skips empty cells and needs extending. Plain text is a convenience export.
+and their styles, and wrapping. The [serializer](../src/widget/capture.rs)
+includes blank cells and reports bounded source omissions. Plain text is a
+convenience export.
 
 The CLI resolves `--out` to an absolute path. Write a temporary bundle, then
 publish a finalized directory with a manifest listing each artifact's completion
@@ -575,12 +584,18 @@ retained resources. Return `busy` before accepting work beyond those limits;
 release resources on failure/timeout. Route `Ctrl+Shift+F12` through this service
 in `presented` mode.
 
+Current limits include four captures, 64 MiB per GPU surface, 128 MiB retained
+textures per window, and source metadata of 20,000 cells per pane/40,000 per
+frame. Consult capabilities for the complete limits; omissions stay explicit.
+
 ### Visual fidelity
 
 The PNG must preserve actual defects: if a red flower renders as a black box,
 capture that black box. Use lossless pixels from the renderer, with color format,
 space, and export conversion recorded. Never reconstruct the image from text,
 substitute fonts, fix colors, expand labels, or disable clipping.
+Direct3D BGRA UNORM pixels export as RGBA by channel swizzle, without color
+correction; this is an application frame rather than a display photograph.
 
 This includes Nerd Font icons, ligatures, fallback glyphs, emoji, wide/combining
 characters, blank backgrounds, decorations, and clipped runs. Off-viewport
@@ -626,12 +641,7 @@ truncation status; do not invent frame associations for uncorrelated errors.
 
 ## Delivery and validation
 
-Run the rendering feasibility investigation early, independently of control
-delivery: prove retained, next, and offscreen capture and measure resource costs.
-Record the GPUI boundary and unresolved backend limits before committing to
-capture implementation.
-
-Deliver usable increments:
+Implemented in separately committed increments:
 
 1. **Inspect:** instance identity/discovery, protocol envelope/capabilities,
    minimal live state, and bounded content reads.
@@ -644,7 +654,22 @@ Deliver usable increments:
 5. **Capture:** bundles and reproduction context through the proven renderer,
    shared with the feedback shortcut.
 
-Add integration tests with each increment. Historical replay, request
+The disposable GUI runner exercises control, UI input, state provenance, quick
+window recreation, persistence, and all capture modes. The native raster fixture
+proves that `presented` preserves a black-box defect while `next` captures a red
+flower after a fresh scene. Run:
+
+```powershell
+mise exec -- cargo build
+pwsh -NoProfile -File tools/control-smoke.ps1
+pwsh -NoProfile -File tools/control-smoke.ps1 -UiOnly
+pwsh -NoProfile -File tools/control-smoke.ps1 -SnapshotOnly
+mise exec -- cargo run --example capture_fidelity
+```
+
+The matrix below also records cases for further regression coverage, including
+multiple DPI settings and native embedding; it does not claim every case has a
+runtime fixture. Historical replay, request
 deduplication, general expression predicates, and generic fresh-text provenance
 remain outside the initial API.
 
@@ -674,15 +699,14 @@ Use this matrix for focused failure and fidelity coverage:
 | Capture lifecycle | Never-presented tabs; exact visible crops/overlays; occluded/minimized windows; missing/evicted frames; readback failure; limits/deadlines; unchanged viewport/PTY/focus; frame versus live revisions |
 | Reproduction/protocol | Build/font/runtime fingerprints; bounded correlated logs; client-relative paths; schema fixtures/version rejection; UTF-8/BOM/stdin; preserved CR/LF/Unicode; clean JSON stdout |
 
-Run repository formatting/checks and focused Windows runtime tests when
-implementing. Keep commands labeled proposed until implemented and verified.
+Run repository formatting/checks and focused Windows runtime tests when changing
+these interfaces.
 
 ## Protocol reference
 
 ### Envelopes and compatibility
 
-The CLI grammar and transport share typed argument definitions, with fixtures
-checked against published schemas. CLI-side file/path and environment-context
+CLI validation and capabilities share argument definitions. CLI-side file/path and environment-context
 resolution prepares requests; live object/alias resolution remains on GPUI.
 Transport framing must bound each request before deserialization.
 
@@ -707,8 +731,8 @@ A resize request:
 }
 ```
 
-Tokens are illustrative opaque values. Success includes affected geometry and
-the committed layout token:
+Tokens are illustrative opaque values. Success returns the tab projection and
+committed layout token, plus PTY acknowledgement progress. Selected fields:
 
 ```json
 {
@@ -718,17 +742,19 @@ the committed layout token:
   "revision": "42",
   "ok": true,
   "result": {
+    "tab_id": "t2",
+    "selected_pane_id": "p7",
     "layout_token": "layout:tab:t2:8",
-    "affected_panes": [
+    "panes": [
       {
         "pane_id": "p7",
-        "bounds": {"x": 0, "y": 0, "width": 800, "height": 600},
+        "computed_bounds": {"x": 0, "y": 0, "width": 800, "height": 600},
         "terminal_size": {"cols": 100, "rows": 30},
         "pty_size": {"cols": 100, "rows": 30}
       },
       {
         "pane_id": "p8",
-        "bounds": {"x": 804, "y": 0, "width": 320, "height": 600},
+        "computed_bounds": {"x": 804, "y": 0, "width": 320, "height": 600},
         "terminal_size": {"cols": 40, "rows": 30},
         "pty_size": {"cols": 40, "rows": 30}
       }
@@ -756,7 +782,7 @@ A stale precondition fails before mutation:
 ```
 
 Streams start with `type: state`, the full projection and its revision.
-Subsequent batches use typed changes:
+Subsequent batches use typed replacements:
 
 ```json
 {
@@ -765,14 +791,15 @@ Subsequent batches use typed changes:
   "revision": "43",
   "type": "change",
   "changes": [
-    {"kind": "settings_changed", "window_id": "w1", "generation": "4"}
+    {"kind": "outcomes_changed", "outcomes": []}
   ]
 }
 ```
 
-Changes carry new field values or explicit removals. Structural batches include
-affected parent topology and selection at the same revision, preventing dangling
-references.
+`windows_changed`, `outcomes_changed`, and `diagnostics_changed` carry their
+complete replacement arrays. Apply each batch atomically; replacing window
+topology and selection together prevents dangling references. A bounded `end`
+event identifies a clean subscription timeout.
 
 Use UTF-8 JSON without an output BOM; streams emit one object per line. Encode
 64-bit counters/generations as decimal strings, IDs/cursors as strings, finite

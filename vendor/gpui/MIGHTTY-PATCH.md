@@ -17,6 +17,9 @@ multithread protection. A private hidden window can paint an owned element tree
 through the same scene renderer without presentation. Other backends report
 unsupported capture. Window hooks associate immutable application metadata with
 the prepared scene and the exact successful presentation identity.
+Cheap metadata getters let `next` wait for a newly prepared scene's successful
+presentation. A repeated native present can increment the frame ID without
+preparing new application content, so frame ID alone is not a redraw barrier.
 
 Limits: 64 MiB per surface, 128 MiB retained textures per window. Capture reports
 CPU copy-submission time and readback duration; it does not measure GPU duration.

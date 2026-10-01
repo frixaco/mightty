@@ -28,7 +28,9 @@ shell I/O through a forkpty-backed bridge.
 - Kitty graphics rendering with crop, z-order, deletion, and GPU cache reuse.
 - Windows shell I/O through ConPTY and Unix shell I/O through forkpty.
 - Embedded JetBrainsMono Nerd Font Mono for terminal text.
-- Feedback capture with `Ctrl+Shift+F12`.
+- Windows CLI control, persisted diagnostic state, waits, and event streams.
+- Lossless GPU snapshots of the presented UI and offscreen tabs/panes;
+  `Ctrl+Shift+F12` writes the same diagnostic bundle.
 
 ## Stack
 
@@ -103,6 +105,35 @@ prompt markers, directory inheritance, and semantic actions.
 See [Windows distribution](docs/windows-distribution.md) for signed packages,
 updates, protocol activation, and default-terminal setup.
 
+## Control and diagnostics (Windows)
+
+Inspect a running instance, use its returned IDs, and keep `--instance ID` on
+commands when more than one instance is running:
+
+```powershell
+mightty ctl instances --json
+mightty ctl capabilities --json
+mightty ctl state --json
+mightty ctl pane split --pane p1 --direction left
+mightty ctl pane resize --pane p1 --edge right --delta-px 40
+mightty ctl pane read --pane p1 --tail 100
+mightty ctl snapshot --window active --frame presented --out .\captures
+mightty ctl snapshot --pane p1 --out .\captures
+mightty ctl state --saved --instance ID --json
+```
+
+`presented` captures the retained successful frame without repainting; `next`
+waits for a fresh scene. Pane/tab snapshots default to offscreen rendering and
+preserve live selection and PTY size. Bundles include PNG pixels, matching
+source/frame metadata, current state, environment, and bounded diagnostics.
+
+For disposable automation, start `mightty --test-instance --data-dir PATH`.
+This uses isolated settings/storage and disables global hotkeys and COM
+registration. See the [control and diagnostics contract](docs/control-and-diagnostics-design.md)
+for targeting, input, waits, persistence, and capture limits. The
+[local GPUI patch](vendor/gpui/MIGHTTY-PATCH.md) supplies native input dispatch
+and Direct3D readback; optional resolved glyph/face diagnostics are unavailable.
+
 ## Shell I/O
 
 Terminal I/O is wake-driven. `TerminalWidget` owns a `PtyWorker`; the platform
@@ -134,6 +165,10 @@ mise exec -- cargo fmt --all -- --check
 mise exec -- cargo check
 mise exec -- cargo clippy --all-targets -- -D warnings
 mise exec -- cargo test
+# Disposable Windows GUI checks, after cargo build:
+pwsh -NoProfile -File tools/control-smoke.ps1
+pwsh -NoProfile -File tools/control-smoke.ps1 -SnapshotOnly
+mise exec -- cargo run --example capture_fidelity
 ```
 
 After changing the Ghostty submodule revision or public C headers, regenerate
@@ -156,7 +191,7 @@ Useful runtime shortcuts:
 - `Ctrl+Shift+F` (`Cmd+F` on macOS): search the full terminal scrollback.
 - `Ctrl+Shift+P` (`Cmd+Shift+P` on macOS): open the command palette.
 - `Cmd+Q` on macOS: quit.
-- `Ctrl+Shift+F12`: write a terminal feedback capture to `captures/`.
+- `Ctrl+Shift+F12`: write a presented-frame diagnostic bundle to `captures/` on Windows.
 
 Drag with the left mouse button to select text. Double-click selects a word and
 triple-click selects a line using Ghostty's selection rules. Hold `Ctrl+Alt`
@@ -173,7 +208,11 @@ src/
 ├── lib.rs               # Library module exports
 ├── action.rs            # Typed actions, descriptors, bindings, and menus
 ├── command_palette.rs   # Palette filtering and action entries
-├── feedback.rs          # Feedback capture output
+├── control.rs           # CLI, protocol, schemas, and bounded transport
+├── diagnostics.rs       # State persistence, process sampling, and logs
+├── snapshot.rs          # GPU frame acquisition and diagnostic bundles
+├── ui_control.rs        # Normal GPUI keyboard, pointer, and text injection
+├── feedback.rs          # Serializable terminal/frame capture data
 ├── pane_container.rs    # Tabs, sidebar, workspaces, and action dispatch
 ├── profile.rs           # Stable profile IDs and shell launch values
 ├── settings.rs          # Typed settings, discovery, and safe reload
@@ -198,6 +237,7 @@ src/
 │   ├── render.rs        # Snapshot and lending render iterators
 │   ├── graphics.rs      # Lending Kitty graphics wrappers
 │   ├── search.rs        # Incremental full-scrollback search
+│   ├── diagnostics.rs   # Non-consuming bounded terminal observations
 │   ├── semantic.rs      # Shell metadata and semantic regions
 │   ├── mouse.rs         # Mouse mode and event encoding
 │   ├── paste.rs         # Paste safety and bracketed encoding
