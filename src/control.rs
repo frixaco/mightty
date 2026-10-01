@@ -77,6 +77,161 @@ pub struct Dispatch {
     pub deadline: std::time::Instant,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct Acknowledgement {
+    pub written_bytes: usize,
+    pub error: Option<String>,
+}
+
+pub async fn complete_acknowledgements(
+    mut response: Value,
+    acknowledgements: Vec<flume::Receiver<Acknowledgement>>,
+    deadline: std::time::Instant,
+) -> Value {
+    let mut written = 0usize;
+    for ack in acknowledgements {
+        loop {
+            match ack.try_recv() {
+                Ok(ack) => {
+                    written = written.saturating_add(ack.written_bytes);
+                    if let Some(error) = ack.error {
+                        response["ok"] = json!(false);
+                        response["error"] = json!({"code":"pty_error","message":error,"effect":"partial","details":{"written_bytes":written,"operation_result":response["result"],"completed_steps":completed_steps(&response,written)}});
+                        response.as_object_mut().unwrap().remove("result");
+                        return response;
+                    }
+                    break;
+                }
+                Err(flume::TryRecvError::Empty) if std::time::Instant::now() < deadline => {
+                    gpui::Timer::after(std::time::Duration::from_millis(5)).await;
+                }
+                _ => {
+                    response["ok"] = json!(false);
+                    response["error"] = json!({"code":"outcome_unknown","message":"PTY completion unavailable before deadline","effect":"unknown","details":{"known_written_bytes":written,"operation_result":response["result"]}});
+                    response.as_object_mut().unwrap().remove("result");
+                    return response;
+                }
+            }
+        }
+    }
+    let steps = completed_steps(&response, written);
+    response["result"]["completion"] =
+        json!({"pty_acknowledged":true,"written_bytes":written,"completed_steps":steps});
+    response
+}
+fn completed_steps(response: &Value, written: usize) -> usize {
+    response["result"]["step_byte_ends"]
+        .as_array()
+        .map_or(0, |ends| {
+            ends.iter()
+                .take_while(|end| end.as_u64().is_some_and(|end| end <= written as u64))
+                .count()
+        })
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum InputStep {
+    Text {
+        text: String,
+    },
+    Key {
+        key: String,
+        #[serde(default)]
+        modifiers: Vec<String>,
+        #[serde(default)]
+        event: KeyEvent,
+    },
+}
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KeyEvent {
+    #[default]
+    Tap,
+    Press,
+    Repeat,
+    Release,
+}
+
+pub fn keystroke(key: &str, modifiers: &[String]) -> Result<gpui::Keystroke, ControlError> {
+    let canonical = if key.chars().count() == 1 {
+        key.to_string()
+    } else {
+        key.to_ascii_lowercase()
+    };
+    if canonical.chars().count() != 1
+        && !matches!(
+            canonical.as_str(),
+            "enter"
+                | "escape"
+                | "tab"
+                | "backspace"
+                | "delete"
+                | "insert"
+                | "left"
+                | "right"
+                | "up"
+                | "down"
+                | "home"
+                | "end"
+                | "pageup"
+                | "pagedown"
+                | "space"
+                | "f1"
+                | "f2"
+                | "f3"
+                | "f4"
+                | "f5"
+                | "f6"
+                | "f7"
+                | "f8"
+                | "f9"
+                | "f10"
+                | "f11"
+                | "f12"
+        )
+    {
+        return Err(ControlError::new(
+            "invalid_argument",
+            format!("unknown key {key}"),
+        ));
+    }
+    let mut mods = gpui::Modifiers::default();
+    for modifier in modifiers {
+        match modifier.as_str() {
+            "ctrl" => mods.control = true,
+            "alt" => mods.alt = true,
+            "shift" => mods.shift = true,
+            "super" => mods.platform = true,
+            _ => {
+                return Err(ControlError::new(
+                    "invalid_argument",
+                    format!("unknown modifier {modifier}"),
+                ));
+            }
+        }
+    }
+    Ok(gpui::Keystroke {
+        modifiers: mods,
+        key: canonical,
+        key_char: None,
+    })
+}
+
+pub fn direction(value: &str) -> Result<crate::action::Direction, ControlError> {
+    use crate::action::Direction;
+    match value {
+        "left" => Ok(Direction::Left),
+        "right" => Ok(Direction::Right),
+        "up" => Ok(Direction::Up),
+        "down" => Ok(Direction::Down),
+        _ => Err(ControlError::new(
+            "invalid_argument",
+            "direction must be left, right, up or down",
+        )),
+    }
+}
+
 pub fn reply(request: &Request, revision: u64, result: Result<Value, ControlError>) -> Value {
     let mut value = json!({"protocol_version": PROTOCOL_VERSION,
         "request_id": request.request_id, "instance_id": request.instance_id,
@@ -121,6 +276,47 @@ pub const OPERATIONS: &[(&str, &[&str])] = &[
     ("profiles", &[]),
     ("state", &[]),
     ("pane.read", &["viewport", "tail", "buffer", "format"]),
+    (
+        "tab.new",
+        &[
+            "profile",
+            "cwd",
+            "exec",
+            "argv",
+            "env",
+            "unset_env",
+            "env_mode",
+            "focus",
+        ],
+    ),
+    ("tab.select", &[]),
+    ("tab.move", &["before"]),
+    ("tab.close", &[]),
+    (
+        "pane.split",
+        &[
+            "profile",
+            "cwd",
+            "exec",
+            "argv",
+            "env",
+            "unset_env",
+            "env_mode",
+            "focus",
+            "direction",
+            "ratio",
+        ],
+    ),
+    ("pane.resize", &["edge", "delta_px"]),
+    ("pane.focus", &["direction"]),
+    ("pane.zoom", &["enabled"]),
+    ("pane.close", &[]),
+    ("pane.scroll", &["rows", "to"]),
+    ("pane.send-text", &["text"]),
+    ("pane.send-key", &["key", "modifiers", "event"]),
+    ("pane.input", &["steps"]),
+    ("window.resize", &["width", "height"]),
+    ("window.focus", &[]),
 ];
 
 pub fn validate(request: &Request, instance_id: &str) -> Result<(), ControlError> {
@@ -305,12 +501,16 @@ fn parse_cli(arguments: Vec<String>) -> Result<(Request, Option<String>, bool), 
     let mut timeout_ms = 5000;
     let mut json_output = false;
     while let Some(option) = iter.next() {
+        if option == "--" {
+            args.insert("argv".into(), json!(iter.collect::<Vec<_>>()));
+            break;
+        }
         if option == "--json" {
             json_output = true;
             continue;
         }
-        if option == "--viewport" {
-            args.insert("viewport".into(), json!(true));
+        if matches!(option.as_str(), "--viewport" | "--focus") {
+            args.insert(option[2..].to_string(), json!(true));
             continue;
         }
         let name = option
@@ -327,6 +527,57 @@ fn parse_cli(arguments: Vec<String>) -> Result<(Request, Option<String>, bool), 
             "pane" => explicit.pane_id = Some(value),
             "if_layout" => preconditions.layout_token = Some(value),
             "timeout" => timeout_ms = parse_timeout(&value)?,
+            "file" => {
+                let text = read_utf8(&value, MAX_INPUT_BYTES)?;
+                match op.as_str() {
+                    "pane.send-text" => {
+                        args.insert("text".into(), json!(text));
+                    }
+                    "pane.input" | "ui.input" => {
+                        args.insert(
+                            "steps".into(),
+                            serde_json::from_str(&text)
+                                .map_err(|e| format!("invalid input JSON: {e}"))?,
+                        );
+                    }
+                    _ => return Err("--file is only supported for input".into()),
+                }
+            }
+            "mod" | "env" | "unset_env" => {
+                let key = if name == "mod" { "modifiers" } else { &name };
+                args.entry(key.into())
+                    .or_insert_with(|| json!([]))
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!(value));
+            }
+            "cwd" => {
+                let path = PathBuf::from(value);
+                let path = if path.is_absolute() {
+                    path
+                } else {
+                    std::env::current_dir()
+                        .map_err(|e| e.to_string())?
+                        .join(path)
+                };
+                args.insert(name, json!(path));
+            }
+            "enabled" | "visible" | "open" => {
+                args.insert(
+                    name,
+                    json!(
+                        value
+                            .parse::<bool>()
+                            .map_err(|_| "expected true or false")?
+                    ),
+                );
+            }
+            "ratio" | "delta_px" | "rows" | "width" | "height" => {
+                args.insert(
+                    name,
+                    json!(value.parse::<f64>().map_err(|_| "expected finite number")?),
+                );
+            }
             "tail" => {
                 args.insert(
                     name,

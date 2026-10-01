@@ -482,14 +482,41 @@ impl PtyInput {
         data: &[u8],
         stopping: &std::sync::atomic::AtomicBool,
     ) -> Result<(), PtyError> {
-        for chunk in data.chunks(32 * 1024) {
+        self.write_with_progress(data, stopping, &mut 0)
+    }
+
+    pub fn write_with_progress(
+        &mut self,
+        data: &[u8],
+        stopping: &std::sync::atomic::AtomicBool,
+        written: &mut usize,
+    ) -> Result<(), PtyError> {
+        *written = 0;
+        while *written < data.len() {
             if stopping.load(std::sync::atomic::Ordering::Acquire) {
                 return Err(PtyError::from_io(
                     "write terminal input",
                     io::Error::new(io::ErrorKind::Interrupted, "session closing"),
                 ));
             }
-            self.write_all(chunk)?;
+            let remaining = &data[*written..];
+            let mut count = 0;
+            let result = unsafe {
+                WriteFile(
+                    self.handle.raw(),
+                    remaining.as_ptr(),
+                    remaining.len().min(32 * 1024) as u32,
+                    &mut count,
+                    null_mut(),
+                )
+            };
+            *written += count as usize;
+            if result == 0 {
+                return Err(PtyError::io("write terminal input"));
+            }
+            if count == 0 {
+                return Err(PtyError::ZeroLengthWrite);
+            }
         }
         Ok(())
     }
@@ -802,11 +829,22 @@ fn push_windows_argument(output: &mut Vec<u16>, argument: &OsStr) -> Result<(), 
 }
 
 fn windows_environment_block(launch: &LaunchSpec) -> Result<Option<Vec<u16>>, PtyError> {
-    if launch.environment.is_empty() {
+    if launch.environment.is_empty()
+        && launch.inherit_environment
+        && launch.unset_environment.is_empty()
+    {
         return Ok(None);
     }
 
-    let mut environment: Vec<(OsString, OsString)> = std::env::vars_os().collect();
+    let mut environment: Vec<(OsString, OsString)> = if launch.inherit_environment {
+        std::env::vars_os().collect()
+    } else {
+        Vec::new()
+    };
+    for key in &launch.unset_environment {
+        validate_environment_key(key)?;
+        environment.retain(|(existing, _)| !existing.eq_ignore_ascii_case(key));
+    }
     for (key, value) in &launch.environment {
         validate_environment_key(key)?;
         environment.retain(|(existing, _)| !existing.eq_ignore_ascii_case(key));
@@ -826,6 +864,9 @@ fn windows_environment_block(launch: &LaunchSpec) -> Result<Option<Vec<u16>>, Pt
         block.push(0);
     }
     block.push(0);
+    if block.len() == 1 {
+        block.push(0);
+    }
     Ok(Some(block))
 }
 

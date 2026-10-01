@@ -73,6 +73,9 @@ pub struct LaunchSpec {
     pub arguments: Vec<OsString>,
     pub working_directory: Option<PathBuf>,
     pub environment: BTreeMap<OsString, OsString>,
+    pub inherit_environment: bool,
+    pub unset_environment: std::collections::BTreeSet<OsString>,
+    pub shell_integration: bool,
 }
 
 impl LaunchSpec {
@@ -82,6 +85,9 @@ impl LaunchSpec {
             arguments: Vec::new(),
             working_directory: None,
             environment: BTreeMap::new(),
+            inherit_environment: true,
+            unset_environment: Default::default(),
+            shell_integration: true,
         }
     }
 

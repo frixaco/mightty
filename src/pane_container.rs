@@ -23,6 +23,7 @@ use crate::workspace::{
     TabId, WorkspaceId, WorkspaceLayout, WorkspacePane, WorkspaceStore, WorkspaceTab,
     trusted_working_directory,
 };
+mod control;
 
 const WINDOW_BACKGROUND: u32 = 0x000000;
 const WINDOW_HORIZONTAL_PADDING_PX: f32 = 8.0;
@@ -58,6 +59,10 @@ struct PaletteState {
 }
 
 pub struct PaneContainer {
+    window_id: &'static str,
+    content_bounds: Option<gpui::Bounds<gpui::Pixels>>,
+    layout_input: Option<(gpui::Size<gpui::Pixels>, bool)>,
+    control_acks: Vec<flume::Receiver<crate::control::Acknowledgement>>,
     tabs: Vec<Tab>,
     active_tab_index: usize,
     sidebar_visible: bool,
@@ -79,6 +84,74 @@ pub struct PaneContainer {
 }
 
 impl PaneContainer {
+    pub fn take_control_acks(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Vec<flume::Receiver<crate::control::Acknowledgement>> {
+        let mut acks = std::mem::take(&mut self.control_acks);
+        for tab in &self.tabs {
+            acks.extend(tab.split.update(cx, |split, _| split.take_control_acks()));
+        }
+        acks
+    }
+    pub fn establish_layout(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let viewport = window.viewport_size();
+        if self.layout_input == Some((viewport, self.sidebar_visible))
+            && let Some(bounds) = self.content_bounds
+        {
+            self.apply_content_layout(bounds, window, cx);
+            return;
+        }
+        self.layout_input = Some((viewport, self.sidebar_visible));
+        let sidebar = if self.sidebar_visible {
+            SIDEBAR_WIDTH_PX + SIDEBAR_GAP_PX
+        } else {
+            0.0
+        };
+        let titlebar = if self.titlebar_visible {
+            TITLE_BAR_HEIGHT_PX
+        } else {
+            0.0
+        };
+        let bounds = gpui::Bounds {
+            origin: gpui::point(px(WINDOW_HORIZONTAL_PADDING_PX + sidebar), px(titlebar)),
+            size: gpui::size(
+                (viewport.width - px(2.0 * WINDOW_HORIZONTAL_PADDING_PX + sidebar)).max(px(1.0)),
+                (viewport.height - px(titlebar)).max(px(1.0)),
+            ),
+        };
+        self.apply_content_layout(bounds, window, cx);
+    }
+    fn apply_content_layout(
+        &mut self,
+        bounds: gpui::Bounds<gpui::Pixels>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.content_bounds = Some(bounds);
+        for tab in &self.tabs {
+            tab.split
+                .update(cx, |split, cx| split.apply_layout(bounds, window, cx));
+        }
+    }
+    fn identify_launch(
+        config: &mut TerminalConfig,
+        window_id: &str,
+        tab: TabId,
+        pane: crate::split::PaneId,
+    ) {
+        for (key, value) in [
+            (
+                "MIGHTTY_INSTANCE_ID",
+                crate::control::instance_id().to_string(),
+            ),
+            ("MIGHTTY_WINDOW_ID", window_id.to_string()),
+            ("MIGHTTY_TAB_ID", format!("t{}", tab.value())),
+            ("MIGHTTY_PANE_ID", format!("p{}", pane.value())),
+        ] {
+            config.launch.environment.insert(key.into(), value.into());
+        }
+    }
     pub fn control_contains(&self, target: &crate::control::Target, cx: &gpui::App) -> bool {
         self.tabs.iter().any(|tab| {
             target
@@ -151,12 +224,13 @@ impl PaneContainer {
     pub fn control_state(&self, window: &Window, cx: &gpui::App) -> serde_json::Value {
         use serde_json::json;
         json!({"bounds":{"width":f32::from(window.viewport_size().width),"height":f32::from(window.viewport_size().height)},
+            "layout_token":self.window_layout_token(window,cx),
             "dpi_scale":window.scale_factor(),"os_focused":window.is_window_active(),
             "active_tab_id":format!("t{}",self.tabs[self.active_tab_index].id.value()),
             "sidebar_visible":self.sidebar_visible,"palette_open":self.palette.is_some(),"settings_generation":self.settings.generation().to_string(),
             "tabs":self.tabs.iter().map(|tab| {let split=tab.split.read(cx);json!({"tab_id":format!("t{}",tab.id.value()),"title":tab.title,"fallback_title":tab.default_title,
-                "selected_pane_id":format!("p{}",split.active_pane_id().value()),"topology":split.topology(),
-                "panes":split.pane_entities().map(|(id,profile,terminal)|{let mut state=terminal.read(cx).control_state();state["pane_id"]=json!(format!("p{}",id.value()));state["profile_id"]=json!(profile.as_str());state}).collect::<Vec<_>>()})}).collect::<Vec<_>>()})
+                "selected_pane_id":format!("p{}",split.active_pane_id().value()),"zoomed_pane_id":split.zoomed_pane_id().map(|p|format!("p{}",p.value())),"topology":control::topology(split.topology()),"layout_token":split.layout_token(tab.id),
+                "panes":split.pane_entities().map(|(id,profile,terminal)|{let mut state=terminal.read(cx).control_state();state["pane_id"]=json!(format!("p{}",id.value()));state["profile_id"]=json!(profile.as_str());state["output_cursor"]=json!(format!("{}:p{}:{}",crate::control::instance_id(),id.value(),state["output_seq"].as_str().unwrap()));state}).collect::<Vec<_>>()})}).collect::<Vec<_>>()})
     }
 
     pub fn control_dispatch(
@@ -173,11 +247,11 @@ impl PaneContainer {
                 if request.target.tab_id.is_none() && request.target.pane_id.is_none() {return Ok(self.control_state(window,cx));}
                 let (index,pane,terminal)=self.control_target(&request.target,cx)?;
                 if request.target.pane_id.is_none() {return Ok(self.control_state(window,cx)["tabs"][index].clone());}
-                let mut result=terminal.read(cx).control_state();result["tab_id"]=json!(format!("t{}",self.tabs[index].id.value()));result["pane_id"]=json!(format!("p{}",pane.value()));Ok(result)
+                let mut result=terminal.read(cx).control_state();result["tab_id"]=json!(format!("t{}",self.tabs[index].id.value()));result["pane_id"]=json!(format!("p{}",pane.value()));result["output_cursor"]=json!(format!("{}:p{}:{}",crate::control::instance_id(),pane.value(),result["output_seq"].as_str().unwrap()));Ok(result)
             }
             "pane.read" => {let (index,pane,terminal)=self.control_target(&request.target,cx)?;let mut result=terminal.update(cx,|terminal,_|terminal.control_read(request))?;
-                result["tab_id"]=json!(format!("t{}",self.tabs[index].id.value()));result["pane_id"]=json!(format!("p{}",pane.value()));Ok(result)}
-            _ => Err(crate::control::ControlError::new("unsupported_operation","unsupported operation")),
+                result["tab_id"]=json!(format!("t{}",self.tabs[index].id.value()));result["pane_id"]=json!(format!("p{}",pane.value()));result["output_cursor"]=json!(format!("{}:p{}:{}",crate::control::instance_id(),pane.value(),result["output_seq"].as_str().unwrap()));Ok(result)}
+            _ => self.control_mutation(request,window,cx),
         }
     }
 
@@ -210,11 +284,16 @@ impl PaneContainer {
             (config, profile_id, title, resolved.app.sidebar_visible)
         };
         let (exit_tx, exit_rx) = flume::unbounded();
-        let tab = Self::create_tab(config, profile_id, title, exit_tx.clone(), cx);
+        let window_id = if titlebar_visible { "w1" } else { "w2" };
+        let tab = Self::create_tab(config, profile_id, title, window_id, exit_tx.clone(), cx);
 
         let workspace_store = WorkspaceStore::open_default();
         let workspace_ids = workspace_store.list().unwrap_or_default();
         let mut container = Self {
+            window_id,
+            content_bounds: None,
+            layout_input: None,
+            control_acks: Vec::new(),
             tabs: vec![tab],
             active_tab_index: 0,
             sidebar_visible,
@@ -240,17 +319,21 @@ impl PaneContainer {
     }
 
     fn create_tab(
-        config: TerminalConfig,
+        mut config: TerminalConfig,
         profile_id: ProfileId,
         title: String,
+        window_id: &str,
         exit_tx: flume::Sender<()>,
         cx: &mut Context<Self>,
     ) -> Tab {
+        let id = TabId::fresh();
+        let pane_id = crate::split::PaneId::allocate();
+        Self::identify_launch(&mut config, window_id, id, pane_id);
         let terminal = Self::create_terminal(config, exit_tx, cx);
-        let split = cx.new(|_cx| Split::with_terminal(terminal, profile_id));
+        let split = cx.new(|_cx| Split::with_terminal_id(pane_id, terminal, profile_id));
 
         Tab {
-            id: TabId::fresh(),
+            id,
             split,
             title: title.clone(),
             default_title: title,
@@ -411,12 +494,20 @@ impl PaneContainer {
         profile_id: Option<&ProfileId>,
         working_directory: Option<PathBuf>,
         cx: &mut Context<Self>,
-    ) -> Option<(Entity<TerminalWidget>, ProfileId)> {
+    ) -> Option<(crate::split::PaneId, Entity<TerminalWidget>, ProfileId)> {
         let (mut config, profile_id) = self.terminal_config(profile_id)?;
         if let Some(working_directory) = working_directory {
             config.launch.working_directory = Some(working_directory);
         }
+        let pane_id = crate::split::PaneId::allocate();
+        Self::identify_launch(
+            &mut config,
+            self.window_id,
+            self.tabs[self.active_tab_index].id,
+            pane_id,
+        );
         Some((
+            pane_id,
             Self::create_terminal(config, self.exit_tx.clone(), cx),
             profile_id,
         ))
@@ -430,16 +521,29 @@ impl PaneContainer {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some((new_terminal, profile_id)) = self.new_terminal(profile_id, working_directory, cx)
+        let Some((pane_id, new_terminal, profile_id)) =
+            self.new_terminal(profile_id, working_directory, cx)
         else {
             return;
         };
         let split = self.active_split();
 
         split.update(cx, |split, cx| {
-            split.split_active(axis, new_terminal, profile_id, window, cx);
+            let direction = match axis {
+                SplitAxis::Horizontal => crate::action::Direction::Right,
+                SplitAxis::Vertical => crate::action::Direction::Down,
+            };
+            split.split_target(
+                split.active_pane_id(),
+                pane_id,
+                direction,
+                0.5,
+                (new_terminal, profile_id),
+                true,
+            );
             split.focus_active(window, cx);
         });
+        self.establish_layout(window, cx);
 
         cx.notify();
     }
@@ -462,6 +566,7 @@ impl PaneContainer {
             config,
             profile_id.clone(),
             profile.label.clone(),
+            self.window_id,
             self.exit_tx.clone(),
             cx,
         );
@@ -553,16 +658,29 @@ impl PaneContainer {
         };
         let mut warnings = Vec::new();
         let mut tabs = Vec::with_capacity(layout.tabs.len());
+        let saved_active_tab = layout.active_tab_id;
+        let mut active_tab_index = 0;
         for saved_tab in layout.tabs {
             let WorkspaceTab {
-                id,
+                id: saved_id,
                 title,
                 active_pane_id,
-                root,
+                mut root,
                 panes,
             } = saved_tab;
+            let id = TabId::fresh();
+            if saved_id == saved_active_tab {
+                active_tab_index = tabs.len();
+            }
+            let mapping = panes
+                .keys()
+                .map(|saved| (*saved, crate::split::PaneId::allocate()))
+                .collect::<BTreeMap<_, _>>();
+            root.remap_ids(&mapping);
+            let active_pane_id = mapping[&active_pane_id];
             let mut runtime_panes = Vec::with_capacity(panes.len());
             for (pane_id, pane) in panes {
+                let pane_id = mapping[&pane_id];
                 let settings = self.settings.current();
                 let profile_id = if settings.profiles.contains_key(&pane.profile_id) {
                     pane.profile_id
@@ -586,6 +704,7 @@ impl PaneContainer {
                         ));
                     }
                 }
+                Self::identify_launch(&mut config, self.window_id, id, pane_id);
                 let terminal = Self::create_terminal(config, self.exit_tx.clone(), cx);
                 runtime_panes.push((pane_id, terminal, profile_id));
             }
@@ -599,11 +718,6 @@ impl PaneContainer {
                 bell_pending: false,
             });
         }
-        let active_tab_index = tabs
-            .iter()
-            .position(|tab| tab.id == layout.active_tab_id)
-            .expect("validated workspace active tab exists");
-        TabId::reserve_after(tabs.iter().map(|tab| tab.id));
         self.tabs = tabs;
         self.active_tab_index = active_tab_index;
         self.workspace_diagnostic = (!warnings.is_empty()).then(|| warnings.join("; "));
@@ -650,18 +764,7 @@ impl PaneContainer {
             return;
         }
 
-        if self.tabs.len() <= 1 {
-            cx.quit();
-            return;
-        }
-
-        self.tabs.remove(self.active_tab_index);
-        self.active_tab_index = self
-            .active_tab_index
-            .saturating_sub(1)
-            .min(self.tabs.len() - 1);
-        self.needs_focus = true;
-        cx.notify();
+        self.close_tab_target(self.active_tab_index, window, cx);
     }
 
     fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
@@ -1091,6 +1194,7 @@ fn caption_icon_font_family() -> &'static str {
 
 impl Render for PaneContainer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.establish_layout(window, cx);
         if self.needs_focus {
             self.needs_focus = false;
             self.focus_active_tab(window, cx);
@@ -1143,6 +1247,22 @@ impl Render for PaneContainer {
                             .min_w_0()
                             .min_h_0()
                             .overflow_hidden()
+                            .relative()
+                            .child(
+                                gpui::canvas(
+                                    {
+                                        let entity = cx.entity();
+                                        move |bounds, window, cx| {
+                                            entity.update(cx, |this, cx| {
+                                                this.apply_content_layout(bounds, window, cx)
+                                            })
+                                        }
+                                    },
+                                    |_, _, _, _| {},
+                                )
+                                .absolute()
+                                .size_full(),
+                            )
                             .child(self.active_split()),
                     ),
             )

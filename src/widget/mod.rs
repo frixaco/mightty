@@ -4,6 +4,7 @@
 //! rendering, and feedback capture together.
 
 mod capture;
+mod control;
 mod graphics;
 mod input;
 mod pty;
@@ -138,7 +139,7 @@ pub struct TerminalWidget {
     search: Option<search::SearchOverlay>,
     search_task: Task<()>,
     config: TerminalConfig,
-    pty_tx: Option<flume::Sender<PtyCommand>>,
+    pty_tx: Option<pty::PtySender>,
     exit_signal_tx: Option<flume::Sender<()>>,
     exit_flag: Arc<AtomicBool>,
     pty_worker: Option<PtyWorker>,
@@ -289,7 +290,7 @@ impl TerminalWidget {
         exit_flag: Arc<AtomicBool>,
         pty_worker: Option<PtyWorker>,
         pty_event_rx: Option<flume::Receiver<PtyEvent>>,
-        pty_tx: Option<flume::Sender<PtyCommand>>,
+        pty_tx: Option<pty::PtySender>,
         cx: &mut Context<Self>,
     ) -> Self {
         let theme = config.theme.clone();
@@ -424,6 +425,9 @@ impl TerminalWidget {
 
     pub fn has_exited(&self) -> bool {
         self.has_exited || self.exit_flag.load(Ordering::Relaxed)
+    }
+    pub fn launch_succeeded(&self) -> bool {
+        self.pty_worker.is_some()
     }
 
     pub fn set_exit_signal(&mut self, tx: flume::Sender<()>) {
@@ -757,9 +761,9 @@ impl TerminalWidget {
 
     fn send_pty_command(&mut self, command: PtyCommand) {
         if let Some(tx) = &self.pty_tx
-            && tx.send(command).is_err()
+            && let Err(error) = tx.send(command)
         {
-            self.mark_exited();
+            eprintln!("Cannot enqueue PTY command: {error}");
         }
     }
 
@@ -789,7 +793,11 @@ impl TerminalWidget {
         (cols.max(1), rows.max(1))
     }
 
-    fn resize_to_size(&mut self, size: Size<Pixels>, cx: &mut Context<Self>) {
+    fn resize_to_size(
+        &mut self,
+        size: Size<Pixels>,
+        cx: &mut Context<Self>,
+    ) -> Option<flume::Receiver<crate::control::Acknowledgement>> {
         let (cols, rows) = self.calculate_dimensions(size);
         if self.geometry_dirty || cols != self.size.0 || rows != self.size.1 {
             let cell_width: f32 = self.cell_size.0.into();
@@ -801,10 +809,56 @@ impl TerminalWidget {
             {
                 self.size = (cols, rows);
                 self.geometry_dirty = false;
-                self.send_pty_command(PtyCommand::Resize(PtySize::new(rows, cols)));
+                let (reply, ack) = flume::bounded(1);
+                if let Some(tx) = &self.pty_tx
+                    && let Err(error) = tx.send(PtyCommand::ResizeAck(
+                        PtySize::new(rows, cols),
+                        reply.clone(),
+                    ))
+                {
+                    let _ = reply.try_send(crate::control::Acknowledgement {
+                        written_bytes: 0,
+                        error: Some(error.into()),
+                    });
+                }
                 cx.notify();
+                return Some(ack);
             }
         }
+        None
+    }
+
+    pub fn apply_control_layout(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<flume::Receiver<crate::control::Acknowledgement>> {
+        self.resolve_font_metrics(window);
+        self.layout_bounds = Some(bounds);
+        self.resize_to_size(bounds.size, cx)
+    }
+    fn resolve_font_metrics(&mut self, window: &Window) {
+        let key = (
+            self.config.font_family.clone(),
+            self.config.font_size_px,
+            window.scale_factor(),
+        );
+        if self.font_metrics_key.as_ref() == Some(&key) {
+            return;
+        }
+        let font = gpui::font(self.config.font_family.clone());
+        let text = window.text_system();
+        let id = text.resolve_font(&font);
+        let size = px(self.config.font_size_px);
+        self.cell_size = (
+            text.ch_advance(id, size).unwrap_or(size * 0.6).max(px(1.0)),
+            (text.ascent(id, size) + text.descent(id, size))
+                .max(size)
+                .ceil(),
+        );
+        self.font_metrics_key = Some(key);
+        self.geometry_dirty = true;
     }
 
     fn update_layout_bounds(&mut self, bounds: Bounds<Pixels>, cx: &mut Context<Self>) {
@@ -813,7 +867,7 @@ impl TerminalWidget {
         }
 
         self.layout_bounds = Some(bounds);
-        self.resize_to_size(bounds.size, cx);
+        let _ = self.resize_to_size(bounds.size, cx);
         cx.notify();
     }
 

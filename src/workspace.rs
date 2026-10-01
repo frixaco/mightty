@@ -82,16 +82,6 @@ impl TabId {
         Self(NEXT_TAB_ID.fetch_add(1, Ordering::Relaxed))
     }
 
-    pub(crate) fn reserve_after(ids: impl IntoIterator<Item = Self>) {
-        let next = ids
-            .into_iter()
-            .map(|id| id.0)
-            .max()
-            .unwrap_or(0)
-            .saturating_add(1);
-        NEXT_TAB_ID.fetch_max(next, Ordering::Relaxed);
-    }
-
     #[cfg(test)]
     const fn test(value: u64) -> Self {
         Self(value)

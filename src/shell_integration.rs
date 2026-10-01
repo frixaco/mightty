@@ -88,6 +88,9 @@ fn local_hostname() -> Option<String> {
 
 fn prepare_launch_in(launch: &LaunchSpec, directory: &Path) -> io::Result<LaunchSpec> {
     let mut launch = launch.clone();
+    if !launch.shell_integration {
+        return Ok(launch);
+    }
     launch
         .environment
         .insert(OsString::from("TERM_PROGRAM"), OsString::from("mightty"));

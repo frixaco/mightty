@@ -1,6 +1,6 @@
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
 };
 use std::thread::JoinHandle;
 
@@ -16,8 +16,81 @@ const OUTPUT_QUEUE_CAPACITY: usize = 64;
 
 pub(super) enum PtyCommand {
     Write(Vec<u8>),
-    Resize(PtySize),
+    WriteAck(Vec<u8>, flume::Sender<crate::control::Acknowledgement>),
+    ResizeAck(PtySize, flume::Sender<crate::control::Acknowledgement>),
     Shutdown,
+}
+
+const INPUT_QUEUE_BYTES: usize = 2 * 1024 * 1024;
+
+#[derive(Clone)]
+pub(super) struct PtySender {
+    sender: flume::Sender<QueuedCommand>,
+    bytes: Arc<AtomicUsize>,
+    size: Arc<AtomicU32>,
+}
+struct QueuedCommand {
+    command: Option<PtyCommand>,
+    bytes: usize,
+    budget: Arc<AtomicUsize>,
+}
+impl Drop for QueuedCommand {
+    fn drop(&mut self) {
+        self.budget.fetch_sub(self.bytes, Ordering::AcqRel);
+    }
+}
+impl PtySender {
+    pub(super) fn acknowledged_size(&self) -> Option<PtySize> {
+        let size = self.size.load(Ordering::Acquire);
+        (size != 0).then(|| PtySize::new(size as u16, (size >> 16) as u16))
+    }
+    pub(super) fn send(&self, command: PtyCommand) -> Result<(), &'static str> {
+        let bytes = match &command {
+            PtyCommand::Write(data) | PtyCommand::WriteAck(data, _) => data.len(),
+            _ => 0,
+        };
+        self.bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current
+                    .checked_add(bytes)
+                    .filter(|next| *next <= INPUT_QUEUE_BYTES)
+            })
+            .map_err(|_| "PTY input byte budget exhausted")?;
+        let queued = QueuedCommand {
+            command: Some(command),
+            bytes,
+            budget: Arc::clone(&self.bytes),
+        };
+        self.sender
+            .try_send(queued)
+            .map_err(|_| "PTY command queue full or closed")
+    }
+}
+
+#[cfg(test)]
+pub(super) fn test_channel() -> (PtySender, TestReceiver) {
+    let (sender, receiver) = flume::bounded(256);
+    (
+        PtySender {
+            sender,
+            bytes: Arc::new(AtomicUsize::new(0)),
+            size: Arc::new(AtomicU32::new(0)),
+        },
+        TestReceiver(receiver),
+    )
+}
+#[cfg(test)]
+pub(super) struct TestReceiver(flume::Receiver<QueuedCommand>);
+#[cfg(test)]
+impl TestReceiver {
+    pub(super) fn try_recv(&self) -> Result<PtyCommand, flume::TryRecvError> {
+        self.0
+            .try_recv()
+            .map(|mut queued| queued.command.take().unwrap())
+    }
+    pub(super) fn try_iter(&self) -> impl Iterator<Item = PtyCommand> + '_ {
+        std::iter::from_fn(|| self.try_recv().ok())
+    }
 }
 
 pub(super) enum PtyEvent {
@@ -36,7 +109,7 @@ impl PtyEvent {
 
 #[cfg(any(windows, unix))]
 pub(super) struct PtyWorker {
-    command_tx: flume::Sender<PtyCommand>,
+    command_tx: PtySender,
     control_thread: Option<JoinHandle<()>>,
     reader_thread: Option<JoinHandle<()>>,
     stopping: Arc<AtomicBool>,
@@ -55,14 +128,26 @@ impl PtyWorker {
         exit_flag: Arc<AtomicBool>,
     ) -> Result<(Self, flume::Receiver<PtyEvent>), crate::shell::PtyError> {
         let parts = PtyParts::spawn(&launch, PtySize::new(rows, cols))?;
-        Ok(Self::from_parts(parts, exit_flag))
+        let result = Self::from_parts(parts, exit_flag);
+        result
+            .0
+            .command_tx
+            .size
+            .store((u32::from(cols) << 16) | u32::from(rows), Ordering::Release);
+        Ok(result)
     }
 
     pub(super) fn from_parts(
         parts: PtyParts,
         exit_flag: Arc<AtomicBool>,
     ) -> (Self, flume::Receiver<PtyEvent>) {
-        let (command_tx, command_rx) = flume::unbounded::<PtyCommand>();
+        let (sender, command_rx) = flume::bounded::<QueuedCommand>(256);
+        let command_tx = PtySender {
+            sender,
+            bytes: Arc::new(AtomicUsize::new(0)),
+            size: Arc::new(AtomicU32::new(0)),
+        };
+        let acknowledged_size = Arc::clone(&command_tx.size);
         let (event_tx, event_rx) = flume::bounded::<PtyEvent>(OUTPUT_QUEUE_CAPACITY);
         let stopping = Arc::new(AtomicBool::new(false));
         let stop_reader = Arc::new(AtomicBool::new(false));
@@ -73,15 +158,38 @@ impl PtyWorker {
         let control_exit_flag = Arc::clone(&exit_flag);
         let control_event_tx = event_tx.clone();
         let control_thread = std::thread::spawn(move || {
-            while let Ok(command) = command_rx.recv() {
+            while let Ok(mut queued) = command_rx.recv() {
                 if control_stopping.load(Ordering::Acquire) {
                     break;
                 }
-                let result = match command {
+                let result = match queued.command.take().expect("queued command") {
                     PtyCommand::Write(data) => {
                         input.write_all_interruptible(&data, &control_stopping)
                     }
-                    PtyCommand::Resize(size) => control.resize(size),
+                    PtyCommand::WriteAck(data, reply) => {
+                        let mut written_bytes = 0;
+                        let result =
+                            input.write_with_progress(&data, &control_stopping, &mut written_bytes);
+                        let _ = reply.try_send(crate::control::Acknowledgement {
+                            written_bytes,
+                            error: result.as_ref().err().map(ToString::to_string),
+                        });
+                        result
+                    }
+                    PtyCommand::ResizeAck(size, reply) => {
+                        let result = control.resize(size);
+                        if result.is_ok() {
+                            acknowledged_size.store(
+                                (u32::from(size.cols) << 16) | u32::from(size.rows),
+                                Ordering::Release,
+                            );
+                        }
+                        let _ = reply.try_send(crate::control::Acknowledgement {
+                            written_bytes: 0,
+                            error: result.as_ref().err().map(ToString::to_string),
+                        });
+                        result
+                    }
                     PtyCommand::Shutdown => break,
                 };
 
@@ -148,7 +256,7 @@ impl PtyWorker {
         )
     }
 
-    pub(super) fn command_tx(&self) -> flume::Sender<PtyCommand> {
+    pub(super) fn command_tx(&self) -> PtySender {
         self.command_tx.clone()
     }
 

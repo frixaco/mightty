@@ -19,6 +19,7 @@ impl TerminalWidget {
             "launch":{"executable":self.config.launch.executable,"argv":self.config.launch.arguments.iter().map(|v|v.to_string_lossy()).collect::<Vec<_>>(),
                 "environment_names":self.config.launch.environment.keys().map(|v|v.to_string_lossy()).collect::<Vec<_>>()},
             "terminal_size":{"cols":self.size.0,"rows":self.size.1},"computed_bounds":bounds,
+            "pty_size":self.pty_tx.as_ref().and_then(|tx|tx.acknowledged_size()).map(|s|json!({"cols":s.cols,"rows":s.rows})),
             "output_seq":self.output_seq.to_string(),"output_cursor":format!("{}:{}",crate::control::instance_id(),self.output_seq),
             "lifecycle":if self.has_exited {"output_ended"} else {"running"},"processes":{"availability":"not_sampled"},
             "font":{"family":self.config.font_family,"size_px":self.config.font_size_px},

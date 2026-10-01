@@ -94,33 +94,12 @@ impl Render for TerminalWidget {
                 }));
         }
 
-        let metrics_key = (
-            self.config.font_family.clone(),
-            self.config.font_size_px,
-            window.scale_factor(),
-        );
-        if self.font_metrics_key.as_ref() != Some(&metrics_key) {
-            let font = gpui::font(self.config.font_family.clone());
-            let text_system = window.text_system();
-            let font_id = text_system.resolve_font(&font);
-            let font_size = px(self.config.font_size_px);
-            let advance = text_system
-                .ch_advance(font_id, font_size)
-                .unwrap_or(font_size * 0.6)
-                .max(px(1.0));
-            let height = (text_system.ascent(font_id, font_size)
-                + text_system.descent(font_id, font_size))
-            .max(font_size)
-            .ceil();
-            self.cell_size = (advance, height);
-            self.font_metrics_key = Some(metrics_key);
-            self.geometry_dirty = true;
-        }
+        self.resolve_font_metrics(window);
 
         let layout_size = self
             .layout_bounds
             .map_or_else(|| window.viewport_size(), |bounds| bounds.size);
-        self.resize_to_size(layout_size, cx);
+        let _ = self.resize_to_size(layout_size, cx);
 
         let snapshot = match self.render_state.update(&self.terminal) {
             Ok(s) => s,
@@ -1243,7 +1222,7 @@ mod tests {
 
         let terminal_slot = Rc::new(RefCell::new(None));
         let build_terminal_slot = Rc::clone(&terminal_slot);
-        let (pty_tx, pty_rx) = flume::unbounded();
+        let (pty_tx, pty_rx) = crate::widget::pty::test_channel();
         let config = TerminalConfig {
             cursor_blink: false,
             ..Default::default()
@@ -1390,7 +1369,7 @@ mod tests {
             gpui_component::init(cx);
             crate::widget::init(cx);
         });
-        let (pty_tx, pty_rx) = flume::unbounded();
+        let (pty_tx, pty_rx) = crate::widget::pty::test_channel();
         let slot = Rc::new(RefCell::new(None));
         let build_slot = slot.clone();
         let (_root, cx) = cx.add_window_view(move |window, cx| {

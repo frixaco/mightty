@@ -43,8 +43,18 @@ fn main() {
 
         #[cfg(windows)]
         {
+            let (control_tx, control_rx) = flume::bounded(32);
+            let control_server = mightty::application::windows::ControlServer::start(control_tx)
+                .expect("failed to start control endpoint");
+            mightty::control::set_instance_id(control_server.descriptor().instance_id.clone());
             let normal_window = open_normal_window(windows_startup.show_normal_window(), cx);
-            start_windows_application(windows_startup, normal_window, cx);
+            start_windows_application(
+                windows_startup,
+                normal_window,
+                control_server,
+                control_rx,
+                cx,
+            );
         }
         #[cfg(not(windows))]
         let _normal_window = open_normal_window(true, cx);
@@ -91,6 +101,9 @@ fn open_terminal_window(
             cx.new(|cx| Root::new(root_panes, window, cx))
         })
         .expect("failed to open terminal window");
+    let _ = handle.update(cx, |_, window, cx| {
+        panes.update(cx, |panes, cx| panes.establish_layout(window, cx))
+    });
     TerminalWindow { handle, panes }
 }
 
@@ -269,12 +282,14 @@ fn parse_profile_id(value: &OsString) -> Result<ProfileId, String> {
 }
 
 #[cfg(windows)]
-fn start_windows_application(startup: WindowsStartup, normal_window: TerminalWindow, cx: &mut App) {
+fn start_windows_application(
+    startup: WindowsStartup,
+    normal_window: TerminalWindow,
+    control_server: mightty::application::windows::ControlServer,
+    control_rx: flume::Receiver<mightty::control::Dispatch>,
+    cx: &mut App,
+) {
     let isolated = matches!(startup, WindowsStartup::Test);
-    let (control_tx, control_rx) = flume::bounded(32);
-    let control_server = mightty::application::windows::ControlServer::start(control_tx)
-        .expect("failed to start control endpoint");
-    mightty::control::set_instance_id(control_server.descriptor().instance_id.clone());
     let (activation_tx, activation_rx) = flume::unbounded();
     let (primary_instance, startup_request, embedding) = match startup {
         WindowsStartup::Application {
@@ -322,7 +337,9 @@ fn start_windows_application(startup: WindowsStartup, normal_window: TerminalWin
                     .control_dispatch(&dispatch, cx)
             });
             if let Ok(value) = result {
-                let _ = dispatch.reply.try_send(value);
+                if let Some(value) = value {
+                    let _ = dispatch.reply.try_send(value);
+                }
             } else {
                 break;
             }
@@ -425,19 +442,19 @@ impl WindowsApplication {
         &mut self,
         dispatch: &mightty::control::Dispatch,
         cx: &mut App,
-    ) -> serde_json::Value {
+    ) -> Option<serde_json::Value> {
         use mightty::control::{ControlError, reply};
         use serde_json::json;
         let request = &dispatch.request;
         if std::time::Instant::now() >= dispatch.deadline {
-            return reply(
+            return Some(reply(
                 request,
                 self.control_revision,
                 Err(ControlError::new(
                     "cancelled",
                     "request expired before dispatch",
                 )),
-            );
+            ));
         }
         let mut windows = vec![(
             "w1",
@@ -462,13 +479,13 @@ impl WindowsApplication {
                     states.push(state);
                 }
             }
-            return reply(
+            return Some(reply(
                 request,
                 self.control_revision,
                 Ok(
                     json!({"schema_version":1,"instance_id":request.instance_id,"pid":std::process::id(),"observed_unix_ms":mightty::feedback::unix_timestamp_ms().to_string(),"revision":self.control_revision.to_string(),"windows":states}),
                 ),
-            );
+            ));
         }
         let active = windows
             .iter()
@@ -505,7 +522,94 @@ impl WindowsApplication {
             )),
             _ => Err(ControlError::new("ambiguous_target", "specify a window")),
         };
-        reply(request, self.control_revision, result)
+        if request.op == "window.resize"
+            && result.is_ok()
+            && let [(id, handle, panes)] = targets.as_slice()
+        {
+            let id = (*id).to_string();
+            let handle = *handle;
+            let panes = panes.clone();
+            let request = request.clone();
+            let deadline = dispatch.deadline;
+            let sender = dispatch.reply.clone();
+            let revision = self.control_revision;
+            let initial = result.as_ref().unwrap()["bounds"].clone();
+            cx.spawn(async move |cx| {
+                loop {
+                    let observed = handle.update(cx, |_, window, cx| {
+                        let width = f32::from(window.viewport_size().width);
+                        let height = f32::from(window.viewport_size().height);
+                        let requested_width = request.args["width"].as_f64().unwrap() as f32;
+                        let requested_height = request.args["height"].as_f64().unwrap() as f32;
+                        if (width == requested_width && height == requested_height)
+                            || f64::from(width) != initial["width"].as_f64().unwrap()
+                            || f64::from(height) != initial["height"].as_f64().unwrap()
+                        {
+                            Some(panes.update(cx, |panes, cx| {
+                                panes.establish_layout(window, cx);
+                                let mut state = panes.control_state(window, cx);
+                                state["window_id"] = json!(id);
+                                state["clamped"] =
+                                    json!(width != requested_width || height != requested_height);
+                                (state, panes.take_control_acks(cx))
+                            }))
+                        } else {
+                            None
+                        }
+                    });
+                    match observed {
+                        Ok(Some((state, acks))) => {
+                            let response = mightty::control::complete_acknowledgements(
+                                reply(&request, revision, Ok(state)),
+                                acks,
+                                deadline,
+                            )
+                            .await;
+                            let _ = sender.try_send(response);
+                            break;
+                        }
+                        Ok(None) if std::time::Instant::now() < deadline => {
+                            Timer::after(Duration::from_millis(5)).await;
+                        }
+                        _ => {
+                            let mut error = ControlError::new(
+                                "outcome_unknown",
+                                "window resize completion unavailable",
+                            );
+                            error.effect = "unknown";
+                            let _ = sender.try_send(reply(&request, revision, Err(error)));
+                            break;
+                        }
+                    }
+                }
+            })
+            .detach();
+            return None;
+        }
+        let mut acknowledgements = Vec::new();
+        if result.is_ok()
+            && !matches!(
+                request.op.as_str(),
+                "state" | "profiles" | "capabilities" | "pane.read"
+            )
+            && let [(_, _, panes)] = targets.as_slice()
+        {
+            acknowledgements = panes.update(cx, |panes, cx| panes.take_control_acks(cx));
+        }
+        let response = reply(request, self.control_revision, result);
+        if acknowledgements.is_empty() {
+            return Some(response);
+        }
+        let deadline = dispatch.deadline;
+        let sender = dispatch.reply.clone();
+        cx.spawn(async move |_| {
+            let response =
+                mightty::control::complete_acknowledgements(response, acknowledgements, deadline)
+                    .await;
+            let _ = sender.try_send(response);
+        })
+        .detach();
+        None
     }
     fn dispatch(&mut self, request: ActivationRequest, cx: &mut App) {
         match request {

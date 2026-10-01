@@ -26,6 +26,9 @@ static NEXT_PANE_ID: AtomicU64 = AtomicU64::new(1);
 pub struct PaneId(u64);
 
 impl PaneId {
+    pub fn allocate() -> Self {
+        Self(NEXT_PANE_ID.fetch_add(1, Ordering::Relaxed))
+    }
     pub fn value(self) -> u64 {
         self.0
     }
@@ -67,7 +70,7 @@ pub enum SplitNode {
     },
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
 pub struct LayoutRect {
     pub x: f32,
     pub y: f32,
@@ -137,11 +140,21 @@ pub struct Split {
     active_pane_id: PaneId,
     zoomed_pane_id: Option<PaneId>,
     layout_bounds: Option<Bounds<Pixels>>,
+    layout_generation: u64,
+    pending_acks: Vec<flume::Receiver<crate::control::Acknowledgement>>,
 }
 
 impl Split {
     pub fn with_terminal(terminal: Entity<TerminalWidget>, profile_id: ProfileId) -> Self {
         let pane_id = PaneId::fresh(&BTreeMap::new());
+        Self::with_terminal_id(pane_id, terminal, profile_id)
+    }
+
+    pub fn with_terminal_id(
+        pane_id: PaneId,
+        terminal: Entity<TerminalWidget>,
+        profile_id: ProfileId,
+    ) -> Self {
         let mut panes = BTreeMap::new();
         panes.insert(
             pane_id,
@@ -156,6 +169,8 @@ impl Split {
             active_pane_id: pane_id,
             zoomed_pane_id: None,
             layout_bounds: None,
+            layout_generation: 1,
+            pending_acks: Vec::new(),
         }
     }
 
@@ -191,6 +206,8 @@ impl Split {
             active_pane_id,
             zoomed_pane_id: None,
             layout_bounds: None,
+            layout_generation: 1,
+            pending_acks: Vec::new(),
         })
     }
 
@@ -200,6 +217,147 @@ impl Split {
 
     pub fn topology(&self) -> &SplitNode {
         &self.root
+    }
+
+    pub fn layout_token(&self, tab_id: crate::workspace::TabId) -> String {
+        format!(
+            "{}:tab:t{}:{}",
+            crate::control::instance_id(),
+            tab_id.value(),
+            self.layout_generation
+        )
+    }
+    pub fn layout_bounds(&self) -> Option<Bounds<Pixels>> {
+        self.layout_bounds
+    }
+    pub fn zoomed_pane_id(&self) -> Option<PaneId> {
+        self.zoomed_pane_id
+    }
+    pub fn take_control_acks(&mut self) -> Vec<flume::Receiver<crate::control::Acknowledgement>> {
+        std::mem::take(&mut self.pending_acks)
+    }
+    pub fn terminal(&self, pane: PaneId) -> Option<Entity<TerminalWidget>> {
+        self.panes.get(&pane).map(|p| p.terminal.clone())
+    }
+
+    pub fn apply_layout(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.pending_acks
+            .retain(|ack| ack.is_empty() && !ack.is_disconnected());
+        if self.layout_bounds != Some(bounds) {
+            self.layout_bounds = Some(bounds);
+            self.layout_generation += 1;
+        }
+        let root = self.current_root_rect(window);
+        for pane_layout in pane_layouts(&self.root, root) {
+            let rect = if self.zoomed_pane_id == Some(pane_layout.pane_id) {
+                root
+            } else {
+                pane_layout.bounds
+            };
+            let absolute = Bounds {
+                origin: gpui::point(bounds.origin.x + px(rect.x), bounds.origin.y + px(rect.y)),
+                size: gpui::size(px(rect.width), px(rect.height)),
+            };
+            let terminal = &self.panes[&pane_layout.pane_id].terminal;
+            if let Some(ack) = terminal.update(cx, |terminal, cx| {
+                terminal.apply_control_layout(absolute, window, cx)
+            }) {
+                self.layout_generation += 1;
+                self.pending_acks.push(ack);
+            }
+        }
+    }
+
+    pub fn split_target(
+        &mut self,
+        target: PaneId,
+        new_id: PaneId,
+        direction: Direction,
+        ratio: f32,
+        new_pane: (Entity<TerminalWidget>, ProfileId),
+        focus: bool,
+    ) -> bool {
+        let (terminal, profile_id) = new_pane;
+        let axis = match direction {
+            Direction::Left | Direction::Right => SplitAxis::Horizontal,
+            _ => SplitAxis::Vertical,
+        };
+        if !self.root.split_leaf_positioned(
+            target,
+            axis,
+            new_id,
+            matches!(direction, Direction::Left | Direction::Up),
+            ratio,
+        ) {
+            return false;
+        }
+        self.panes.insert(
+            new_id,
+            RuntimePane {
+                terminal,
+                profile_id,
+            },
+        );
+        if focus {
+            self.active_pane_id = new_id;
+        }
+        self.zoomed_pane_id = None;
+        self.layout_generation += 1;
+        true
+    }
+    pub fn focus_target(
+        &mut self,
+        target: PaneId,
+        direction: Option<Direction>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let pane = if let Some(direction) = direction {
+            let Some(next) =
+                directional_neighbor(&self.current_layout(window).panes, target, direction)
+            else {
+                return false;
+            };
+            next
+        } else {
+            target
+        };
+        if !self.panes.contains_key(&pane) {
+            return false;
+        }
+        if self.zoomed_pane_id.is_some() {
+            self.zoomed_pane_id = None;
+            self.layout_generation += 1;
+        }
+        self.active_pane_id = pane;
+        self.focus_active(window, cx);
+        true
+    }
+    pub fn zoom_target(&mut self, target: PaneId, enabled: bool) {
+        let next = enabled.then_some(target);
+        if self.zoomed_pane_id != next {
+            self.zoomed_pane_id = next;
+            self.layout_generation += 1;
+        }
+    }
+    pub fn resize_target(
+        &mut self,
+        target: PaneId,
+        direction: Direction,
+        delta: f32,
+        window: &Window,
+    ) -> bool {
+        let bounds = self.current_root_rect(window);
+        let changed = resize_pane_pixels(&mut self.root, target, direction, delta, bounds);
+        if changed {
+            self.layout_generation += 1;
+        }
+        changed
     }
 
     pub fn pane_profiles(&self) -> impl Iterator<Item = (PaneId, &ProfileId)> {
@@ -244,18 +402,18 @@ impl Split {
     ) {
         self.update_active_from_focus(window, cx);
         let pane_id = PaneId::fresh(&self.panes);
-        if !self.root.split_leaf(self.active_pane_id, axis, pane_id) {
-            return;
-        }
-        self.panes.insert(
+        let direction = match axis {
+            SplitAxis::Horizontal => Direction::Right,
+            SplitAxis::Vertical => Direction::Down,
+        };
+        self.split_target(
+            self.active_pane_id,
             pane_id,
-            RuntimePane {
-                terminal,
-                profile_id,
-            },
+            direction,
+            0.5,
+            (terminal, profile_id),
+            true,
         );
-        self.active_pane_id = pane_id;
-        self.zoomed_pane_id = None;
     }
 
     pub fn remove_active_pane(
@@ -272,7 +430,7 @@ impl Split {
         self.remove_pane(pane_id)
     }
 
-    fn remove_pane(&mut self, pane_id: PaneId) -> Option<Entity<TerminalWidget>> {
+    pub fn remove_pane(&mut self, pane_id: PaneId) -> Option<Entity<TerminalWidget>> {
         if self.panes.len() <= 1 || !self.root.contains(pane_id) {
             return None;
         }
@@ -284,7 +442,10 @@ impl Split {
         self.root = self.root.clone().without(pane_id)?;
         self.panes.remove(&pane_id);
         let remaining = self.root.pane_ids();
-        self.active_pane_id = remaining[removed_index.min(remaining.len() - 1)];
+        if self.active_pane_id == pane_id {
+            self.active_pane_id = remaining[removed_index.min(remaining.len() - 1)];
+        }
+        self.layout_generation += 1;
         if self.zoomed_pane_id == Some(pane_id) {
             self.zoomed_pane_id = None;
         }
@@ -317,14 +478,7 @@ impl Split {
         cx: &mut Context<Self>,
     ) -> bool {
         self.update_active_from_focus(window, cx);
-        let layout = self.current_layout(window);
-        let Some(next) = directional_neighbor(&layout.panes, self.active_pane_id, direction) else {
-            return false;
-        };
-        self.active_pane_id = next;
-        self.zoomed_pane_id = None;
-        self.focus_active(window, cx);
-        true
+        self.focus_target(self.active_pane_id, Some(direction), window, cx)
     }
 
     pub fn resize_active(
@@ -335,23 +489,25 @@ impl Split {
         cx: &Context<Self>,
     ) -> bool {
         self.update_active_from_focus(window, cx);
-        let bounds = self.current_root_rect(window);
-        resize_pane(
-            &mut self.root,
+        let unit = if matches!(direction, Direction::Left | Direction::Right) {
+            8.0
+        } else {
+            18.0
+        };
+        self.resize_target(
             self.active_pane_id,
             direction,
-            f32::from(amount),
-            bounds,
+            f32::from(amount) * unit,
+            window,
         )
     }
 
     pub fn toggle_zoom(&mut self, window: &Window, cx: &Context<Self>) {
         self.update_active_from_focus(window, cx);
-        self.zoomed_pane_id = if self.zoomed_pane_id == Some(self.active_pane_id) {
-            None
-        } else {
-            Some(self.active_pane_id)
-        };
+        self.zoom_target(
+            self.active_pane_id,
+            self.zoomed_pane_id != Some(self.active_pane_id),
+        );
     }
 
     pub fn set_action_bindings(&self, bindings: &[ActionBinding], cx: &mut Context<Self>) {
@@ -391,6 +547,7 @@ impl Split {
     fn update_layout_bounds(&mut self, bounds: Bounds<Pixels>, cx: &mut Context<Self>) {
         if self.layout_bounds != Some(bounds) {
             self.layout_bounds = Some(bounds);
+            self.layout_generation += 1;
             cx.notify();
         }
     }
@@ -427,6 +584,7 @@ impl Split {
             }
         };
         if self.root.set_ratio(path, ratio) {
+            self.layout_generation += 1;
             cx.notify();
         }
     }
@@ -526,6 +684,47 @@ impl Render for DividerDrag {
 }
 
 impl SplitNode {
+    pub fn remap_ids(&mut self, mapping: &BTreeMap<PaneId, PaneId>) {
+        match self {
+            Self::Leaf { pane_id } => *pane_id = mapping[pane_id],
+            Self::Branch { first, second, .. } => {
+                first.remap_ids(mapping);
+                second.remap_ids(mapping);
+            }
+        }
+    }
+    fn split_leaf_positioned(
+        &mut self,
+        target: PaneId,
+        axis: SplitAxis,
+        new_id: PaneId,
+        before: bool,
+        new_ratio: f32,
+    ) -> bool {
+        match self {
+            Self::Leaf { pane_id } if *pane_id == target => {
+                let old = Box::new(Self::Leaf { pane_id: target });
+                let new = Box::new(Self::Leaf { pane_id: new_id });
+                let (first, second, ratio) = if before {
+                    (new, old, new_ratio)
+                } else {
+                    (old, new, 1.0 - new_ratio)
+                };
+                *self = Self::Branch {
+                    axis,
+                    ratio,
+                    first,
+                    second,
+                };
+                true
+            }
+            Self::Branch { first, second, .. } => {
+                first.split_leaf_positioned(target, axis, new_id, before, new_ratio)
+                    || second.split_leaf_positioned(target, axis, new_id, before, new_ratio)
+            }
+            _ => false,
+        }
+    }
     fn contains(&self, pane_id: PaneId) -> bool {
         match self {
             Self::Leaf { pane_id: candidate } => *candidate == pane_id,
@@ -551,6 +750,7 @@ impl SplitNode {
         }
     }
 
+    #[cfg(test)]
     fn split_leaf(&mut self, target: PaneId, axis: SplitAxis, new_pane_id: PaneId) -> bool {
         match self {
             Self::Leaf { pane_id } if *pane_id == target => {
@@ -818,7 +1018,29 @@ fn directional_neighbor(
         .map(|candidate| candidate.0)
 }
 
+#[cfg(test)]
 fn resize_pane(
+    root: &mut SplitNode,
+    pane_id: PaneId,
+    direction: Direction,
+    amount: f32,
+    bounds: LayoutRect,
+) -> bool {
+    resize_pane_pixels(
+        root,
+        pane_id,
+        direction,
+        amount
+            * if matches!(direction, Direction::Left | Direction::Right) {
+                8.0
+            } else {
+                18.0
+            },
+        bounds,
+    )
+}
+
+fn resize_pane_pixels(
     root: &mut SplitNode,
     pane_id: PaneId,
     direction: Direction,
@@ -838,14 +1060,20 @@ fn resize_pane(
     }
     .max(1.0);
     let current = ratio_at_path(root, &path).unwrap_or(0.5);
-    let delta = amount
-        * if axis == SplitAxis::Horizontal {
-            8.0
-        } else {
-            18.0
-        }
-        / extent;
-    root.set_ratio(&path, current + if grows_first { delta } else { -delta })
+    let delta = amount / (extent - SEPARATOR_SIZE_PX).max(1.0);
+    let proposed = current + if grows_first { delta } else { -delta };
+    let mut node = root.clone();
+    node.set_ratio(&path, proposed);
+    let effective = layout_tree(&node, bounds);
+    let divider = effective.dividers.iter().find(|d| d.path == path).unwrap();
+    let ratio = if axis == SplitAxis::Horizontal {
+        (divider.bounds.x - divider.branch_bounds.x)
+            / (divider.branch_bounds.width - SEPARATOR_SIZE_PX).max(1.0)
+    } else {
+        (divider.bounds.y - divider.branch_bounds.y)
+            / (divider.branch_bounds.height - SEPARATOR_SIZE_PX).max(1.0)
+    };
+    root.set_ratio(&path, ratio)
 }
 
 fn resize_branch(
@@ -942,6 +1170,46 @@ impl Render for Split {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn splits_in_four_directions_and_remaps_all_runtime_references() {
+        for direction in [
+            Direction::Left,
+            Direction::Right,
+            Direction::Up,
+            Direction::Down,
+        ] {
+            let mut root = leaf(1);
+            let axis = if matches!(direction, Direction::Left | Direction::Right) {
+                SplitAxis::Horizontal
+            } else {
+                SplitAxis::Vertical
+            };
+            let before = matches!(direction, Direction::Left | Direction::Up);
+            assert!(root.split_leaf_positioned(
+                PaneId::test(1),
+                axis,
+                PaneId::test(2),
+                before,
+                0.35
+            ));
+            let ids = root.pane_ids();
+            assert_eq!(
+                ids,
+                if before {
+                    vec![PaneId::test(2), PaneId::test(1)]
+                } else {
+                    vec![PaneId::test(1), PaneId::test(2)]
+                }
+            );
+            root.remap_ids(&BTreeMap::from([
+                (PaneId::test(1), PaneId::test(11)),
+                (PaneId::test(2), PaneId::test(12)),
+            ]));
+            assert!(!root.contains(PaneId::test(1)));
+            assert!(root.contains(PaneId::test(11)));
+        }
+    }
 
     fn leaf(value: u64) -> SplitNode {
         SplitNode::Leaf {

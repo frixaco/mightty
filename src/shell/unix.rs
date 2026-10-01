@@ -195,7 +195,17 @@ impl PtyInput {
         data: &[u8],
         stopping: &std::sync::atomic::AtomicBool,
     ) -> Result<(), PtyError> {
+        self.write_with_progress(data, stopping, &mut 0)
+    }
+
+    pub fn write_with_progress(
+        &mut self,
+        data: &[u8],
+        stopping: &std::sync::atomic::AtomicBool,
+        written: &mut usize,
+    ) -> Result<(), PtyError> {
         let mut written_total = 0usize;
+        *written = 0;
 
         while written_total < data.len() {
             if stopping.load(std::sync::atomic::Ordering::Acquire) {
@@ -210,6 +220,7 @@ impl PtyInput {
 
             if bytes_written > 0 {
                 written_total += bytes_written as usize;
+                *written = written_total;
                 continue;
             }
 
@@ -469,7 +480,14 @@ impl ResolvedUnixLaunch {
             .collect::<Vec<_>>();
         argument_pointers.push(ptr::null());
 
-        let mut environment = std::env::vars_os().collect::<BTreeMap<OsString, OsString>>();
+        let mut environment = if launch.inherit_environment {
+            std::env::vars_os().collect::<BTreeMap<OsString, OsString>>()
+        } else {
+            BTreeMap::new()
+        };
+        for key in &launch.unset_environment {
+            environment.remove(key);
+        }
         environment.extend(launch.environment.clone());
         let environment = environment
             .into_iter()
