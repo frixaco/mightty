@@ -7,8 +7,10 @@ New-Item -ItemType Directory -Path $caseDirectory | Out-Null
     default_profile = 'fixture'
     profiles = @(@{ id = 'fixture'; label = 'Control fixture'; executable = 'pwsh.exe'; arguments = @('-NoLogo', '-NoProfile') })
     terminal = @{ cursor_blink = $false }
+    app = @{ quick_terminal = @{ enabled = $true; hide_on_focus_loss = $false } }
+    key_bindings = @(@{ chord = 'ctrl-alt-q'; action = @{ type = 'toggle_quick_terminal' } })
 } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $caseDirectory 'settings.json') -Encoding utf8NoBOM
-$application = Start-Process -FilePath $Executable -ArgumentList @('--test-instance', '--data-dir', ('"' + $caseDirectory + '"')) -PassThru -WindowStyle Hidden -RedirectStandardOutput (Join-Path $caseDirectory 'stdout.log') -RedirectStandardError (Join-Path $caseDirectory 'stderr.log')
+$application = Start-Process -FilePath $Executable -ArgumentList @('--test-instance', '--data-dir', ('"' + $caseDirectory + '"')) -WorkingDirectory $caseDirectory -PassThru -WindowStyle Hidden -RedirectStandardOutput (Join-Path $caseDirectory 'stdout.log') -RedirectStandardError (Join-Path $caseDirectory 'stderr.log')
 try {
     $deadline = [datetime]::UtcNow.AddSeconds(20)
     do {
@@ -62,6 +64,17 @@ try {
         $crop = Invoke-Control @('snapshot', '--pane', $pane, '--frame', 'presented', '--out', $caseDirectory)
         $absent = & $Executable ctl snapshot --tab $background.tab_id --frame presented --out $caseDirectory --instance $instance[0].instance_id --json | ConvertFrom-Json
         if ($absent.ok -or $absent.error.code -ne 'target_not_in_frame') { throw 'Presented capture accepted an invisible tab' }
+        $null = Invoke-Control @('ui', 'key', '--window', 'w1', '--key', 'f12', '--mod', 'ctrl', '--mod', 'shift')
+        $feedbackRoot = Join-Path $caseDirectory 'captures'
+        $deadline = [datetime]::UtcNow.AddSeconds(10)
+        do {
+            $feedback = @(Get-ChildItem -LiteralPath $feedbackRoot -Directory -Filter 'capture-*' -ErrorAction SilentlyContinue | Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'manifest.json') })
+            if ($feedback.Count) { break }
+            Start-Sleep -Milliseconds 100
+        } while ([datetime]::UtcNow -lt $deadline)
+        if (!$feedback.Count) { throw 'Feedback shortcut did not publish a renderer bundle' }
+        $feedbackManifest = Get-Content -LiteralPath (Join-Path $feedback[0].FullName 'manifest.json') -Raw | ConvertFrom-Json
+        if ($feedbackManifest.mode -ne 'presented' -or $feedbackManifest.status -ne 'complete') { throw 'Feedback shortcut bypassed the presented capture coordinator' }
         Write-Output "Inactive titles: $($titles.image); visible crop: $($crop.image)"
         Write-Output "Offscreen tab: $($offscreen.image); pane: $($paneCapture.image)"
         Write-Output "Renderer readback passed; presented: $($presented.image); next: $($next.image)"; return
@@ -93,9 +106,25 @@ try {
     if ($dragged.layout_token -eq $split.layout_token) { throw 'Real divider drag did not change layout' }
     $null = Invoke-Control @('pane', 'close', '--pane', $split.new_pane_id)
     if ($UiOnly) { Write-Output "UI control passed; artifacts: $caseDirectory"; return }
+    $null = Invoke-Control @('ui', 'key', '--window', 'w1', '--key', 'q', '--mod', 'ctrl', '--mod', 'alt')
+    $quick = @((Invoke-Control @('state')).windows | Where-Object window_id -ne 'w1')[0]
+    if (!$quick.window_id) { throw 'Quick terminal did not open through the UI action' }
+    $null = Invoke-Control @('tab', 'close', '--tab', $quick.active_tab_id)
+    $null = Invoke-Control @('ui', 'key', '--window', 'w1', '--key', 'q', '--mod', 'ctrl', '--mod', 'alt')
+    $replacement = @((Invoke-Control @('state')).windows | Where-Object window_id -ne 'w1')[0]
+    if (!$replacement.window_id -or $replacement.window_id -eq $quick.window_id) { throw 'Quick terminal reused a removed window ID' }
+    $staleWindow = & $Executable ctl state --window $quick.window_id --instance $instance[0].instance_id --json | ConvertFrom-Json
+    if ($staleWindow.ok) { throw 'Stale window ID resolved to the replacement' }
+    $null = Invoke-Control @('tab', 'close', '--tab', $replacement.active_tab_id)
     $capabilities = Invoke-Control @('capabilities')
     if (!$capabilities.'$defs'.terminal_step -or !$capabilities.operations[0].argument_schema) { throw 'Published protocol schema missing' }
     $null = Invoke-Control @('profiles')
+    $settings = Get-Content -LiteralPath (Join-Path $caseDirectory 'settings.json') -Raw | ConvertFrom-Json
+    $settings.terminal | Add-Member -NotePropertyName font_size_px -NotePropertyValue 18 -Force
+    $settings | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $caseDirectory 'settings.json') -Encoding utf8NoBOM
+    $null = Invoke-Control @('wait', '--window', 'w1', '--condition', 'settings-generation', '--at-least', '2', '--timeout', '10s')
+    $provenance = Invoke-Control @('state', '--pane', $pane)
+    if ($provenance.launch.settings_generation -ne '1' -or $provenance.effective_settings.font_size_px -ne 16 -or $provenance.effective_settings.bindings_generation -ne '2' -or !$provenance.title.observed_at -or !$provenance.terminal_status.value.cursor_visible) { throw 'State lost effective settings, title provenance, or terminal status' }
     $text = Invoke-Control @('pane', 'read', '--pane', $pane, '--tail', '100')
     if ($text.source -ne 'active_buffer_tail') { throw 'Read source mislabeled' }
     $bad = & $Executable ctl pane read --pane p999999 --instance $instance[0].instance_id --json | ConvertFrom-Json
@@ -139,10 +168,10 @@ try {
     if ($remaining.selected_pane_id -ne $backgroundPane) { throw 'Closing unselected panes changed selection' }
     $null = Invoke-Control @('tab', 'close', '--tab', $background.tab_id)
     $outcome = Invoke-Control @('state', '--pane', $backgroundPane)
-    if (!$outcome.removed_at -or !$outcome.final_tail.Contains($marker)) { throw 'Removed pane outcome unavailable' }
+    if (!$outcome.removed_at -or !$outcome.final_tail.Contains($marker) -or $outcome.removal_reason -ne 'tab_closed' -or !$outcome.output_cursor.Contains(":${backgroundPane}:")) { throw 'Removed pane outcome unavailable or uncorrelated' }
     $null = Invoke-Control @('wait', '--pane', $backgroundPane, '--condition', 'process-exited', '--timeout', '10s')
     $events = @(& $Executable ctl events --instance $instance[0].instance_id --json --timeout 2s | ForEach-Object { $_ | ConvertFrom-Json })
-    if ($events[0].type -ne 'state' -or $events[-1].type -ne 'end') { throw 'Event subscription did not deliver initial state and clean end' }
+    if ($events[0].type -ne 'state' -or $events[-1].type -ne 'end' -or $events[-1].protocol_version -ne 1) { throw 'Event subscription did not deliver initial state and clean end' }
     $saved = & $Executable ctl state --saved --data-dir $caseDirectory --instance $instance[0].instance_id --json | ConvertFrom-Json
     if (!$saved.ok -or $saved.result.source -ne 'saved') { throw 'Saved state unavailable' }
     $null = Invoke-Control @('tab', 'close', '--tab', $originalTab)

@@ -192,6 +192,40 @@ pub fn visibility(window: &gpui::Window) -> Value {
     }
     json!({"visible":null,"minimized":null})
 }
+pub fn pane_presentation(window: &gpui::Window, pane_id: &str) -> Value {
+    if let Some(data) = window.presented_metadata()
+        && let Ok(frame) = data.downcast::<Frame>()
+        && let Some(pane) = frame
+            .panes
+            .iter()
+            .find(|pane| pane.state["pane_id"] == pane_id)
+    {
+        return json!({"availability":"observed","frame_id":window.presented_frame_id().to_string(),"bounds":pane.state["computed_bounds"],"scene_revision":frame.scene_revision});
+    }
+    json!({"availability":"unavailable","reason":"pane absent from latest presented scene"})
+}
+
+fn operating_system() -> Value {
+    #[cfg(windows)]
+    {
+        use windows_sys::{
+            Wdk::System::SystemServices::RtlGetVersion,
+            Win32::System::SystemInformation::OSVERSIONINFOW,
+        };
+        let mut version = OSVERSIONINFOW {
+            dwOSVersionInfoSize: std::mem::size_of::<OSVERSIONINFOW>() as u32,
+            ..Default::default()
+        };
+        let status = unsafe { RtlGetVersion(&mut version) };
+        if status >= 0 {
+            json!({"platform":"windows","major":version.dwMajorVersion,"minor":version.dwMinorVersion,"build":version.dwBuildNumber})
+        } else {
+            json!({"platform":"windows","version":{"availability":"unavailable","ntstatus":status}})
+        }
+    }
+    #[cfg(not(windows))]
+    json!({"platform":std::env::consts::OS,"version":{"availability":"unavailable"}})
+}
 pub fn acquire_presented(
     request: &Request,
     window: &gpui::Window,
@@ -304,7 +338,7 @@ pub fn write(
             Ok(pixels) => {
                 let image = image::RgbaImage::from_raw(width, height, pixels)
                     .ok_or_else(|| std::io::Error::other("invalid readback dimensions"))?;
-                let image = if let Some(crop) = prepared.crop {
+                let image = if let Some(crop) = &prepared.crop {
                     let scale = prepared.frame.dpi_scale;
                     let x = (crop["x"].as_f64().unwrap() as f32 * scale).floor().max(0.) as u32;
                     let y = (crop["y"].as_f64().unwrap() as f32 * scale).floor().max(0.) as u32;
@@ -356,7 +390,7 @@ pub fn write(
                 None
             }
         };
-        let environment = json!({"build":{"mightty_version":env!("CARGO_PKG_VERSION"),"mightty_revision":env!("MIGHTTY_BUILD_REVISION"),"target":env!("MIGHTTY_BUILD_TARGET"),"profile":env!("MIGHTTY_BUILD_PROFILE"),"ghostty_headers":env!("MIGHTTY_GHOSTTY_HEADERS"),"embedded_fonts":env!("MIGHTTY_FONT_FINGERPRINTS"),"ghostty_revision":crate::ghostty::SOURCE_REVISION,"gpui_version":"0.2.2 with local capture patch","debug_assertions":cfg!(debug_assertions)},"os":std::env::consts::OS,"backend":"Direct3D11","color":{"source":"BGRA8 UNORM","export":"RGBA8 PNG","conversion":"lossless channel swizzle; no color correction"},"dpi_scale":prepared.frame.dpi_scale,"frame_effective_settings":prepared.frame.window["settings"],"gpu":prepared.frame.window["gpu"],"current_settings_generations":state["windows"].as_array().map(|windows|windows.iter().map(|window|json!({"window_id":window["window_id"],"generation":window["settings_generation"]})).collect::<Vec<_>>()),"launch_recipes":prepared.frame.panes.iter().map(|pane|&pane.state["launch"]).collect::<Vec<_>>()});
+        let environment = json!({"build":{"mightty_version":env!("CARGO_PKG_VERSION"),"mightty_revision":env!("MIGHTTY_BUILD_REVISION"),"target":env!("MIGHTTY_BUILD_TARGET"),"profile":env!("MIGHTTY_BUILD_PROFILE"),"ghostty_headers":env!("MIGHTTY_GHOSTTY_HEADERS"),"embedded_fonts":env!("MIGHTTY_FONT_FINGERPRINTS"),"ghostty_revision":crate::ghostty::SOURCE_REVISION,"gpui_version":"0.2.2 with local capture patch","debug_assertions":cfg!(debug_assertions)},"os":operating_system(),"backend":"Direct3D11","color":{"source":"BGRA8 UNORM","export":"RGBA8 PNG","conversion":"lossless channel swizzle; no color correction"},"dpi_scale":prepared.frame.dpi_scale,"frame_effective_settings":prepared.frame.window["settings"],"gpu":prepared.frame.window["gpu"],"current_settings_generations":state["windows"].as_array().map(|windows|windows.iter().map(|window|json!({"window_id":window["window_id"],"generation":window["settings_generation"]})).collect::<Vec<_>>()),"launch_recipes":prepared.frame.panes.iter().map(|pane|&pane.state["launch"]).collect::<Vec<_>>()});
         for (name, value) in [
             (
                 "frame.json",
@@ -430,7 +464,9 @@ pub fn write(
         } else {
             "partial"
         };
-        let manifest = json!({"schema_version":1,"protocol_version":1,"instance_id":request.instance_id,"request_id":request.request_id,"target":request.target,"mode":prepared.mode,"frame_id":if prepared.mode=="offscreen" {format!("offscreen:{}",request.request_id)} else {frame_id.to_string()},"resource_cost":retention,"readback_ns":readback_ns,"frame_revision":prepared.frame.scene_revision,"frame_revision_domain":"window_scene","live_revision":state["revision"],"live_revision_domain":"application","frame_time_unix_ms":timestamp.to_string(),"frame_age_ms":crate::feedback::unix_timestamp_ms().saturating_sub(timestamp).to_string(),"visibility":prepared.visibility,"dimensions":dimensions,"dpi_scale":prepared.frame.dpi_scale,"artifacts":statuses,"diagnostics":{"observed_at":prepared.diagnostics_observed_at,"limit":128,"count":prepared.diagnostics.len(),"range":{"first":prepared.diagnostics.first().map(|v|&v["time"]),"last":prepared.diagnostics.last().map(|v|&v["time"])},"truncated":prepared.diagnostics.len()==128},"output_cursors":prepared.frame.panes.iter().map(|pane|&pane.state["output_cursor"]).collect::<Vec<_>>(),"shaping":{"availability":"unavailable","reason":"GPUI does not retain face and glyph cluster diagnostics"},"source_cells":{"max_cells_per_pane":20000,"max_cells_per_frame":40000,"omitted_pane_ids":prepared.frame.panes.iter().filter(|pane|pane.source.is_none()).map(|pane|&pane.state["pane_id"]).collect::<Vec<_>>()},"status":status,"errors":errors});
+        let mut manifest = json!({"schema_version":1,"protocol_version":1,"instance_id":request.instance_id,"request_id":request.request_id,"target":request.target,"mode":prepared.mode,"frame_id":if prepared.mode=="offscreen" {format!("offscreen:{}",request.request_id)} else {frame_id.to_string()},"resource_cost":retention,"readback_ns":readback_ns,"frame_revision":prepared.frame.scene_revision,"frame_revision_domain":if prepared.mode=="offscreen"{"offscreen_preparation"}else{"window_scene"},"live_revision":state["revision"],"live_revision_domain":"application","frame_time_unix_ms":timestamp.to_string(),"frame_age_ms":crate::feedback::unix_timestamp_ms().saturating_sub(timestamp).to_string(),"visibility":prepared.visibility,"dimensions":dimensions,"dpi_scale":prepared.frame.dpi_scale,"artifacts":statuses,"diagnostics":{"observed_at":prepared.diagnostics_observed_at,"limit":128,"count":prepared.diagnostics.len(),"range":{"first":prepared.diagnostics.first().map(|v|&v["time"]),"last":prepared.diagnostics.last().map(|v|&v["time"])},"truncated":prepared.diagnostics.len()==128},"output_cursors":prepared.frame.panes.iter().map(|pane|&pane.state["output_cursor"]).collect::<Vec<_>>(),"shaping":{"availability":"unavailable","reason":"GPUI does not retain face and glyph cluster diagnostics"},"source_cells":{"max_cells_per_pane":20000,"max_cells_per_frame":40000,"omitted_pane_ids":prepared.frame.panes.iter().filter(|pane|pane.source.is_none()).map(|pane|&pane.state["pane_id"]).collect::<Vec<_>>()},"status":status,"errors":errors});
+        manifest["crop_bounds_logical"] = prepared.crop.clone().unwrap_or(Value::Null);
+        manifest["source_frame_dimensions"] = json!({"width":width,"height":height});
         std::fs::write(
             temporary.join("manifest.json"),
             serde_json::to_vec_pretty(&manifest).map_err(std::io::Error::other)?,

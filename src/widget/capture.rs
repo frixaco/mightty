@@ -75,19 +75,6 @@ impl TerminalWidget {
         state["pending_paste_confirmation"] = serde_json::json!(self.pending_paste.is_some());
         state["selection_coordinates"] =
             serde_json::json!(self.terminal.selection_coordinates().ok().flatten());
-        state["effective_settings"] = serde_json::json!({"font_family":self.config.font_family,"font_size_px":self.config.font_size_px,"cursor_style":format!("{:?}",self.config.cursor_style),"cursor_blink":self.config.cursor_blink,"blink_interval_ms":self.config.blink_interval.as_millis().to_string(),"scrollback":self.config.scrollback,"theme":format!("{:?}",self.theme),"clipboard_policy":format!("{:?}",self.config.terminal_clipboard_policy),"action_bindings":self.config.action_bindings});
-        state["launch"]["inherit_environment"] =
-            serde_json::json!(self.config.launch.inherit_environment);
-        state["launch"]["unset_environment"] = serde_json::json!(
-            self.config
-                .launch
-                .unset_environment
-                .iter()
-                .map(|v| v.to_string_lossy())
-                .collect::<Vec<_>>()
-        );
-        state["launch"]["shell_integration"] =
-            serde_json::json!(self.config.launch.shell_integration);
         state["launch"]["environment_values"] = serde_json::json!(
             self.config
                 .launch
@@ -128,17 +115,31 @@ impl TerminalWidget {
     pub fn control_state(&self) -> serde_json::Value {
         use serde_json::json;
         let bounds = self.layout_bounds.map(|b| json!({"x":f32::from(b.origin.x),"y":f32::from(b.origin.y),"width":f32::from(b.size.width),"height":f32::from(b.size.height)}));
-        json!({"title":{"reported":self.reported_title,"normalized":crate::shell_integration::display_title(self.reported_title.as_deref())},
-            "working_directory":{"configured":self.config.launch.working_directory,"reported":self.reported_working_directory},
+        let filtered = self
+            .reported_title
+            .as_deref()
+            .unwrap_or("")
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(128)
+            .collect::<String>();
+        let status = self.terminal.diagnostic_status().map_or_else(
+            |error| json!({"availability":"unavailable","reason":error.to_string()}),
+            |status| json!({"availability":"observed","value":status}),
+        );
+        json!({"title":{"reported":self.reported_title,"normalized":crate::shell_integration::display_title(self.reported_title.as_deref()),"observed_at":self.title_observed_at,"source":"ghostty_osc_title","source_limit_bytes":2047,"normalization":{"removed_controls":self.reported_title.as_ref().is_some_and(|title|title.chars().any(char::is_control)),"limited_to_128_scalars":self.reported_title.as_ref().is_some_and(|title|title.chars().filter(|c|!c.is_control()).count()>128),"trimmed":filtered.trim()!=filtered}},
+            "working_directory":{"configured":self.config.launch.working_directory,"reported":self.reported_working_directory,"observed_at":self.directory_observed_at,"resolved_local":self.workspace_working_directory(),"source":if self.reported_working_directory.is_none(){"configured"}else if self.reported_local_working_directory().is_some(){"shell_local"}else{"shell_remote_untrusted_or_absent"}},
             "launch":{"executable":self.config.launch.executable,"argv":self.config.launch.arguments.iter().map(|v|v.to_string_lossy()).collect::<Vec<_>>(),
-                "environment_names":self.config.launch.environment.keys().map(|v|v.to_string_lossy()).collect::<Vec<_>>()},
+                "settings_generation":self.config.settings_generation.map(|v|v.to_string()),"inherit_environment":self.config.launch.inherit_environment,"unset_environment":self.config.launch.unset_environment.iter().map(|v|v.to_string_lossy()).collect::<Vec<_>>(),"shell_integration":self.config.launch.shell_integration,"environment_values":{"availability":"omitted","reason":"live metadata exposes configured names only"},"environment_names":self.config.launch.environment.keys().map(|v|v.to_string_lossy()).collect::<Vec<_>>()},
+            "effective_settings":{"font_family":self.config.font_family,"font_size_px":self.config.font_size_px,"cursor_style":self.config.cursor_style,"cursor_blink":self.config.cursor_blink,"blink_interval_ms":self.config.blink_interval.as_millis().to_string(),"scrollback":self.config.scrollback,"theme":{"foreground":u32::from(self.theme.foreground),"background":u32::from(self.theme.background),"cursor":u32::from(self.theme.cursor),"selection":u32::from(self.theme.selection),"palette":self.theme.palette.map(u32::from)},"clipboard_policy":self.config.terminal_clipboard_policy,"action_bindings":self.config.action_bindings,"live_applied_fields":["action_bindings"],"bindings_generation":self.bindings_generation.map(|v|v.to_string())},
+            "terminal_status":status,"integration":{"availability":if self.semantic_commands_available{"observed"}else{"unavailable"},"prompt_phase":if self.semantic_commands_available{self.terminal.cursor_at_prompt().ok()}else{None}},
             "terminal_size":{"cols":self.size.0,"rows":self.size.1},"computed_bounds":bounds,
             "pty_size":self.pty_tx.as_ref().and_then(|tx|tx.acknowledged_size()).map(|s|json!({"cols":s.cols,"rows":s.rows})),
             "output_seq":self.output_seq.to_string(),"output_cursor":format!("{}:{}",crate::control::instance_id(),self.output_seq),
             "lifecycle":if self.has_exited {"output_ended"} else {"running"},"output_eof":self.output_eof,"io_error":self.io_error,"processes":self.pty_worker.as_ref().and_then(|worker|worker.root_process()).map(|root|root.state()).unwrap_or(serde_json::json!({"availability":"unavailable"})),
             "font":{"family":self.config.font_family,"size_px":self.config.font_size_px},
             "viewport":self.terminal.scrollbar().ok().map(|s|json!({"offset":s.offset,"length":s.len,"total":s.total})),
-            "selection":self.has_selection(),"search_open":self.search.is_some(),"search":self.search.as_ref().map(|search|json!({"query":search.query,"progress":format!("{:?}",search.progress),"matches":search.ranges.len(),"diagnostic":search.diagnostic}))})
+            "selection":self.has_selection(),"selection_coordinates":self.terminal.selection_coordinates().ok().flatten(),"search_open":self.search.is_some(),"search":self.search.as_ref().map(|search|json!({"query":search.query,"progress":format!("{:?}",search.progress),"matches":search.ranges.len(),"diagnostic":search.diagnostic}))})
     }
 
     pub fn control_read(

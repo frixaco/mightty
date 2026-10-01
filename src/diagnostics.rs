@@ -132,7 +132,7 @@ pub fn record_control(request: &crate::control::Request, response: &Value) {
     if logs.len() == 128 {
         logs.pop_front();
     }
-    logs.push_back(json!({"time":timestamp(),"subsystem":"control","severity":if response["ok"]==true{"info"}else{"error"},"code":"control_outcome","request_id":request.request_id,"instance_id":request.instance_id,"op":request.op,"target":request.target,"ok":response["ok"],"error_code":response["error"]["code"],"effect":response["error"]["effect"]}));
+    logs.push_back(json!({"time":timestamp(),"subsystem":"control","severity":if response["ok"]==true{"info"}else{"error"},"code":"control_outcome","request_id":request.request_id,"instance_id":request.instance_id,"op":request.op,"target":request.target,"ok":response["ok"],"error_code":response["error"]["code"],"message":response["error"]["message"].as_str().map(|message|message.chars().take(1024).collect::<String>()),"effect":response["error"]["effect"],"written_bytes":response["result"]["completion"]["written_bytes"],"completed_steps":response["result"]["completion"]["completed_steps"]}));
     mark_dirty();
 }
 
@@ -180,7 +180,7 @@ impl Writer {
                     // The journal does not continuously copy pane contents or output counters.
                     if let Some(windows)=metadata["windows"].as_array_mut(){for window in windows {if let Some(tabs)=window["tabs"].as_array_mut(){for tab in tabs {if let Some(panes)=tab["panes"].as_array_mut(){for pane in panes {if let Some(object)=pane.as_object_mut(){object.remove("output_seq");object.remove("output_cursor");object.remove("cursor");object.remove("viewport");}}}}}}}
                     if let Some(outcomes)=metadata["outcomes"].as_array_mut(){for outcome in outcomes {if let Some(object)=outcome.as_object_mut(){object.remove("final_tail");}}}
-                    metadata.as_object_mut().unwrap().remove("observed_at");metadata.as_object_mut().unwrap().remove("revision");metadata.as_object_mut().unwrap().remove("persistence");metadata.as_object_mut().unwrap().remove("diagnostics");
+                    metadata.as_object_mut().unwrap().remove("observed_at");metadata.as_object_mut().unwrap().remove("uptime_ms");metadata.as_object_mut().unwrap().remove("revision");metadata.as_object_mut().unwrap().remove("persistence");metadata.as_object_mut().unwrap().remove("diagnostics");
                     if metadata!=previous {writeln!(file,"{}",json!({"schema_version":1,"time":timestamp(),"revision":state["revision"],"kind":"metadata_changed","state":metadata}))?;previous=metadata;}
                     let logs=recent();
                     let start=last_log.as_ref().and_then(|last|logs.iter().position(|log|log==last)).map_or(0,|i|i+1);

@@ -37,8 +37,8 @@ pub use search::{SearchDirection, SearchPoint, SearchProgress, SearchRange};
 pub use selection::{SelectionDrag, SelectionGeometry, SelectionPoint, SelectionPress};
 pub use semantic::PromptDirection;
 pub use terminal::{
-    ClipboardContent, ClipboardLocation, ClipboardWrite, ClipboardWriteResult, Scrollbar, Terminal,
-    TerminalOptions, ViewportScroll,
+    ClipboardContent, ClipboardLocation, ClipboardWrite, ClipboardWriteResult, DiagnosticStatus,
+    Scrollbar, Terminal, TerminalOptions, ViewportScroll,
 };
 
 /// Exact Ghostty source revision compiled into this build.

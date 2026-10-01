@@ -240,7 +240,7 @@ impl SettingsStore {
                 Err(SettingsError::new(format!("cannot read settings: {error}"))),
             ),
         };
-        let (current, diagnostic) = match resolved {
+        let (mut current, diagnostic) = match resolved {
             Ok(settings) => (settings, None),
             Err(error) => {
                 let fallback = resolve_user_settings(
@@ -259,6 +259,15 @@ impl SettingsStore {
             }
         };
 
+        current.terminal.settings_generation = Some(1);
+        if let Some(diagnostic) = &diagnostic {
+            crate::diagnostics::record(
+                "settings",
+                "startup_rejected",
+                &diagnostic.to_string(),
+                serde_json::json!({"path":path}),
+            );
+        }
         Self {
             path,
             current,
@@ -297,10 +306,11 @@ impl SettingsStore {
         self.last_observation = observation;
         self.last_discovered = discovered;
         match resolved {
-            Ok(settings) => {
+            Ok(mut settings) => {
+                self.generation = self.generation.saturating_add(1);
+                settings.terminal.settings_generation = Some(self.generation);
                 self.current = settings;
                 self.diagnostic = None;
-                self.generation = self.generation.saturating_add(1);
                 ReloadOutcome::Applied {
                     generation: self.generation,
                 }
@@ -1156,7 +1166,7 @@ mod tests {
             }}"#,
             executable = executable.to_string_lossy()
         );
-        fs::write(&path, valid).unwrap();
+        fs::write(&path, &valid).unwrap();
         let mut store = SettingsStore::open(path.clone());
         let generation = store.generation();
         let font_size = store.current().terminal.font_size_px;
@@ -1167,8 +1177,25 @@ mod tests {
             ReloadOutcome::Rejected(_)
         ));
         assert_eq!(store.generation(), generation);
+        assert_eq!(
+            store.current().terminal.settings_generation,
+            Some(generation)
+        );
         assert_eq!(store.current().terminal.font_size_px, font_size);
         assert!(store.diagnostic().is_some());
+        fs::write(
+            &path,
+            valid.replace("\"font_size_px\": 19", "\"font_size_px\": 20"),
+        )
+        .unwrap();
+        assert!(matches!(
+            store.reload_if_changed(),
+            ReloadOutcome::Applied { .. }
+        ));
+        assert_eq!(
+            store.current().terminal.settings_generation,
+            Some(store.generation())
+        );
 
         fs::remove_dir_all(directory).unwrap();
     }

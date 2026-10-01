@@ -391,7 +391,7 @@ impl ControlServer {
                                                             Ok(value)=>value,
                                                             Err(flume::RecvTimeoutError::Disconnected)=>return Ok(()),
                                                             Err(_) if stop.load(Ordering::Acquire)=>return Ok(()),
-                                                            Err(_) if Instant::now()>=deadline=>serde_json::json!({"type":"end","revision":last_revision}),
+                                                            Err(_) if Instant::now()>=deadline=>serde_json::json!({"protocol_version":crate::control::PROTOCOL_VERSION,"instance_id":descriptor.instance_id,"type":"end","revision":last_revision}),
                                                             Err(_)=>continue,
                                                         };
                                                         if value["type"] == "resync_required" {value["last_delivered_revision"]=last_revision.clone();}

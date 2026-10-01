@@ -50,6 +50,19 @@ pub struct Scrollbar {
     pub len: u64,
 }
 
+/// Current terminal input modes and cursor, independent of render snapshots.
+#[derive(serde::Serialize)]
+pub struct DiagnosticStatus {
+    pub cursor_x: u16,
+    pub cursor_y: u16,
+    pub cursor_visible: bool,
+    pub cursor_pending_wrap: bool,
+    pub alternate_buffer: bool,
+    pub bracketed_paste: bool,
+    pub mouse_tracking: bool,
+    pub kitty_keyboard_flags: u8,
+}
+
 /// Clipboard destination requested by terminal output.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ClipboardLocation {
@@ -193,6 +206,23 @@ impl Terminal {
 
     pub fn mouse_tracking(&self) -> Result<bool> {
         unsafe { self.get_unchecked(ffi::TerminalData::MOUSE_TRACKING) }
+    }
+
+    pub fn diagnostic_status(&self) -> Result<DiagnosticStatus> {
+        Ok(DiagnosticStatus {
+            cursor_x: unsafe { self.get_unchecked(ffi::TerminalData::CURSOR_X) }?,
+            cursor_y: unsafe { self.get_unchecked(ffi::TerminalData::CURSOR_Y) }?,
+            cursor_visible: unsafe { self.get_unchecked(ffi::TerminalData::CURSOR_VISIBLE) }?,
+            cursor_pending_wrap: unsafe {
+                self.get_unchecked(ffi::TerminalData::CURSOR_PENDING_WRAP)
+            }?,
+            alternate_buffer: self.active_buffer_is_alternate()?,
+            bracketed_paste: self.bracketed_paste()?,
+            mouse_tracking: self.mouse_tracking()?,
+            kitty_keyboard_flags: unsafe {
+                self.get_unchecked(ffi::TerminalData::KITTY_KEYBOARD_FLAGS)
+            }?,
+        })
     }
 
     pub fn bracketed_paste(&self) -> Result<bool> {

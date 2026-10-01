@@ -510,10 +510,15 @@ impl Split {
         );
     }
 
-    pub fn set_action_bindings(&self, bindings: &[ActionBinding], cx: &mut Context<Self>) {
+    pub fn set_action_bindings(
+        &self,
+        bindings: &[ActionBinding],
+        generation: u64,
+        cx: &mut Context<Self>,
+    ) {
         for pane in self.panes.values() {
             pane.terminal.update(cx, |terminal, _cx| {
-                terminal.set_action_bindings(bindings.to_vec())
+                terminal.set_action_bindings(bindings.to_vec(), generation)
             });
         }
     }

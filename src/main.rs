@@ -64,6 +64,8 @@ fn main() {
 }
 
 struct TerminalWindow {
+    #[cfg(windows)]
+    id: String,
     handle: WindowHandle<Root>,
     panes: gpui::Entity<PaneContainer>,
 }
@@ -126,7 +128,12 @@ fn open_terminal_window(
                 .detach();
         })
     });
-    TerminalWindow { handle, panes }
+    TerminalWindow {
+        #[cfg(windows)]
+        id: panes.read(cx).window_id().to_owned(),
+        handle,
+        panes,
+    }
 }
 
 fn load_embedded_fonts(cx: &mut App) {
@@ -334,11 +341,18 @@ fn start_windows_application(
 
     let diagnostic_writer =
         mightty::diagnostics::Writer::start(&control_server.descriptor().instance_id);
+    let settings = SettingsStore::open_default();
+    let quick_settings = if isolated {
+        settings.current().app.quick_terminal.clone()
+    } else {
+        QuickTerminalSettings::default()
+    };
+    let last_focused_window = normal_window.id.clone();
     let controller = Rc::new(RefCell::new(WindowsApplication {
         normal_window,
         quick_window: None,
-        settings: SettingsStore::open_default(),
-        quick_settings: QuickTerminalSettings::default(),
+        settings,
+        quick_settings,
         activation_tx: (!embedding).then_some(activation_tx),
         primary_instance,
         global_hotkey: None,
@@ -348,10 +362,11 @@ fn start_windows_application(
         diagnostic_writer,
         diagnostic_state: serde_json::Value::Null,
         started_at: mightty::diagnostics::timestamp(),
+        started: std::time::Instant::now(),
         last_persistence: std::time::Instant::now() - Duration::from_secs(1),
         persistence_pending: true,
         subscribers: Vec::new(),
-        last_focused_window: "w1".into(),
+        last_focused_window,
         replace_initial_handoff_tab: embedding,
         shutting_down: false,
     }));
@@ -488,6 +503,7 @@ struct WindowsApplication {
     diagnostic_writer: mightty::diagnostics::Writer,
     diagnostic_state: serde_json::Value,
     started_at: String,
+    started: std::time::Instant,
     last_persistence: std::time::Instant,
     persistence_pending: bool,
     subscribers: Vec<flume::Sender<serde_json::Value>>,
@@ -509,21 +525,21 @@ impl WindowsApplication {
         }
         let mut windows = Vec::new();
         for (id, handle, panes) in std::iter::once((
-            "w1",
+            self.normal_window.id.clone(),
             self.normal_window.handle,
             self.normal_window.panes.clone(),
         ))
         .chain(
             self.quick_window
                 .as_ref()
-                .map(|w| ("w2", w.handle, w.panes.clone())),
+                .map(|w| (w.id.clone(), w.handle, w.panes.clone())),
         ) {
             if let Ok(mut state) =
                 handle.update(cx, |_, window, cx| panes.read(cx).control_state(window, cx))
             {
                 state["window_id"] = json!(id);
                 if state["os_focused"] == true {
-                    self.last_focused_window = id.into();
+                    self.last_focused_window = id;
                 }
                 windows.push(state);
             }
@@ -536,7 +552,7 @@ impl WindowsApplication {
         if changed || force {
             self.persistence_pending = true;
             self.control_revision += 1;
-            self.diagnostic_state = json!({"schema_version":1,"instance_id":mightty::control::instance_id(),"pid":std::process::id(),"started_at":self.started_at,"observed_at":mightty::diagnostics::timestamp(),"revision":self.control_revision.to_string(),"source":"live","orderly_shutdown":false,"last_focused_window_id":self.last_focused_window,"build":{"mightty_version":env!("CARGO_PKG_VERSION"),"ghostty_revision":mightty::ghostty::SOURCE_REVISION},"windows":windows,"outcomes":outcomes,"diagnostics":logs,"persistence":self.diagnostic_writer.status()});
+            self.diagnostic_state = json!({"schema_version":1,"instance_id":mightty::control::instance_id(),"pid":std::process::id(),"started_at":self.started_at,"uptime_ms":self.started.elapsed().as_millis().to_string(),"observed_at":mightty::diagnostics::timestamp(),"revision":self.control_revision.to_string(),"source":"live","orderly_shutdown":false,"last_focused_window_id":self.last_focused_window,"build":{"mightty_version":env!("CARGO_PKG_VERSION"),"mightty_revision":env!("MIGHTTY_BUILD_REVISION"),"target":env!("MIGHTTY_BUILD_TARGET"),"profile":env!("MIGHTTY_BUILD_PROFILE"),"ghostty_revision":mightty::ghostty::SOURCE_REVISION},"windows":windows,"outcomes":outcomes,"diagnostics":logs,"persistence":self.diagnostic_writer.status()});
             mightty::snapshot::publish_state(self.diagnostic_state.clone());
             let event = json!({"protocol_version":1,"instance_id":mightty::control::instance_id(),"revision":self.control_revision.to_string(),"type":"change","changes":[{"kind":"windows_changed","windows":self.diagnostic_state["windows"]},{"kind":"outcomes_changed","outcomes":self.diagnostic_state["outcomes"]},{"kind":"diagnostics_changed","diagnostics":self.diagnostic_state["diagnostics"]}]});
             self.subscribers.retain(|sender|{if sender.len()>=31 {let _=sender.try_send(json!({"protocol_version":1,"instance_id":mightty::control::instance_id(),"revision":self.control_revision.to_string(),"type":"resync_required"}));false}else{sender.try_send(event.clone()).is_ok()}});
@@ -622,12 +638,12 @@ impl WindowsApplication {
             ));
         }
         let mut windows = vec![(
-            "w1",
+            self.normal_window.id.clone(),
             self.normal_window.handle,
             self.normal_window.panes.clone(),
         )];
         if let Some(quick) = &self.quick_window {
-            windows.push(("w2", quick.handle, quick.panes.clone()));
+            windows.push((quick.id.clone(), quick.handle, quick.panes.clone()));
         }
         windows.retain(|(_, handle, _)| handle.is_active(cx).is_some());
         if request.op == "state"
@@ -670,8 +686,8 @@ impl WindowsApplication {
         let active = windows
             .iter()
             .find(|(_, handle, _)| handle.is_active(cx) == Some(true))
-            .map(|(id, _, _)| *id)
-            .unwrap_or(&self.last_focused_window);
+            .map(|(id, _, _)| id.clone())
+            .unwrap_or_else(|| self.last_focused_window.clone());
         let targets = windows
             .into_iter()
             .filter(|(id, _, panes)| {
@@ -679,7 +695,7 @@ impl WindowsApplication {
                     .target
                     .window_id
                     .as_ref()
-                    .is_none_or(|w| w == *id || (w == "active" && *id == active))
+                    .is_none_or(|w| w == id || (w == "active" && *id == active))
                     && (request.target.window_id.is_some()
                         || (request.target.tab_id.as_deref() != Some("active")
                             && request.target.pane_id.as_deref() != Some("active"))

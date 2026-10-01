@@ -61,7 +61,7 @@ struct PaletteState {
 }
 
 pub struct PaneContainer {
-    window_id: &'static str,
+    window_id: String,
     content_bounds: Option<gpui::Bounds<gpui::Pixels>>,
     layout_input: Option<(gpui::Size<gpui::Pixels>, bool)>,
     control_acks: Vec<flume::Receiver<crate::control::Acknowledgement>>,
@@ -225,16 +225,21 @@ impl PaneContainer {
         }
     }
 
+    pub fn window_id(&self) -> &str {
+        &self.window_id
+    }
+
     pub fn control_state(&self, window: &Window, cx: &gpui::App) -> serde_json::Value {
         use serde_json::json;
         json!({"bounds":{"width":f32::from(window.viewport_size().width),"height":f32::from(window.viewport_size().height)},
+            "visibility":crate::snapshot::visibility(window),
             "layout_token":self.window_layout_token(window,cx),
             "dpi_scale":window.scale_factor(),"os_focused":window.is_window_active(),
             "active_tab_id":format!("t{}",self.tabs[self.active_tab_index].id.value()),
             "sidebar_visible":self.sidebar_visible,"palette_open":self.palette.is_some(),"palette":self.palette.as_ref().map(|palette|json!({"query":palette.query,"selected":palette.selected})),"settings_generation":self.settings.generation().to_string(),
-            "tabs":self.tabs.iter().map(|tab| {let split=tab.split.read(cx);json!({"tab_id":format!("t{}",tab.id.value()),"title":tab.title,"fallback_title":tab.default_title,
+            "tabs":self.tabs.iter().enumerate().map(|(index,tab)| {let split=tab.split.read(cx);json!({"tab_id":format!("t{}",tab.id.value()),"title":tab.title,"fallback_title":tab.default_title,"title_provenance":self.title_provenance(index,cx),
                 "selected_pane_id":format!("p{}",split.active_pane_id().value()),"zoomed_pane_id":split.zoomed_pane_id().map(|p|format!("p{}",p.value())),"topology":control::topology(split.topology()),"layout_token":split.layout_token(tab.id),
-                "panes":split.pane_entities().map(|(id,profile,terminal)|{let mut state=terminal.read(cx).control_state();state["pane_id"]=json!(format!("p{}",id.value()));state["profile_id"]=json!(profile.as_str());state["output_cursor"]=json!(format!("{}:p{}:{}",crate::control::instance_id(),id.value(),state["output_seq"].as_str().unwrap()));state}).collect::<Vec<_>>()})}).collect::<Vec<_>>()})
+                "panes":split.pane_entities().map(|(id,profile,terminal)|{let mut state=terminal.read(cx).control_state();let pane_id=format!("p{}",id.value());state["last_presented"]=crate::snapshot::pane_presentation(window,&pane_id);state["pane_id"]=json!(pane_id);state["profile_id"]=json!(profile.as_str());state["output_cursor"]=json!(format!("{}:p{}:{}",crate::control::instance_id(),id.value(),state["output_seq"].as_str().unwrap()));state}).collect::<Vec<_>>()})}).collect::<Vec<_>>()})
     }
 
     pub fn control_dispatch(
@@ -251,7 +256,7 @@ impl PaneContainer {
                 if request.target.tab_id.is_none() && request.target.pane_id.is_none() {return Ok(self.control_state(window,cx));}
                 let (index,pane,terminal)=self.control_target(&request.target,cx)?;
                 if request.target.pane_id.is_none() {return Ok(self.control_state(window,cx)["tabs"][index].clone());}
-                let mut result=terminal.read(cx).control_state();result["tab_id"]=json!(format!("t{}",self.tabs[index].id.value()));result["pane_id"]=json!(format!("p{}",pane.value()));result["output_cursor"]=json!(format!("{}:p{}:{}",crate::control::instance_id(),pane.value(),result["output_seq"].as_str().unwrap()));Ok(result)
+                let mut result=terminal.read(cx).control_state();let pane_id=format!("p{}",pane.value());result["last_presented"]=crate::snapshot::pane_presentation(window,&pane_id);result["tab_id"]=json!(format!("t{}",self.tabs[index].id.value()));result["pane_id"]=json!(pane_id);result["output_cursor"]=json!(format!("{}:p{}:{}",crate::control::instance_id(),pane.value(),result["output_seq"].as_str().unwrap()));Ok(result)
             }
             "pane.read" => {let (index,pane,terminal)=self.targeted_terminal(request,cx)?;let mut result=terminal.update(cx,|terminal,_|terminal.control_read(request))?;
                 result["tab_id"]=json!(format!("t{}",self.tabs[index].id.value()));result["pane_id"]=json!(format!("p{}",pane.value()));result["output_cursor"]=json!(format!("{}:p{}:{}",crate::control::instance_id(),pane.value(),result["output_seq"].as_str().unwrap()));Ok(result)}
@@ -288,8 +293,12 @@ impl PaneContainer {
             (config, profile_id, title, resolved.app.sidebar_visible)
         };
         let (exit_tx, exit_rx) = flume::unbounded();
-        let window_id = if titlebar_visible { "w1" } else { "w2" };
-        let tab = Self::create_tab(config, profile_id, title, window_id, exit_tx.clone(), cx);
+        static NEXT_WINDOW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let window_id = format!(
+            "w{}",
+            NEXT_WINDOW.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let tab = Self::create_tab(config, profile_id, title, &window_id, exit_tx.clone(), cx);
 
         let workspace_store = WorkspaceStore::open_default();
         let workspace_ids = workspace_store.list().unwrap_or_default();
@@ -512,7 +521,7 @@ impl PaneContainer {
         let pane_id = crate::split::PaneId::allocate();
         Self::identify_launch(
             &mut config,
-            self.window_id,
+            &self.window_id,
             self.tabs[self.active_tab_index].id,
             pane_id,
         );
@@ -576,7 +585,7 @@ impl PaneContainer {
             config,
             profile_id.clone(),
             profile.label.clone(),
-            self.window_id,
+            &self.window_id,
             self.exit_tx.clone(),
             cx,
         );
@@ -714,7 +723,7 @@ impl PaneContainer {
                         ));
                     }
                 }
-                Self::identify_launch(&mut config, self.window_id, id, pane_id);
+                Self::identify_launch(&mut config, &self.window_id, id, pane_id);
                 let terminal = Self::create_terminal(config, self.exit_tx.clone(), cx);
                 runtime_panes.push((pane_id, terminal, profile_id));
             }
@@ -766,7 +775,12 @@ impl PaneContainer {
         let pane_count = split.read(cx).pane_count();
 
         if pane_count > 1 {
-            self.retain_pane(self.active_tab_index, split.read(cx).active_pane_id(), cx);
+            self.retain_pane(
+                self.active_tab_index,
+                split.read(cx).active_pane_id(),
+                "pane_closed",
+                cx,
+            );
             let pane_to_focus = split.update(cx, |split, cx| split.remove_active_pane(window, cx));
             if let Some(pane) = pane_to_focus {
                 pane.update(cx, |pane, _cx| pane.request_focus(window));
@@ -817,9 +831,10 @@ impl PaneContainer {
                             let settings = this.settings.current();
                             this.sidebar_visible = settings.app.sidebar_visible;
                             let bindings = settings.key_bindings.clone();
+                            let generation = this.settings.generation();
                             for tab in &this.tabs {
                                 tab.split.update(cx, |split, cx| {
-                                    split.set_action_bindings(&bindings, cx)
+                                    split.set_action_bindings(&bindings, generation, cx)
                                 });
                             }
                             cx.notify();
@@ -859,7 +874,7 @@ impl PaneContainer {
                     .find(|(_, _, terminal)| terminal.entity_id() == pane_id)
                     .map(|(id, _, _)| id);
                 if let Some(id) = id {
-                    self.retain_pane(index, id, cx);
+                    self.retain_pane(index, id, "output_ended", cx);
                 }
                 let removed = split.update(cx, |split, _cx| split.remove_pane_by_entity(pane_id));
                 removed_any |= removed.is_some();

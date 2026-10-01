@@ -97,6 +97,7 @@ fn launch_context(launch: &LaunchSpec) -> serde_json::Value {
 #[derive(Debug, Clone)]
 pub struct TerminalConfig {
     pub launch: LaunchSpec,
+    pub settings_generation: Option<u64>,
     pub initial_rows: u16,
     pub initial_cols: u16,
     pub scrollback: usize,
@@ -114,6 +115,7 @@ impl Default for TerminalConfig {
     fn default() -> Self {
         Self {
             launch: LaunchSpec::default_shell(),
+            settings_generation: None,
             initial_rows: 30,
             initial_cols: 100,
             scrollback: 10000,
@@ -172,7 +174,10 @@ pub struct TerminalWidget {
     terminal_clipboard_writes: Rc<RefCell<Vec<String>>>,
     terminal_effects: Rc<RefCell<PendingTerminalEffects>>,
     reported_title: Option<String>,
+    title_observed_at: Option<String>,
     reported_working_directory: Option<Option<String>>,
+    directory_observed_at: Option<String>,
+    bindings_generation: Option<u64>,
     semantic_commands_available: bool,
     theme: TerminalTheme,
     has_exited: bool,
@@ -379,6 +384,7 @@ impl TerminalWidget {
         let size = (config.initial_cols, config.initial_rows);
 
         let has_exited = exit_flag.load(Ordering::Relaxed);
+        let bindings_generation = config.settings_generation;
 
         let mut widget = Self {
             terminal,
@@ -423,7 +429,10 @@ impl TerminalWidget {
             terminal_clipboard_writes,
             terminal_effects,
             reported_title: None,
+            title_observed_at: None,
             reported_working_directory: None,
+            directory_observed_at: None,
+            bindings_generation,
             semantic_commands_available: false,
             theme,
             has_exited,
@@ -466,8 +475,9 @@ impl TerminalWidget {
         &self.focus_handle
     }
 
-    pub(crate) fn set_action_bindings(&mut self, bindings: Vec<ActionBinding>) {
+    pub(crate) fn set_action_bindings(&mut self, bindings: Vec<ActionBinding>, generation: u64) {
         self.config.action_bindings = bindings;
+        self.bindings_generation = Some(generation);
     }
 
     pub(crate) fn has_selection(&self) -> bool {
@@ -782,6 +792,7 @@ impl TerminalWidget {
             match title {
                 Ok(title) => {
                     self.reported_title = title.clone();
+                    self.title_observed_at = Some(crate::diagnostics::timestamp());
                     cx.emit(TerminalEvent::TitleChanged(title));
                 }
                 Err(error) => crate::diagnostics::record(
@@ -796,6 +807,7 @@ impl TerminalWidget {
             match working_directory {
                 Ok(working_directory) => {
                     self.reported_working_directory = Some(working_directory.clone());
+                    self.directory_observed_at = Some(crate::diagnostics::timestamp());
                     cx.emit(TerminalEvent::WorkingDirectoryChanged(working_directory));
                 }
                 Err(error) => crate::diagnostics::record(

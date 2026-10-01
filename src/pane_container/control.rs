@@ -6,6 +6,16 @@ use crate::{
 use serde_json::{Value, json};
 
 impl PaneContainer {
+    pub(super) fn title_provenance(&self, index: usize, cx: &gpui::App) -> Value {
+        let tab = &self.tabs[index];
+        let split = tab.split.read(cx);
+        let selected = split.active_pane_id();
+        let normalized = split.terminal(selected).and_then(|terminal| {
+            crate::shell_integration::display_title(terminal.read(cx).reported_title())
+        });
+        let from_shell = normalized.as_deref() == Some(tab.title.as_str());
+        json!({"source":if from_shell{"selected_pane"}else if tab.title==tab.default_title{"profile_or_restored_fallback"}else{"retained_tab_title"},"source_pane_id":from_shell.then(||format!("p{}",selected.value())),"fallback_reason":(tab.title==tab.default_title&&!from_shell).then_some("selected pane has no matching normalized title")})
+    }
     pub fn receiving_focus(&self, window: &Window, cx: &gpui::App) -> Value {
         if self.palette_focus.contains_focused(window, cx) {
             return json!({"kind":"palette","window_id":self.window_id});
@@ -54,7 +64,7 @@ impl PaneContainer {
         cx: &gpui::App,
     ) -> Result<Request, ControlError> {
         let mut request = request.clone();
-        request.target.window_id = Some(self.window_id.into());
+        request.target.window_id = Some(self.window_id.clone());
         if request.target.pane_id.is_some() {
             let (index, pane, _) = self.targeted_terminal(&request, cx)?;
             request.target.tab_id = Some(format!("t{}", self.tabs[index].id.value()));
@@ -121,13 +131,13 @@ impl PaneContainer {
             .retain(|id, _| self.tabs.iter().any(|tab| tab.id.value() == *id));
         if self.sidebar_visible && index == self.active_tab_index && target.is_none() {
             for (index, tab) in self.tabs.iter().enumerate() {
-                labels.push(json!({"tab_id":format!("t{}",tab.id.value()),"chosen_title":tab.title,"fallback_title":tab.default_title,"decorated_label":tab.title,"badge":if tab.bell_pending{format!("{}•",index+1)}else{(index+1).to_string()},"geometry":self.label_geometry.borrow().get(&tab.id.value()),"measured_extents":{"availability":"unavailable"}}));
+                labels.push(json!({"tab_id":format!("t{}",tab.id.value()),"chosen_title":tab.title,"fallback_title":tab.default_title,"provenance":self.title_provenance(index,cx),"decorated_label":tab.title,"badge":if tab.bell_pending{format!("{}•",index+1)}else{(index+1).to_string()},"geometry":self.label_geometry.borrow().get(&tab.id.value()),"measured_extents":{"availability":"unavailable"}}));
             }
         }
         std::sync::Arc::new(crate::snapshot::Frame {
             schema_version: 1,
             instance_id: control::instance_id().into(),
-            window_id: self.window_id.into(),
+            window_id: self.window_id.clone(),
             scene_revision: revision.to_string(),
             prepared_at: crate::diagnostics::timestamp(),
             dpi_scale: window.scale_factor(),
@@ -176,6 +186,7 @@ impl PaneContainer {
         crate::snapshot::validate_size(size, window.scale_factor())?;
         let mut frame = self.presentation_tab(index, target, 0, window, cx);
         let owned = std::sync::Arc::get_mut(&mut frame).unwrap();
+        owned.scene_revision = format!("offscreen:{}", request.request_id);
         owned.labels.clear();
         owned.window["palette"] = Value::Null;
         owned.window["sidebar_visible"] = json!(false);
@@ -199,12 +210,34 @@ impl PaneContainer {
             diagnostics_observed_at: crate::diagnostics::timestamp(),
         })
     }
-    pub(super) fn retain_pane(&self, index: usize, pane: PaneId, cx: &mut Context<Self>) {
+    pub(super) fn retain_pane(
+        &self,
+        index: usize,
+        pane: PaneId,
+        reason: &str,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(terminal) = self.tabs[index].split.read(cx).terminal(pane) {
             let mut state = terminal.read(cx).control_state();
             state["window_id"] = json!(self.window_id);
             state["tab_id"] = json!(format!("t{}", self.tabs[index].id.value()));
             state["pane_id"] = json!(format!("p{}", pane.value()));
+            state["removal_reason"] = json!(reason);
+            if reason == "output_ended" {
+                state["removal_reason"] = json!(if !state["io_error"].is_null() {
+                    "io_failed"
+                } else if state["output_eof"] == true {
+                    "output_eof"
+                } else {
+                    "pty_worker_stopped"
+                });
+            }
+            state["output_cursor"] = json!(format!(
+                "{}:p{}:{}",
+                control::instance_id(),
+                pane.value(),
+                state["output_seq"].as_str().unwrap()
+            ));
             let root = terminal.read(cx).control_root_process();
             let mut request = control::request(
                 &control::Descriptor {
@@ -387,7 +420,7 @@ impl PaneContainer {
                 .retain(|key, _| !key.eq_ignore_ascii_case(std::ffi::OsStr::new(name)));
             config.launch.environment.insert(name.into(), value.into());
         }
-        Self::identify_launch(&mut config, self.window_id, tab, pane);
+        Self::identify_launch(&mut config, &self.window_id, tab, pane);
         Ok((config, profile, label))
     }
 
@@ -428,7 +461,7 @@ impl PaneContainer {
             .map(|(id, _, _)| id)
             .collect::<Vec<_>>();
         for pane in panes {
-            self.retain_pane(index, pane, cx);
+            self.retain_pane(index, pane, "tab_closed", cx);
         }
         self.tabs.remove(index);
         if self.tabs.is_empty() {
@@ -712,7 +745,7 @@ impl PaneContainer {
                             return Ok(self.close_tab_target(index, window, cx));
                         }
                         let selected = split.read(cx).active_pane_id() == pane_id;
-                        self.retain_pane(index, pane_id, cx);
+                        self.retain_pane(index, pane_id, "pane_closed", cx);
                         split.update(cx, |s, _| s.remove_pane(pane_id));
                         if selected && index == self.active_tab_index {
                             self.needs_focus = true;

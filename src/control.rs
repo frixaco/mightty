@@ -572,6 +572,8 @@ pub fn capabilities() -> Value {
     json!({"protocol_version": PROTOCOL_VERSION, "operations": OPERATIONS.iter().map(|(op,args)|
         json!({"op":op,"arguments":args,"argument_schema":{"type":"object","properties":args.iter().map(|name|((*name).to_string(),argument_schema(op,name))).collect::<BTreeMap<_,_>>(),"required":required_arguments(op),"additionalProperties":false},"result_schema":result_schema(op),"error_schema":{"$ref":"#/$defs/error"},"availability":if cfg!(windows){"supported"}else{"unsupported"}})).collect::<Vec<_>>(), "platform":std::env::consts::OS,
         "$defs":{
+            "request":{"type":"object","required":["protocol_version","request_id","instance_id","op","target","args","preconditions","timeout_ms"],"properties":{"protocol_version":{"const":1},"request_id":{"type":"string","minLength":1,"maxLength":128},"instance_id":{"type":"string"},"op":{"enum":OPERATIONS.iter().map(|(op,_)|*op).collect::<Vec<_>>()},"target":{"type":"object","properties":{"window_id":{"type":["string","null"]},"tab_id":{"type":["string","null"]},"pane_id":{"type":["string","null"]}},"additionalProperties":false},"args":{"type":"object","description":"Validated against the selected operation argument_schema"},"preconditions":{"type":"object","properties":{"layout_token":{"type":["string","null"]}},"additionalProperties":false},"timeout_ms":{"type":"integer","minimum":1,"maximum":60000}},"additionalProperties":false},
+            "event":{"type":"object","required":["protocol_version","instance_id","revision","type"],"properties":{"protocol_version":{"const":1},"instance_id":{"type":"string"},"revision":{"type":["string","null"]},"type":{"enum":["state","change","resync_required","end"]},"changes":{"type":"array","items":{"type":"object","required":["kind"]}},"state":{"type":"object"},"last_delivered_revision":{"type":["string","null"]}}},
             "error":{"type":"object","required":["code","message","effect","details"],"properties":{"code":{"type":"string"},"message":{"type":"string"},"effect":{"enum":["none","committed","partial","unknown"]},"details":{"type":"object"}}},
             "terminal_step":{"oneOf":[{"type":"object","required":["type","text"],"properties":{"type":{"const":"text"},"text":{"type":"string"}},"additionalProperties":false},{"type":"object","required":["type","key"],"properties":{"type":{"const":"key"},"key":{"type":"string"},"modifiers":{"type":"array","items":{"enum":["ctrl","alt","shift","super"]}},"event":{"enum":["tap","press","repeat","release"]}},"additionalProperties":false}]},
             "ui_step":{"oneOf":[{"$ref":"#/$defs/terminal_step"},{"type":"object","required":["type","event","x","y"],"properties":{"type":{"const":"pointer"},"event":{"enum":["move","press","release","wheel"]},"x":{"type":"number"},"y":{"type":"number"},"button":{"enum":["left","right","middle"]},"modifiers":{"type":"array","items":{"enum":["ctrl","alt","shift","super"]}},"delta_x":{"type":"number"},"delta_y":{"type":"number"}},"additionalProperties":false}]},
@@ -681,7 +683,7 @@ pub fn cli(arguments: Vec<String>) -> i32 {
                     "{}",
                     json!({"protocol_version":PROTOCOL_VERSION,"request_id":null,
                 "instance_id":null,"revision":null,"ok":false,
-                "error":{"code":"client_error","effect":"none","message":error}})
+                "error":{"code":"client_error","effect":"none","message":error,"details":{}}})
                 );
             } else {
                 eprintln!("{error}");
@@ -744,7 +746,9 @@ fn run_cli(arguments: Vec<String>) -> Result<Value, String> {
             })
             .map_err(|e| e.to_string())?;
         if request.op == "instances" {
-            return Ok(json!({"protocol_version":PROTOCOL_VERSION,"ok":true,"result":descriptors}));
+            return Ok(
+                json!({"protocol_version":PROTOCOL_VERSION,"request_id":request.request_id,"instance_id":null,"revision":null,"ok":true,"result":descriptors}),
+            );
         }
         let descriptor = if let Some(instance) = instance {
             descriptors

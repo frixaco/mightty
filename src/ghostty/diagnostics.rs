@@ -290,6 +290,12 @@ mod tests {
         assert!(rows.rows.len() > 2);
         assert_eq!(rows.rows[0].cells[1].text, " ");
         assert_eq!(terminal.scrollbar().unwrap(), before);
+        let status = terminal.diagnostic_status().unwrap();
+        assert!(!status.bracketed_paste);
+        terminal.vt_write(b"\x1b[?2004h\x1b[?25l");
+        let status = terminal.diagnostic_status().unwrap();
+        assert!(status.bracketed_paste);
+        assert!(!status.cursor_visible);
         let limited = terminal.diagnostic_rows(false, 100, 1, &colors).unwrap();
         assert!(limited.truncated);
         assert!(limited.rows.is_empty());
