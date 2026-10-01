@@ -11,8 +11,14 @@ use super::TerminalWidget;
 use super::render::CellWidthExt;
 
 impl TerminalWidget {
-    pub fn capture_cell_count(&self) -> usize {
-        usize::from(self.size.0) * usize::from(self.size.1)
+    pub fn capture_cell_count(&self, offscreen: bool) -> usize {
+        let size = self
+            .painted_terminal(offscreen)
+            .as_ref()
+            .map(|painted| painted.frame.size)
+            .or_else(|| self.committed.as_ref().map(|frame| frame.size))
+            .unwrap_or(self.size);
+        usize::from(size.0) * usize::from(size.1)
     }
     pub fn geometry_ready(&self) -> bool {
         self.pty_tx
@@ -27,21 +33,13 @@ impl TerminalWidget {
         offscreen: bool,
         include_source: bool,
     ) -> crate::snapshot::PaneFrame {
-        let key = format!(
-            "{:?}",
-            (
-                self.output_seq,
-                offscreen,
-                self.size,
-                self.terminal.scrollbar().ok().map(|s| s.offset),
-                self.terminal.selection_coordinates().ok(),
-                &self.config.font_family,
-                self.config.font_size_px,
-                self.cell_size,
-                &self.theme
-            )
-        );
-        let source = if !include_source || self.capture_cell_count() > 20000 {
+        let frame = self
+            .painted_terminal(offscreen)
+            .as_ref()
+            .map(|painted| painted.frame.clone())
+            .or_else(|| self.committed.clone());
+        let key = frame.as_ref().map_or(0, |frame| frame.revision).to_string();
+        let source = if !include_source || self.capture_cell_count(offscreen) > 20000 {
             self.capture_cache = None;
             None
         } else {
@@ -50,10 +48,9 @@ impl TerminalWidget {
                 .as_ref()
                 .is_none_or(|(old, _)| *old != key)
             {
-                self.capture_cache = self
-                    .build_feedback_capture(offscreen)
-                    .ok()
-                    .map(|capture| (key, std::sync::Arc::new(capture)));
+                self.capture_cache = frame
+                    .as_ref()
+                    .map(|frame| (key, std::sync::Arc::new(feedback_capture(frame))));
             }
             self.capture_cache
                 .as_ref()
@@ -69,12 +66,37 @@ impl TerminalWidget {
         ] {
             state.as_object_mut().unwrap().remove(field);
         }
-        state["focus_appearance"] = serde_json::json!(self.focus_handle.is_focused(window));
-        state["cursor_phase"] = serde_json::json!(self.cursor_blink_phase);
-        state["preedit"] = serde_json::json!(self.preedit);
+        let painted = self.painted_terminal(offscreen);
+        state["focus_appearance"] = serde_json::json!(painted.map_or_else(
+            || self.focus_handle.is_focused(window),
+            |painted| painted.focused
+        ));
+        state["cursor_phase"] = serde_json::json!(
+            painted.map_or(self.cursor_blink_phase, |painted| painted.cursor_phase)
+        );
+        if let Some(frame) = &frame {
+            state["output_seq"] = serde_json::json!(frame.output_seq.to_string());
+            state["output_cursor"] = serde_json::json!(format!(
+                "{}:{}",
+                crate::control::instance_id(),
+                frame.output_seq
+            ));
+            state["terminal_size"] = serde_json::json!({"cols":frame.size.0,"rows":frame.size.1});
+            state["viewport"] = serde_json::json!({"offset":frame.scrollbar.offset,"length":frame.scrollbar.len,"total":frame.scrollbar.total});
+            state["terminal_status"] = serde_json::json!({"source":"committed_presentation","value":{"cursor_visible":frame.cursor.visible,"cursor":frame.cursor.position.map(|p| (p.x,p.y)),"cursor_footprint":frame.cursor_footprint(),"cursor_shape":format!("{:?}",frame.cursor.shape),"cursor_blinking":frame.cursor.blinking,"alternate_buffer":frame.alternate}});
+            state["selection"] = serde_json::json!(frame.selection.is_some());
+            state["presentation_revision"] = serde_json::json!(frame.revision.to_string());
+            state["font"] =
+                serde_json::json!({"family":frame.font_family,"size_px":frame.font_size_px});
+        }
+        state["preedit"] = serde_json::json!(
+            painted.map_or(self.preedit.as_str(), |painted| painted.preedit.as_str())
+        );
+        state["composing"] =
+            serde_json::json!(painted.map_or(self.composing, |painted| painted.composing));
         state["pending_paste_confirmation"] = serde_json::json!(self.pending_paste.is_some());
         state["selection_coordinates"] =
-            serde_json::json!(self.terminal.selection_coordinates().ok().flatten());
+            serde_json::json!(frame.as_ref().and_then(|frame| frame.selection));
         state["launch"]["environment_values"] = serde_json::json!(
             self.config
                 .launch
@@ -86,8 +108,20 @@ impl TerminalWidget {
                 ))
                 .collect::<std::collections::BTreeMap<_, _>>()
         );
-        state["painter"] = serde_json::json!({"font_features":format!("{:?}",super::render::terminal_font_features()),"fallback_chain":format!("{:?}",super::render::terminal_font_fallbacks(&self.config.font_family)),"resolved_font_faces":{"availability":"unavailable","reason":"GPUI does not retain face/cluster diagnostics for this surface"}});
+        let family = frame
+            .as_ref()
+            .map_or(self.config.font_family.as_str(), |frame| {
+                frame.font_family.as_str()
+            });
+        state["painter"] = serde_json::json!({"font_features":format!("{:?}",super::render::terminal_font_features()),"fallback_chain":format!("{:?}",super::render::terminal_font_fallbacks(family)),"resolved_font_faces":{"availability":"unavailable","reason":"GPUI does not retain face/cluster diagnostics for this surface"}});
         crate::snapshot::PaneFrame { state, source }
+    }
+    fn painted_terminal(&self, offscreen: bool) -> Option<&super::presentation::PaintedTerminal> {
+        if offscreen {
+            self.offscreen_painted.as_ref()
+        } else {
+            self.painted.as_ref()
+        }
     }
     pub fn control_root_process(&self) -> Option<crate::diagnostics::RootProcess> {
         self.pty_worker
@@ -125,7 +159,7 @@ impl TerminalWidget {
             .collect::<String>();
         let status = self.terminal.diagnostic_status().map_or_else(
             |error| json!({"availability":"unavailable","reason":error.to_string()}),
-            |status| json!({"availability":"observed","value":status}),
+            |status| json!({"availability":"observed","source":"live_terminal","value":status}),
         );
         json!({"title":{"reported":self.reported_title,"normalized":crate::shell_integration::display_title(self.reported_title.as_deref()),"observed_at":self.title_observed_at,"source":"ghostty_osc_title","source_limit_bytes":2047,"normalization":{"removed_controls":self.reported_title.as_ref().is_some_and(|title|title.chars().any(char::is_control)),"limited_to_128_scalars":self.reported_title.as_ref().is_some_and(|title|title.chars().filter(|c|!c.is_control()).count()>128),"trimmed":filtered.trim()!=filtered}},
             "working_directory":{"configured":self.config.launch.working_directory,"reported":self.reported_working_directory,"observed_at":self.directory_observed_at,"resolved_local":self.workspace_working_directory(),"source":if self.reported_working_directory.is_none(){"configured"}else if self.reported_local_working_directory().is_some(){"shell_local"}else{"shell_remote_untrusted_or_absent"}},
@@ -139,7 +173,7 @@ impl TerminalWidget {
             "lifecycle":if self.has_exited {"output_ended"} else {"running"},"output_eof":self.output_eof,"io_error":self.io_error,"processes":self.pty_worker.as_ref().and_then(|worker|worker.root_process()).map(|root|root.state()).unwrap_or(serde_json::json!({"availability":"unavailable"})),
             "font":{"family":self.config.font_family,"size_px":self.config.font_size_px},
             "viewport":self.terminal.scrollbar().ok().map(|s|json!({"offset":s.offset,"length":s.len,"total":s.total})),
-            "selection":self.has_selection(),"selection_coordinates":self.terminal.selection_coordinates().ok().flatten(),"search_open":self.search.is_some(),"search":self.search.as_ref().map(|search|json!({"query":search.query,"progress":format!("{:?}",search.progress),"matches":search.ranges.len(),"diagnostic":search.diagnostic}))})
+            "selection":self.terminal.has_selection().ok(),"selection_coordinates":self.terminal.selection_coordinates().ok().flatten(),"search_open":self.search.is_some(),"search":self.search.as_ref().map(|search|json!({"query":search.query,"progress":format!("{:?}",search.progress),"matches":search.ranges.len(),"diagnostic":search.diagnostic}))})
     }
 
     pub fn control_read(
@@ -207,94 +241,95 @@ impl TerminalWidget {
         Ok(
             serde_json::json!({"text":text,"rows":rows,"buffer":if alternate {"alternate"}else{"primary"},
             "output_seq":self.output_seq.to_string(),"row_start":start,"row_end":start+count,"total_rows":total,
-            "source":if viewport {"active_buffer_viewport"}else{"active_buffer_tail"},"truncation":{"omitted_rows":total-count,"reason":if observation.truncated {Some("byte_limit")}else if count<total {Some("requested_range")} else {None}},"terminal_size":{"cols":self.size.0,"rows":self.size.1}}),
+            "source":if viewport {"active_buffer_viewport"}else{"active_buffer_tail"},"state_source":"live_terminal","truncation":{"omitted_rows":total-count,"reason":if observation.truncated {Some("byte_limit")}else if count<total {Some("requested_range")} else {None}},"terminal_size":{"cols":self.size.0,"rows":self.size.1}}),
         )
     }
     pub fn build_feedback_capture(
         &mut self,
-        offscreen: bool,
+        _offscreen: bool,
     ) -> crate::ghostty::Result<TerminalCapture> {
-        // Observation must not alter the painter's reusable dirty snapshot.
-        let mut state = crate::ghostty::RenderState::new()?;
-        let mut row_iterator = crate::ghostty::render::RowIterator::new()?;
-        let mut cell_iterator = crate::ghostty::render::CellIterator::new()?;
-        let snapshot = if offscreen {
-            state.observe(&self.terminal)?
-        } else {
-            self.render_state.current()
-        };
-        let colors = snapshot.colors()?;
+        let frame = self
+            .committed
+            .as_ref()
+            .ok_or(crate::ghostty::Error::InvalidValue)?;
+        Ok(feedback_capture(frame))
+    }
+}
 
-        let mut rows = Vec::new();
-        let mut row_it = row_iterator.update(&snapshot)?;
-        let mut row_idx = 0u16;
-        while let Some(row) = row_it.next() {
+pub(super) fn feedback_capture(frame: &super::presentation::TerminalFrame) -> TerminalCapture {
+    let colors = &frame.colors;
+    let rows = frame
+        .rows
+        .iter()
+        .enumerate()
+        .map(|(index, row)| {
             let mut row_text = String::new();
-            let mut cells = Vec::new();
-            let mut cell_it = cell_iterator.update(row)?;
-            let mut col_idx = 0u16;
-            while let Some(cell) = cell_it.next() {
-                let width = cell.width()?;
-                let advance = width.column_advance();
-                let text = cell.text()?;
-                let continuation = matches!(width, CellWidth::SpacerTail | CellWidth::SpacerHead);
-                if !continuation {
-                    row_text.push_str(if text.is_empty() { " " } else { &text });
-                }
-
-                let fg = cell.fg_color()?.unwrap_or(colors.foreground);
-                let bg = cell.bg_color()?;
-                let style = cell.style()?;
-                cells.push(CaptureCell {
-                    col: col_idx,
-                    width: advance,
-                    continuation,
-                    text,
-                    fg: rgb_hex(fg),
-                    bg: bg.map(rgb_hex),
-                    bold: style.bold,
-                    italic: style.italic,
-                    underline: underline_name(style.underline).to_string(),
-                    inverse: style.inverse,
-                    strikethrough: style.strikethrough,
-                });
-                col_idx += 1;
-            }
-
-            rows.push(CaptureRow {
-                index: row_idx,
-                wrapped: self.terminal.viewport_row_wrapped(row_idx)?,
+            let cells = row
+                .cells
+                .iter()
+                .enumerate()
+                .map(|(column, cell)| {
+                    let advance = cell.width.column_advance();
+                    let continuation =
+                        matches!(cell.width, CellWidth::SpacerTail | CellWidth::SpacerHead);
+                    if !continuation {
+                        row_text.push_str(if cell.text.is_empty() {
+                            " "
+                        } else {
+                            &cell.text
+                        });
+                    }
+                    CaptureCell {
+                        col: column as u16,
+                        width: advance,
+                        continuation,
+                        text: cell.text.clone(),
+                        fg: rgb_hex(cell.foreground.unwrap_or(colors.foreground)),
+                        bg: cell.background.map(rgb_hex),
+                        bold: cell.style.bold,
+                        italic: cell.style.italic,
+                        underline: underline_name(cell.style.underline).into(),
+                        inverse: cell.style.inverse,
+                        strikethrough: cell.style.strikethrough,
+                    }
+                })
+                .collect();
+            CaptureRow {
+                index: index as u16,
+                wrapped: row.wrapped,
                 text: row_text,
                 cells,
-            });
-            row_idx += 1;
-        }
-
-        Ok(TerminalCapture {
-            captured_unix_ms: feedback::unix_timestamp_ms(),
-            terminal_size: GridSize {
-                cols: self.size.0,
-                rows: self.size.1,
-            },
-            cell_size_px: SizePx {
-                width: self.cell_size.0.into(),
-                height: self.cell_size.1.into(),
-            },
-            font: FontCapture {
-                family: self.config.font_family.clone(),
-                size_px: self.config.font_size_px,
-            },
-            colors: CaptureColors {
-                foreground: rgb_hex(colors.foreground),
-                background: rgb_hex(colors.background),
-                cursor: colors.cursor.map(rgb_hex),
-            },
-            cursor: snapshot.cursor_viewport()?.map(|cursor| CaptureCursor {
+            }
+        })
+        .collect();
+    TerminalCapture {
+        captured_unix_ms: feedback::unix_timestamp_ms(),
+        terminal_size: GridSize {
+            cols: frame.size.0,
+            rows: frame.size.1,
+        },
+        cell_size_px: SizePx {
+            width: frame.cell_size.0.into(),
+            height: frame.cell_size.1.into(),
+        },
+        font: FontCapture {
+            family: frame.font_family.clone(),
+            size_px: frame.font_size_px,
+        },
+        colors: CaptureColors {
+            foreground: rgb_hex(colors.foreground),
+            background: rgb_hex(colors.background),
+            cursor: colors.cursor.map(rgb_hex),
+        },
+        cursor: frame
+            .cursor
+            .position
+            .filter(|_| frame.cursor.visible)
+            .map(|cursor| CaptureCursor {
                 x: cursor.x,
                 y: cursor.y,
             }),
-            rows,
-        })
+        rows,
     }
 }
 

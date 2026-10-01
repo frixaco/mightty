@@ -13,8 +13,11 @@ mightty has one terminal-engine upstream: the Ghostty source pinned by the
 - The rest of `src/ghostty/` is mightty's project-owned safe Rust interface.
 
 Zig `0.16.0` is a build tool here. It compiles the pinned Ghostty source into
-the native library. mightty does not call Zig APIs, maintain a separate Zig
-wrapper, or require Zig at runtime.
+the native library. Zig is not required at runtime. The small local bridge at
+`tools/ghostty-search/` adapts pinned Ghostty search/observation internals and
+counts synchronized-output starts using Ghostty's exported parser functions.
+It has no second terminal engine or ANSI parser. Its header is included in
+binding generation alongside the upstream public headers.
 
 ```text
 mightty widget code
@@ -71,6 +74,14 @@ or support dynamic linking.
 - A render `Snapshot` mutably borrows its `RenderState`.
 - Row and cell iterations are lending iterators. Their returned views cannot
   outlive the snapshot, row, or reusable iterator storage that C references.
+- `src/widget/presentation.rs` is the sole presentation builder: it copies cells,
+  colors, protocol cursor, selection, search highlights, viewport and geometry,
+  plus owned graphics references, before atomically publishing an immutable frame.
+  Painters, IME anchors and capture use owned frame data. Raw diagnostic reads use
+  a separate non-consuming observation path and are labeled live.
+- Mode 2026 gates publication while parsing/input/replies continue. One-second
+  generation-safe recovery resets the actual mode; resize/reset/EOF also release
+  holds. A failed frame build retains the prior frame and retryable dirty work.
 - Raw C types and functions never leave the private `ffi` module.
 - Tests compare every struct reported by `ghostty_type_json()` with Rust's
   target-native size, alignment, fields, and offsets.
@@ -93,9 +104,11 @@ zig build
   -Doptimize=<Cargo-derived mode>
 ```
 
-Development builds use Zig `Debug`; ordinary release builds use
-`ReleaseFast`; size-optimized Cargo profiles use `ReleaseSmall`. Set `ZIG` to
-choose a Zig executable.
+Development builds use Zig `ReleaseSafe`, with ordinary runtime safety enabled
+and Ghostty's slow page integrity audits disabled. `--features ghostty-debug`
+opts into Zig `Debug` and those audits. Ordinary release builds use
+`ReleaseFast`; size-optimized Cargo profiles use `ReleaseSmall`. Captures report
+the native mode as `ghostty_optimize`. Set `ZIG` to choose a Zig executable.
 
 On Windows the build script copies `ghostty-vt-static.lib` into an isolated
 link directory under Cargo's `OUT_DIR` before linking. This prevents Rust's

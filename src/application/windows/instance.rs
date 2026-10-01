@@ -296,7 +296,7 @@ impl Drop for ConnectionCount {
 impl ControlServer {
     pub fn start(sender: flume::Sender<crate::control::Dispatch>) -> io::Result<Self> {
         let identity = ProcessIdentity::current()?;
-        let creation = process_creation_time(unsafe { GetCurrentProcess() })?;
+        let creation = live_process_creation_time(unsafe { GetCurrentProcess() })?;
         let instance_id = format!("{}-{creation}", std::process::id());
         let descriptor = crate::control::Descriptor {
             protocol_version: crate::control::PROTOCOL_VERSION,
@@ -519,8 +519,18 @@ fn control_pipe_name(identity: &ProcessIdentity, instance_id: &str) -> String {
     )
 }
 
-fn process_creation_time(process: HANDLE) -> io::Result<String> {
-    use windows_sys::Win32::{Foundation::FILETIME, System::Threading::GetProcessTimes};
+fn live_process_creation_time(process: HANDLE) -> io::Result<String> {
+    use windows_sys::Win32::{
+        Foundation::{FILETIME, STILL_ACTIVE},
+        System::Threading::{GetExitCodeProcess, GetProcessTimes},
+    };
+    let mut exit_code = 0;
+    if unsafe { GetExitCodeProcess(process, &mut exit_code) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if exit_code != STILL_ACTIVE as u32 {
+        return Err(io::Error::other("process has exited"));
+    }
     let mut times = [FILETIME::default(); 4];
     if unsafe {
         GetProcessTimes(
@@ -581,7 +591,7 @@ pub fn discover_control_instances(
             continue;
         }
         let handle = OwnedHandle::new(handle);
-        if process_creation_time(handle.raw()).ok().as_ref()
+        if live_process_creation_time(handle.raw()).ok().as_ref()
             != Some(&descriptor.process_creation_time)
         {
             continue;
@@ -883,6 +893,17 @@ impl Drop for OwnedHandle {
 mod tests {
     use super::*;
     use std::mem::size_of_val;
+    #[test]
+    fn exited_process_with_a_retained_handle_is_not_a_live_instance() {
+        use std::os::windows::io::AsRawHandle;
+        assert!(live_process_creation_time(unsafe { GetCurrentProcess() }).is_ok());
+        let mut child = std::process::Command::new("cmd.exe")
+            .args(["/D", "/C", "exit 7"])
+            .spawn()
+            .unwrap();
+        child.wait().unwrap();
+        assert!(live_process_creation_time(child.as_raw_handle()).is_err());
+    }
 
     #[test]
     fn instance_names_include_session_user_and_protocol_version() {

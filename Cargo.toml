@@ -7,6 +7,10 @@ edition = "2024"
 name = "mightty"
 path = "src/lib.rs"
 
+[features]
+# Opt into Ghostty's expensive page integrity audits when debugging its core.
+ghostty-debug = []
+
 [[bin]]
 name = "mightty"
 path = "src/main.rs"

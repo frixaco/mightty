@@ -3034,6 +3034,9 @@ unsafe extern "C" {
 unsafe extern "C" {
     pub fn mightty_ghostty_render_observe(state: RenderState, terminal: Terminal) -> Result::Type;
 }
+unsafe extern "C" {
+    pub fn mightty_ghostty_vt_write(terminal: Terminal, data: *const u8, len: usize) -> u64;
+}
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct MighttyGhosttySearchImpl {

@@ -22,6 +22,8 @@ pub struct Terminal {
     pub(crate) next_control_search: u64,
     selection_gesture: SelectionGesture,
     callbacks: Box<CallbackState>,
+    sync_generation: u64,
+    write_revision: u64,
     _not_send_or_sync: PhantomData<Rc<()>>,
 }
 
@@ -56,6 +58,7 @@ pub struct DiagnosticStatus {
     pub cursor_x: u16,
     pub cursor_y: u16,
     pub cursor_visible: bool,
+    pub synchronized_output: bool,
     pub cursor_pending_wrap: bool,
     pub alternate_buffer: bool,
     pub bracketed_paste: bool,
@@ -138,6 +141,8 @@ impl Terminal {
             next_control_search: 1,
             selection_gesture,
             callbacks: Box::new(CallbackState::default()),
+            sync_generation: 0,
+            write_revision: 0,
             _not_send_or_sync: PhantomData,
         };
         let userdata = std::ptr::from_mut(terminal.callbacks.as_mut()).cast::<c_void>();
@@ -146,9 +151,46 @@ impl Terminal {
     }
 
     pub fn vt_write(&mut self, data: &[u8]) {
-        unsafe {
-            ffi::ghostty_terminal_vt_write(self.as_raw(), data.as_ptr(), data.len());
-        }
+        self.write_revision = self.write_revision.wrapping_add(1);
+        self.sync_generation = self.sync_generation.wrapping_add(unsafe {
+            ffi::mightty_ghostty_vt_write(self.as_raw(), data.as_ptr(), data.len())
+        });
+    }
+
+    pub fn synchronized_output(&self) -> Result<bool> {
+        self.mode(2026)
+    }
+    pub fn sync_generation(&self) -> u64 {
+        self.sync_generation
+    }
+    pub fn write_revision(&self) -> u64 {
+        self.write_revision
+    }
+    pub fn end_synchronized_output(&mut self) -> Result<()> {
+        let config = ffi::TerminalModeConfig {
+            mode: 2026,
+            value: false,
+        };
+        self.set_raw_pointer(
+            ffi::TerminalOption::MODE,
+            std::ptr::from_ref(&config).cast(),
+        )
+    }
+    pub fn set_default_cursor(
+        &mut self,
+        shape: super::render::CursorShape,
+        blinking: bool,
+    ) -> Result<&mut Self> {
+        let shape = shape.into_raw();
+        self.set_raw_pointer(
+            ffi::TerminalOption::DEFAULT_CURSOR_STYLE,
+            std::ptr::from_ref(&shape).cast(),
+        )?;
+        self.set_raw_pointer(
+            ffi::TerminalOption::DEFAULT_CURSOR_BLINK,
+            std::ptr::from_ref(&blinking).cast(),
+        )?;
+        Ok(self)
     }
 
     pub fn resize(
@@ -213,6 +255,7 @@ impl Terminal {
             cursor_x: unsafe { self.get_unchecked(ffi::TerminalData::CURSOR_X) }?,
             cursor_y: unsafe { self.get_unchecked(ffi::TerminalData::CURSOR_Y) }?,
             cursor_visible: unsafe { self.get_unchecked(ffi::TerminalData::CURSOR_VISIBLE) }?,
+            synchronized_output: self.synchronized_output()?,
             cursor_pending_wrap: unsafe {
                 self.get_unchecked(ffi::TerminalData::CURSOR_PENDING_WRAP)
             }?,
@@ -800,6 +843,14 @@ mod tests {
         terminal.vt_write(b"\x1b[5n");
 
         assert_eq!(responses.borrow().as_slice(), b"\x1b[0n");
+        responses.borrow_mut().clear();
+        terminal.vt_write(b"\x1b[?2026$p\x1b[?2026h\x1b[?2026$p");
+        terminal.end_synchronized_output().unwrap();
+        terminal.vt_write(b"\x1b[?2026$p");
+        assert_eq!(
+            responses.borrow().as_slice(),
+            b"\x1b[?2026;2$y\x1b[?2026;1$y\x1b[?2026;2$y"
+        );
     }
 
     #[test]

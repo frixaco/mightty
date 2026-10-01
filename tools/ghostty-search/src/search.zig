@@ -3,6 +3,33 @@ const terminal = @import("terminal/main.zig");
 const terminal_c = @import("terminal/c/terminal.zig");
 const render_c = @import("terminal/c/render.zig");
 
+extern fn ghostty_terminal_vt_write(terminal_c.Terminal, [*]const u8, usize) void;
+extern fn ghostty_terminal_vt_write_until_ground(terminal_c.Terminal, [*]const u8, usize, *usize) c_int;
+
+fn write(raw: terminal_c.Terminal, ptr: [*]const u8, len: usize) callconv(.c) u64 {
+    const wrapper = raw orelse return 0;
+    var input = ptr[0..len];
+    var active = wrapper.terminal.modes.get(.synchronized_output);
+    var begins: u64 = 0;
+    while (input.len > 0) {
+        var consumed: usize = 0;
+        _ = ghostty_terminal_vt_write_until_ground(raw, input.ptr, input.len, &consumed);
+        if (consumed > 0) {
+            input = input[consumed..];
+        } else {
+            // Only divide at ESC; Ghostty owns all sequence/UTF-8 interpretation.
+            const end = std.mem.indexOfScalar(u8, input, 0x1b) orelse input.len;
+            const take = if (end == 0) 1 else end;
+            ghostty_terminal_vt_write(raw, input.ptr, take);
+            input = input[take..];
+        }
+        const next = wrapper.terminal.modes.get(.synchronized_output);
+        if (next and !active) begins += 1;
+        active = next;
+    }
+    return begins;
+}
+
 // The pinned RenderState update only changes these terminal dirty flags.
 // Restore them even on allocation failure; no terminal borrow escapes this call.
 fn observe(state: render_c.RenderState, raw: terminal_c.Terminal) callconv(.c) Result {
@@ -275,6 +302,7 @@ fn probe(search: ?*Search, out_match: ?*bool, out_buffer_changed: ?*bool) callco
 }
 
 comptime {
+    @export(&write, .{ .name = "mightty_ghostty_vt_write" });
     @export(&observe, .{ .name = "mightty_ghostty_render_observe" });
     @export(&new, .{ .name = "mightty_ghostty_search_new" });
     @export(&free, .{ .name = "mightty_ghostty_search_free" });

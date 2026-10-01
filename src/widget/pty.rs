@@ -95,7 +95,7 @@ impl TestReceiver {
 
 pub(super) enum PtyEvent {
     Output(Vec<u8>),
-    OutputEnded,
+    OutputEnded(Option<String>),
     IoFailed(String),
 }
 
@@ -103,7 +103,7 @@ impl PtyEvent {
     pub(super) fn len(&self) -> usize {
         match self {
             Self::Output(data) => data.len(),
-            Self::OutputEnded | Self::IoFailed(_) => 0,
+            Self::OutputEnded(_) | Self::IoFailed(_) => 0,
         }
     }
 }
@@ -164,7 +164,34 @@ impl PtyWorker {
         let control_exit_flag = Arc::clone(&exit_flag);
         let control_event_tx = event_tx.clone();
         let control_thread = std::thread::spawn(move || {
-            while let Ok(mut queued) = command_rx.recv() {
+            loop {
+                // ConPTY keeps its output pipe open after the child exits until
+                // we close the pseudoconsole. Output itself remains wake-driven.
+                // ponytail: check exit every 250 ms; use a combined native wait
+                // if idle worker wakeups become a measured cost.
+                #[cfg(windows)]
+                let mut queued =
+                    match command_rx.recv_timeout(std::time::Duration::from_millis(250)) {
+                        Ok(queued) => queued,
+                        Err(flume::RecvTimeoutError::Disconnected) => break,
+                        Err(flume::RecvTimeoutError::Timeout) => match control.has_exited() {
+                            Ok(true) => break,
+                            Ok(false) => continue,
+                            Err(error) => {
+                                send_event(
+                                    &control_event_tx,
+                                    PtyEvent::IoFailed(error.to_string()),
+                                    &control_stopping,
+                                );
+                                break;
+                            }
+                        },
+                    };
+                #[cfg(unix)]
+                let mut queued = match command_rx.recv() {
+                    Ok(queued) => queued,
+                    Err(_) => break,
+                };
                 if control_stopping.load(Ordering::Acquire) {
                     break;
                 }
@@ -205,7 +232,11 @@ impl PtyWorker {
                     }
                     eprintln!("ConPTY command failed: {err}");
                     control_exit_flag.store(true, Ordering::Relaxed);
-                    let _ = control_event_tx.try_send(PtyEvent::IoFailed(err.to_string()));
+                    send_event(
+                        &control_event_tx,
+                        PtyEvent::IoFailed(err.to_string()),
+                        &control_stopping,
+                    );
                     break;
                 }
             }
@@ -225,17 +256,13 @@ impl PtyWorker {
                 match output.read_interruptible(&mut buf, &reader_cancel) {
                     Ok(PtyRead::Data(0)) => {}
                     Ok(PtyRead::Data(n)) => {
-                        let mut event = PtyEvent::Output(buf[..n].to_vec());
                         // Keep draining ConPTY during close, even when the UI no longer
                         // consumes output. ClosePseudoConsole needs its output reader.
-                        while !reader_stopping.load(Ordering::Acquire) {
-                            match event_tx.send_timeout(event, std::time::Duration::from_millis(20))
-                            {
-                                Ok(()) => break,
-                                Err(flume::SendTimeoutError::Timeout(returned)) => event = returned,
-                                Err(flume::SendTimeoutError::Disconnected(_)) => break,
-                            }
-                        }
+                        send_event(
+                            &event_tx,
+                            PtyEvent::Output(buf[..n].to_vec()),
+                            &reader_stopping,
+                        );
                     }
                     Ok(PtyRead::Eof) => break,
                     Err(err) => {
@@ -249,8 +276,7 @@ impl PtyWorker {
             }
 
             reader_exit_flag.store(true, Ordering::Relaxed);
-            let event = failure.map_or(PtyEvent::OutputEnded, PtyEvent::IoFailed);
-            let _ = event_tx.send_timeout(event, std::time::Duration::from_millis(100));
+            send_event(&event_tx, PtyEvent::OutputEnded(failure), &reader_stopping);
         });
 
         (
@@ -309,6 +335,16 @@ impl Drop for PtyWorker {
     }
 }
 
+#[cfg(any(windows, unix))]
+fn send_event(sender: &flume::Sender<PtyEvent>, mut event: PtyEvent, stopping: &AtomicBool) {
+    while !stopping.load(Ordering::Acquire) {
+        match sender.send_timeout(event, std::time::Duration::from_millis(20)) {
+            Ok(()) | Err(flume::SendTimeoutError::Disconnected(_)) => break,
+            Err(flume::SendTimeoutError::Timeout(returned)) => event = returned,
+        }
+    }
+}
+
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
@@ -316,6 +352,55 @@ mod tests {
     use std::time::{Duration, Instant};
     use windows_sys::Win32::Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle};
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    #[test]
+    fn child_exit_closes_conpty_and_delivers_final_output_without_a_command() {
+        let launch = LaunchSpec::new("cmd.exe").with_arguments(["/d", "/c", "echo OUTPUT-FINAL"]);
+        let (mut worker, receiver) =
+            PtyWorker::spawn(launch, 24, 80, Arc::new(AtomicBool::new(false))).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut output = Vec::new();
+        loop {
+            match receiver
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .expect("reader completion after child exit")
+            {
+                PtyEvent::Output(bytes) => output.extend(bytes),
+                PtyEvent::OutputEnded(error) => {
+                    assert!(error.is_none());
+                    break;
+                }
+                PtyEvent::IoFailed(error) => panic!("PTY failed: {error}"),
+            }
+        }
+        assert!(String::from_utf8_lossy(&output).contains("OUTPUT-FINAL"));
+        worker.shutdown();
+    }
+
+    #[test]
+    fn completion_waits_for_backpressure_and_can_be_cancelled() {
+        let (tx, rx) = flume::bounded(1);
+        tx.send(PtyEvent::Output(vec![1])).unwrap();
+        let stopping = Arc::new(AtomicBool::new(false));
+        let stop = stopping.clone();
+        let sender = tx.clone();
+        let worker =
+            std::thread::spawn(move || send_event(&sender, PtyEvent::OutputEnded(None), &stop));
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(!worker.is_finished());
+        assert!(matches!(rx.recv().unwrap(), PtyEvent::Output(_)));
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            PtyEvent::OutputEnded(None)
+        ));
+        worker.join().unwrap();
+        tx.send(PtyEvent::Output(vec![2])).unwrap();
+        let stop = stopping.clone();
+        let worker =
+            std::thread::spawn(move || send_event(&tx, PtyEvent::OutputEnded(None), &stop));
+        stopping.store(true, Ordering::Release);
+        worker.join().unwrap();
+    }
 
     fn process_handle() -> OwnedHandle {
         unsafe {

@@ -3,16 +3,16 @@ use crate::ghostty::{
     style::{RgbColor, Underline},
 };
 use gpui::{
-    Context, FontFallbacks, FontFeatures, FontStyle, FontWeight, IntoElement, KeyDownEvent,
-    KeyUpEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Render,
-    ScrollWheelEvent, StrikethroughStyle, Styled, StyledText, TextRun, TextStyle, UnderlineStyle,
-    WhiteSpace, Window, canvas, div, prelude::*, px,
+    Bounds, ContentMask, Context, FontFallbacks, FontFeatures, FontStyle, FontWeight, IntoElement,
+    KeyDownEvent, KeyUpEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
+    Render, ScrollWheelEvent, StrikethroughStyle, Styled, TextRun, TextStyle, UnderlineStyle,
+    WhiteSpace, Window, canvas, div, fill, point, prelude::*, px, size,
 };
 #[cfg(test)]
 use std::cell::RefCell;
 use std::sync::Arc;
 
-use super::{CursorStyle, TERMINAL_KEY_CONTEXT, TerminalWidget, rgb_to_rgba, scrollbar_layout};
+use super::{TERMINAL_KEY_CONTEXT, TerminalWidget, rgb_to_rgba, scrollbar_layout};
 
 #[cfg(test)]
 thread_local! {
@@ -79,6 +79,7 @@ impl RowSegment {
 
 impl Render for TerminalWidget {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.prepare_terminal(window, cx);
         self.paint_terminal(window, cx, false)
     }
 }
@@ -90,6 +91,7 @@ impl TerminalWidget {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
+        self.publish_terminal(cx);
         self.paint_terminal(window, cx, true).into_any_element()
     }
 
@@ -114,66 +116,29 @@ impl TerminalWidget {
                 }));
         }
 
-        if !offscreen {
-            self.resolve_font_metrics(window);
-        }
-
+        let Some(frame) = self.committed.clone() else {
+            return div().size_full().bg(self.theme.background);
+        };
+        let painted = if offscreen {
+            &mut self.offscreen_painted
+        } else {
+            &mut self.painted
+        };
+        *painted = Some(super::presentation::PaintedTerminal {
+            frame: frame.clone(),
+            focused: self.focus_handle.is_focused(window),
+            cursor_phase: self.cursor_blink_phase,
+            preedit: self.preedit.clone(),
+            composing: self.composing,
+        });
+        let colors = &frame.colors;
+        let cell_size = frame.cell_size;
         let layout_size = self
             .layout_bounds
-            .map_or_else(|| window.viewport_size(), |bounds| bounds.size);
-        if !offscreen {
-            let _ = self.resize_to_size(layout_size, cx);
-        }
-
-        let mut observation = offscreen.then(crate::ghostty::RenderState::new).transpose();
-        let snapshot = match match &mut observation {
-            Ok(Some(state)) => state.observe(&self.terminal),
-            Ok(None) => self.render_state.update(&self.terminal),
-            Err(error) => Err(*error),
-        } {
-            Ok(s) => s,
-            Err(error) => {
-                crate::diagnostics::record(
-                    "render",
-                    "state_failed",
-                    &error.to_string(),
-                    super::launch_context(&self.config.launch),
-                );
-                return div()
-                    .size_full()
-                    .bg(self.theme.background)
-                    .child("Failed to update render state");
-            }
-        };
-
-        let colors = match snapshot.colors() {
-            Ok(c) => c,
-            Err(_) => return div().size_full().bg(self.theme.background),
-        };
-
-        let cell_size = self.cell_size;
-        let selection_color = super::rgba_to_rgb(self.theme.selection);
-        let search_highlights =
-            self.search
-                .as_ref()
-                .and_then(|search| {
-                    self.terminal.scrollbar().ok().map(|scrollbar| {
-                        search.visible_highlights(scrollbar, self.size.0, self.size.1)
-                    })
-                })
-                .unwrap_or_default();
-        let graphics = match self.graphics_renderer.frame(&self.terminal, cell_size) {
-            Ok(frame) => frame,
-            Err(error) => {
-                crate::diagnostics::record(
-                    "render",
-                    "graphics_failed",
-                    &error.to_string(),
-                    super::launch_context(&self.config.launch),
-                );
-                Default::default()
-            }
-        };
+            .map_or(window.viewport_size(), |b| b.size);
+        let selection_color = frame.selection_color;
+        let search_highlights = frame.highlights.clone();
+        let graphics = frame.graphics.clone();
         #[cfg(test)]
         record_render_stage(format!(
             "below-background graphics z={:?}",
@@ -188,107 +153,33 @@ impl TerminalWidget {
             .into_iter()
             .map(|placement| placement.into_element())
             .collect();
-        let mut background_elements = Vec::new();
-        let mut text_elements = Vec::new();
+        let mut backgrounds = Vec::new();
+        let mut text_segments = Vec::new();
         let mut base_text_style = window.text_style();
-        base_text_style.font_family = self.config.font_family.clone().into();
+        base_text_style.font_family = frame.font_family.clone().into();
         base_text_style.font_features = terminal_font_features();
-        base_text_style.font_fallbacks = Some(terminal_font_fallbacks(&self.config.font_family));
-        base_text_style.font_size = px(self.config.font_size_px).into();
+        base_text_style.font_fallbacks = Some(terminal_font_fallbacks(&frame.font_family));
+        base_text_style.font_size = px(frame.font_size_px).into();
         base_text_style.line_height = cell_size.1.into();
         base_text_style.white_space = WhiteSpace::Nowrap;
 
-        let mut row_it = match self.row_iterator.update(&snapshot) {
-            Ok(it) => it,
-            Err(_) => return div().size_full().bg(self.theme.background),
-        };
-
-        let mut row_idx: u16 = 0;
-        while let Some(row) = row_it.next() {
-            let row_selection = row.selection().ok().flatten();
-            let mut cell_it = match self.cell_iterator.update(row) {
-                Ok(it) => it,
-                Err(_) => continue,
-            };
-
+        for (row_index, row) in frame.rows.iter().enumerate() {
+            let row_idx = row_index as u16;
+            let row_selection = row.selection;
             let mut row_segments = Vec::new();
             let mut pending_segment = None;
-            let mut col_idx = 0u16;
-            while let Some(cell) = cell_it.next() {
-                let width = match cell.width() {
-                    Ok(width) => width,
-                    Err(_) => continue,
-                };
+            for (column, cell) in row.cells.iter().enumerate() {
+                let width = cell.width;
                 let advance = width.column_advance();
-                let start_col = col_idx;
-                // Iteration includes wide-cell continuation slots; columns are physical.
-                col_idx += 1;
-                let text = match cell.text() {
-                    Ok(text) => text,
-                    Err(_) => {
-                        if advance > 0 {
-                            push_row_segment(
-                                &mut row_segments,
-                                &mut pending_segment,
-                                start_col,
-                                advance,
-                                RowTextStyle {
-                                    fg: colors.foreground,
-                                    bg: selected_background(
-                                        row_selection,
-                                        start_col,
-                                        advance,
-                                        None,
-                                        selection_color,
-                                    ),
-                                    default_bg: colors.background,
-                                    bold: false,
-                                    italic: false,
-                                    underline: Underline::None,
-                                    strikethrough: false,
-                                },
-                                " ".repeat(advance as usize),
-                            );
-                        }
-                        continue;
-                    }
-                };
-
+                let start_col = column as u16;
+                let text = cell.text.as_str();
                 if matches!(width, CellWidth::SpacerTail | CellWidth::SpacerHead) {
                     continue;
                 }
 
-                let fg = cell.fg_color().ok().flatten().unwrap_or(colors.foreground);
-                let bg = cell.bg_color().ok().flatten();
-                let style = match cell.style() {
-                    Ok(s) => s,
-                    Err(_) => {
-                        push_row_segment(
-                            &mut row_segments,
-                            &mut pending_segment,
-                            start_col,
-                            advance.max(1),
-                            RowTextStyle {
-                                fg,
-                                bg: selected_background(
-                                    row_selection,
-                                    start_col,
-                                    advance.max(1),
-                                    bg,
-                                    selection_color,
-                                ),
-                                default_bg: colors.background,
-                                bold: false,
-                                italic: false,
-                                underline: Underline::None,
-                                strikethrough: false,
-                            },
-                            " ".repeat(advance.max(1) as usize),
-                        );
-                        continue;
-                    }
-                };
-
+                let fg = cell.foreground.unwrap_or(colors.foreground);
+                let bg = cell.background;
+                let style = cell.style;
                 let (fg_color, bg_color, has_bg) = if style.inverse {
                     (fg, bg.unwrap_or(colors.background), true)
                 } else {
@@ -296,7 +187,7 @@ impl TerminalWidget {
                 };
 
                 let segment = if text.is_empty() {
-                    " ".repeat(advance.max(1) as usize)
+                    if advance == 2 { "  " } else { " " }
                 } else {
                     text
                 };
@@ -332,50 +223,32 @@ impl TerminalWidget {
             for segment in row_segments {
                 let (x, y) = cell_position(row_idx, segment.start_col, cell_size);
                 let segment_width = cell_size.0 * segment.columns as f32;
-                let segment_len = segment.text.len();
+                let bounds = Bounds::new(point(x, y), size(segment_width, cell_size.1));
                 let (_, segment_bg, _) = resolved_render_style(segment.style);
                 if let Some(background) = segment_bg {
-                    background_elements.push(
-                        div()
-                            .absolute()
-                            .left(x)
-                            .top(y)
-                            .w(segment_width)
-                            .h(cell_size.1)
-                            .bg(rgb_to_rgba(background))
-                            .into_any_element(),
-                    );
+                    backgrounds.push((bounds, rgb_to_rgba(background)));
                 }
-                let segment_text = div()
-                    .absolute()
-                    .left(x)
-                    .top(y)
-                    .w(segment_width)
-                    .h(cell_size.1)
-                    .overflow_hidden()
-                    .whitespace_nowrap()
-                    .text_size(px(self.config.font_size_px))
-                    .font_family(self.config.font_family.clone())
-                    .line_height(cell_size.1)
-                    .child(
-                        StyledText::new(segment.text).with_runs(vec![text_run_for_style(
-                            &base_text_style,
-                            segment.style,
-                            segment_len,
-                        )]),
-                    );
-                text_elements.push(segment_text.into_any_element());
+                text_segments.push((bounds, segment));
             }
-            let _ = row.set_dirty(false);
-            row_idx += 1;
         }
 
         #[cfg(test)]
-        record_render_stage(format!(
-            "cell backgrounds count={}",
-            background_elements.len()
-        ));
-        elements.extend(background_elements);
+        record_render_stage(format!("cell backgrounds count={}", backgrounds.len()));
+        elements.push(
+            canvas(
+                |_, _, _| (),
+                move |bounds, (), window, _| {
+                    for (cell_bounds, color) in backgrounds {
+                        let cell_bounds =
+                            pixel_aligned_bounds(cell_bounds, bounds.origin, window.scale_factor());
+                        window.paint_quad(fill(cell_bounds, color));
+                    }
+                },
+            )
+            .absolute()
+            .size_full()
+            .into_any_element(),
+        );
         #[cfg(test)]
         record_render_stage(format!(
             "search highlights count={}",
@@ -412,21 +285,73 @@ impl TerminalWidget {
                 .map(|placement| placement.into_element()),
         );
         #[cfg(test)]
-        record_render_stage(format!("cell text count={}", text_elements.len()));
-        elements.extend(text_elements);
+        record_render_stage(format!("cell text count={}", text_segments.len()));
+        let font_size = px(frame.font_size_px);
+        elements.push(
+            canvas(
+                move |_, window, _| {
+                    text_segments
+                        .into_iter()
+                        .map(|(bounds, segment)| {
+                            let run = text_run_for_style(
+                                &base_text_style,
+                                segment.style,
+                                segment.text.len(),
+                            );
+                            let line = window.text_system().shape_line(
+                                segment.text.into(),
+                                font_size,
+                                &[run],
+                                None,
+                            );
+                            (bounds, line)
+                        })
+                        .collect::<Vec<_>>()
+                },
+                move |bounds, lines, window, cx| {
+                    for (segment_bounds, line) in lines {
+                        let segment_bounds = pixel_aligned_bounds(
+                            segment_bounds,
+                            bounds.origin,
+                            window.scale_factor(),
+                        );
+                        window.with_content_mask(
+                            Some(ContentMask {
+                                bounds: segment_bounds,
+                            }),
+                            |window| {
+                                if let Err(error) =
+                                    line.paint(segment_bounds.origin, cell_size.1, window, cx)
+                                {
+                                    crate::diagnostics::record(
+                                        "render",
+                                        "text_paint_failed",
+                                        &error.to_string(),
+                                        serde_json::json!({}),
+                                    );
+                                }
+                            },
+                        );
+                    }
+                },
+            )
+            .absolute()
+            .size_full()
+            .into_any_element(),
+        );
 
         if !self.preedit.is_empty()
-            && let Ok(Some(cursor)) = snapshot.cursor_viewport()
+            && let Some((column, row, _)) = frame.cursor_footprint()
         {
-            let (x, y) = cell_position(cursor.y, cursor.x, cell_size);
+            let (x, y) = cell_position(row, column, cell_size);
             elements.push(
                 div()
                     .absolute()
                     .left(x)
                     .top(y)
                     .h(cell_size.1)
-                    .font_family(self.config.font_family.clone())
-                    .text_size(px(self.config.font_size_px))
+                    .font_family(frame.font_family.clone())
+                    .text_size(px(frame.font_size_px))
                     .line_height(cell_size.1)
                     .whitespace_nowrap()
                     .bg(rgb_to_rgba(colors.background))
@@ -438,43 +363,101 @@ impl TerminalWidget {
             );
         }
 
-        let is_focused = self.focus_handle.is_focused(window);
-        let cursor_visible = is_focused && (self.cursor_blink_phase || !self.config.cursor_blink);
+        let cursor_visible = self.focus_handle.is_focused(window)
+            && frame.cursor.visible
+            && (self.cursor_blink_phase || !frame.cursor.blinking)
+            && !self.composing;
+        if cursor_visible && let Some((column, row, columns)) = frame.cursor_footprint() {
+            use crate::ghostty::render::CursorShape;
 
-        if cursor_visible && let Ok(Some(cursor_pos)) = snapshot.cursor_viewport() {
-            let cursor_color = colors.cursor.unwrap_or(colors.foreground);
-            let (x, y) = cell_position(cursor_pos.y, cursor_pos.x, cell_size);
-            let cursor_rgba = rgb_to_rgba(cursor_color);
-
-            let cursor_div = match self.config.cursor_style {
-                CursorStyle::Block => div()
+            let cell = frame
+                .rows
+                .get(usize::from(row))
+                .and_then(|row| row.cells.get(usize::from(column)));
+            let width = cell_size.0 * f32::from(columns);
+            let (x, y) = cell_position(row, column, cell_size);
+            let color = rgb_to_rgba(colors.cursor.unwrap_or(colors.foreground));
+            let cursor_div = match frame.cursor.shape {
+                CursorShape::Block => div()
                     .absolute()
                     .left(x)
                     .top(y)
-                    .w(cell_size.0)
+                    .w(width)
                     .h(cell_size.1)
-                    .bg(cursor_rgba),
-                CursorStyle::Line => div()
+                    .bg(color),
+                CursorShape::HollowBlock => div()
+                    .absolute()
+                    .left(x)
+                    .top(y)
+                    .w(width)
+                    .h(cell_size.1)
+                    .border_1()
+                    .border_color(color),
+                CursorShape::Bar => div()
                     .absolute()
                     .left(x)
                     .top(y)
                     .w(px(2.0))
                     .h(cell_size.1)
-                    .bg(cursor_rgba),
-                CursorStyle::Underline => div()
+                    .bg(color),
+                CursorShape::Underline => div()
                     .absolute()
                     .left(x)
                     .top(y + cell_size.1 - px(2.0))
-                    .w(cell_size.0)
+                    .w(width)
                     .h(px(2.0))
-                    .bg(cursor_rgba),
+                    .bg(color),
             };
             elements.push(cursor_div.into_any_element());
+            if frame.cursor.shape == CursorShape::Block
+                && let Some(cell) = cell
+            {
+                let mut cursor_style = window.text_style();
+                cursor_style.font_family = frame.font_family.clone().into();
+                cursor_style.font_features = terminal_font_features();
+                cursor_style.font_fallbacks = Some(terminal_font_fallbacks(&frame.font_family));
+                let text_style = RowTextStyle {
+                    fg: cursor_text_color(
+                        colors.cursor.unwrap_or(colors.foreground),
+                        colors.background,
+                    ),
+                    bg: None,
+                    default_bg: colors.background,
+                    bold: cell.style.bold,
+                    italic: cell.style.italic,
+                    underline: cell.style.underline,
+                    strikethrough: cell.style.strikethrough,
+                };
+                let text = cell.text.clone();
+                elements.push(
+                    canvas(
+                        move |_, window, _| {
+                            let run = text_run_for_style(&cursor_style, text_style, text.len());
+                            window
+                                .text_system()
+                                .shape_line(text.into(), font_size, &[run], None)
+                        },
+                        move |bounds, line, window, cx| {
+                            let bounds = pixel_aligned_bounds(
+                                Bounds::new(point(x, y), size(width, cell_size.1)),
+                                bounds.origin,
+                                window.scale_factor(),
+                            );
+                            window.with_content_mask(Some(ContentMask { bounds }), |window| {
+                                let _ = line.paint(bounds.origin, cell_size.1, window, cx);
+                            });
+                        },
+                    )
+                    .absolute()
+                    .size_full()
+                    .into_any_element(),
+                );
+            }
         }
         #[cfg(test)]
         record_render_stage(format!(
             "cursor count={}",
-            usize::from(cursor_visible && snapshot.cursor_viewport().ok().flatten().is_some())
+            usize::from(cursor_visible && frame.cursor.position.is_some())
         ));
         #[cfg(test)]
         record_render_stage(format!(
@@ -496,10 +479,7 @@ impl TerminalWidget {
         let input_entity = entity.clone();
         let input_focus = self.focus_handle.clone();
         let track_height: f32 = layout_size.height.into();
-        let scrollbar = self
-            .terminal
-            .scrollbar()
-            .ok()
+        let scrollbar = Some(frame.scrollbar)
             .and_then(|scrollbar| scrollbar_layout(scrollbar, track_height))
             .map(|layout| {
                 div()
@@ -1057,18 +1037,18 @@ fn push_row_segment(
     start_col: u16,
     columns: u16,
     style: RowTextStyle,
-    text: String,
+    text: &str,
 ) {
     if text.is_empty() {
         return;
     }
 
-    let isolate = segment_needs_own_layout(&text, columns);
+    let isolate = segment_needs_own_layout(text, columns);
     if isolate {
         if let Some(segment) = pending.take() {
             segments.push(segment);
         }
-        segments.push(RowSegment::new(start_col, columns, text, style));
+        segments.push(RowSegment::new(start_col, columns, text.to_owned(), style));
         return;
     }
 
@@ -1077,18 +1057,50 @@ fn push_row_segment(
         && segment.start_col + segment.columns == start_col
     {
         segment.columns += columns;
-        segment.text.push_str(&text);
+        segment.text.push_str(text);
         return;
     }
 
     if let Some(segment) = pending.take() {
         segments.push(segment);
     }
-    *pending = Some(RowSegment::new(start_col, columns, text, style));
+    *pending = Some(RowSegment::new(start_col, columns, text.to_owned(), style));
 }
 
 fn cell_position(row: u16, col: u16, cell_size: (Pixels, Pixels)) -> (Pixels, Pixels) {
     (cell_size.0 * col as f32, cell_size.1 * row as f32)
+}
+
+fn cursor_text_color(cursor: RgbColor, background: RgbColor) -> RgbColor {
+    let brightness = |color: RgbColor| {
+        (u32::from(color.r) * 299 + u32::from(color.g) * 587 + u32::from(color.b) * 114) / 1000
+    };
+    if brightness(cursor).abs_diff(brightness(background)) >= 96 {
+        background
+    } else if brightness(cursor) >= 128 {
+        RgbColor { r: 0, g: 0, b: 0 }
+    } else {
+        RgbColor {
+            r: 255,
+            g: 255,
+            b: 255,
+        }
+    }
+}
+
+// Match GPUI's layout rounding for the positioned spans replaced by the canvases.
+fn pixel_aligned_bounds(
+    bounds: Bounds<Pixels>,
+    origin: gpui::Point<Pixels>,
+    scale: f32,
+) -> Bounds<Pixels> {
+    let start = bounds.origin + origin;
+    let end = start + point(bounds.size.width, bounds.size.height);
+    let align = |value: Pixels| (value * scale).round() / scale;
+    Bounds::from_corners(
+        point(align(start.x), align(start.y)),
+        point(align(end.x), align(end.y)),
+    )
 }
 
 #[cfg(test)]
@@ -1102,6 +1114,38 @@ mod tests {
     use gpui::{AppContext, Bounds, Entity, FocusHandle, TestAppContext, size};
     use gpui_component::Root;
     use std::{cell::RefCell, rc::Rc};
+
+    #[test]
+    fn terminal_spans_share_pixel_aligned_edges_at_fractional_dpi() {
+        let cell_width = px(9.6);
+        for scale in [1.0, 1.25, 1.5, 2.0] {
+            let first = pixel_aligned_bounds(
+                Bounds::new(
+                    point(cell_width, px(16.0)),
+                    size(cell_width * 2.0, px(16.0)),
+                ),
+                point(px(176.0), px(34.0)),
+                scale,
+            );
+            let next = pixel_aligned_bounds(
+                Bounds::new(
+                    point(cell_width * 3.0, px(16.0)),
+                    size(cell_width, px(16.0)),
+                ),
+                point(px(176.0), px(34.0)),
+                scale,
+            );
+            assert_eq!(first.right(), next.left());
+            assert_eq!(first.origin.x * scale, (first.origin.x * scale).round());
+        }
+        let span = pixel_aligned_bounds(
+            Bounds::new(point(px(9.6), px(0.0)), size(px(19.2), px(16.0))),
+            point(px(0.0), px(0.0)),
+            1.0,
+        );
+        assert_eq!(span.origin.x, px(10.0));
+        assert_eq!(span.size.width, px(19.0));
+    }
 
     struct TerminalTabFixture {
         terminal: Entity<TerminalWidget>,
@@ -1596,5 +1640,272 @@ mod tests {
             surface_x: f64::from(column) * 10.0 + 1.0,
             surface_y: 1.0,
         }
+    }
+}
+#[cfg(test)]
+mod presentation_tests {
+    use super::*;
+    use crate::widget::{CursorStyle, PtyEvent, TerminalConfig};
+    use gpui::TestAppContext;
+    use std::rc::Rc;
+    #[gpui::test]
+    fn capture_keeps_the_painted_revision_after_a_new_commit(cx: &mut TestAppContext) {
+        let (widget, cx) = cx.add_window_view(|_, cx| {
+            TerminalWidget::with_pty(
+                TerminalConfig {
+                    cursor_blink: false,
+                    ..Default::default()
+                },
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                None,
+                None,
+                None,
+                cx,
+            )
+        });
+        cx.refresh().unwrap();
+        cx.run_until_parked();
+        cx.update_window_entity(&widget, |widget, window, cx| {
+            widget.apply_pty_event(PtyEvent::Output(b"\x1b[2J\x1b[Hpainted".to_vec()), cx);
+            widget.publish_terminal(cx);
+            let _ = widget.paint_terminal(window, cx, false);
+            let live_before = widget.presentation(window, false, true);
+            let _ = widget.offscreen_element(window, cx);
+            let before = widget.presentation(window, true, true);
+            widget.apply_pty_event(
+                PtyEvent::Output(b"\x1b[2J\x1b[Hnewer\x1b[?25l".to_vec()),
+                cx,
+            );
+            widget.publish_terminal(cx);
+            assert_ne!(
+                widget.committed.as_ref().unwrap().output_seq,
+                widget.offscreen_painted.as_ref().unwrap().frame.output_seq
+            );
+            let retained = widget.presentation(window, true, true);
+            assert_eq!(before.state["output_seq"], retained.state["output_seq"]);
+            assert!(
+                retained
+                    .source
+                    .unwrap()
+                    .rows
+                    .iter()
+                    .any(|r| r.text.contains("painted"))
+            );
+            let _ = widget.offscreen_element(window, cx);
+            let newest = widget.presentation(window, true, true);
+            assert_eq!(newest.state["output_seq"], widget.output_seq.to_string());
+            assert_eq!(
+                newest.state["terminal_status"]["value"]["cursor_visible"],
+                false
+            );
+            assert!(
+                newest
+                    .source
+                    .unwrap()
+                    .rows
+                    .iter()
+                    .any(|r| r.text.contains("newer"))
+            );
+            let live = widget.presentation(window, false, true);
+            assert_eq!(live.state["output_seq"], live_before.state["output_seq"]);
+            assert!(
+                live.source
+                    .unwrap()
+                    .rows
+                    .iter()
+                    .any(|r| r.text.contains("painted"))
+            );
+        });
+    }
+    #[gpui::test]
+    fn explicit_pane_focus_does_not_reselect_the_old_focus(cx: &mut TestAppContext) {
+        use crate::split::{PaneId, Split, SplitAxis, SplitNode};
+        let first = PaneId::allocate();
+        let second = PaneId::allocate();
+        let (split, cx) = cx.add_window_view(|window, cx| {
+            let make = |cx: &mut gpui::App| {
+                cx.new(|cx| {
+                    TerminalWidget::with_pty(
+                        TerminalConfig {
+                            cursor_blink: false,
+                            ..Default::default()
+                        },
+                        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                        None,
+                        None,
+                        None,
+                        cx,
+                    )
+                })
+            };
+            let first_widget = make(cx);
+            let second_widget = make(cx);
+            first_widget.update(cx, |widget, _| widget.request_focus(window));
+            Split::from_restored(
+                SplitNode::Branch {
+                    axis: SplitAxis::Horizontal,
+                    ratio: 0.5,
+                    first: Box::new(SplitNode::Leaf { pane_id: first }),
+                    second: Box::new(SplitNode::Leaf { pane_id: second }),
+                },
+                vec![
+                    (
+                        first,
+                        first_widget,
+                        crate::profile::ProfileId::new("fixture").unwrap(),
+                    ),
+                    (
+                        second,
+                        second_widget,
+                        crate::profile::ProfileId::new("fixture").unwrap(),
+                    ),
+                ],
+                first,
+            )
+            .unwrap()
+        });
+        cx.refresh().unwrap();
+        cx.run_until_parked();
+        cx.update_window_entity(&split, |split, window, cx| {
+            assert!(split.focus_target(second, None, window, cx));
+            assert_eq!(split.active_pane_id(), second);
+            assert!(
+                split
+                    .terminal(second)
+                    .unwrap()
+                    .read(cx)
+                    .focus_handle()
+                    .is_focused(window)
+            );
+        });
+    }
+    #[gpui::test]
+    fn protocol_cursor_and_synchronized_repaints_use_the_committed_frame(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::widget::init(cx);
+        });
+        let (widget, cx) = cx.add_window_view(|_, cx| {
+            TerminalWidget::with_pty(
+                TerminalConfig {
+                    cursor_style: CursorStyle::Underline,
+                    cursor_blink: false,
+                    ..Default::default()
+                },
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                None,
+                None,
+                None,
+                cx,
+            )
+        });
+        cx.simulate_resize(size(px(600.), px(400.)));
+        cx.refresh().unwrap();
+        cx.run_until_parked();
+        for (bytes, shape, blinking, visible) in [
+            (
+                &b"\x1b[?25h\x1b[12;4H"[..],
+                crate::ghostty::render::CursorShape::Underline,
+                false,
+                true,
+            ),
+            (
+                &b"\x1b[?25l\x1b[2;7Hlabel"[..],
+                crate::ghostty::render::CursorShape::Underline,
+                false,
+                false,
+            ),
+            (
+                &b"\x1b[5;19Hspinner"[..],
+                crate::ghostty::render::CursorShape::Underline,
+                false,
+                false,
+            ),
+            (
+                &b"\x1b[?25h\x1b[2 q"[..],
+                crate::ghostty::render::CursorShape::Block,
+                false,
+                true,
+            ),
+            (
+                &b"\x1b[5 q"[..],
+                crate::ghostty::render::CursorShape::Bar,
+                true,
+                true,
+            ),
+            (
+                &b"\x1b[?12l"[..],
+                crate::ghostty::render::CursorShape::Bar,
+                false,
+                true,
+            ),
+            (
+                &b"\x1b[0 q"[..],
+                crate::ghostty::render::CursorShape::Underline,
+                false,
+                true,
+            ),
+            (
+                &b"\x1b[?1049h\x1b[3 q"[..],
+                crate::ghostty::render::CursorShape::Underline,
+                true,
+                true,
+            ),
+            (
+                &b"\x1b[?1049l\x1bc"[..],
+                crate::ghostty::render::CursorShape::Underline,
+                false,
+                true,
+            ),
+        ] {
+            cx.update_window_entity(&widget, |widget, window, cx| {
+                widget.request_focus(window);
+                widget.cursor_blink_phase = true;
+                widget.apply_pty_event(PtyEvent::Output(bytes.to_vec()), cx);
+                cx.notify();
+            });
+            cx.run_until_parked();
+            cx.update_window_entity(&widget, |widget, _, _| {
+                let frame = widget.committed.as_ref().unwrap();
+                assert_eq!(
+                    (
+                        frame.cursor.shape,
+                        frame.cursor.blinking,
+                        frame.cursor.visible
+                    ),
+                    (shape, blinking, visible)
+                );
+            });
+            assert!(
+                render_stage_trace().contains(&format!("cursor count={}", usize::from(visible)))
+            );
+        }
+        let before =
+            cx.update_window_entity(&widget, |widget, _, _| widget.committed.clone().unwrap());
+        cx.update_window_entity(&widget, |widget, _, cx| {
+            widget.apply_pty_event(
+                PtyEvent::Output(b"\x1b[?2026h\x1b[2J\x1b[7;19Hpartial".to_vec()),
+                cx,
+            );
+            widget.publish_terminal(cx);
+            widget.cursor_blink_phase = false;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cx.update_window_entity(&widget, |widget, window, cx| {
+            let anchor = widget.input_cursor_bounds().unwrap();
+            widget.preedit = "日本".into();
+            widget.composing = true;
+            window.blur();
+            let _ = widget.offscreen_element(window, cx);
+            assert!(Rc::ptr_eq(&before, widget.committed.as_ref().unwrap()));
+            assert_eq!(anchor, widget.input_cursor_bounds().unwrap());
+            widget.search = Some(Default::default());
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cx.update_window_entity(&widget, |widget, _, _| {
+            assert!(Rc::ptr_eq(&before, widget.committed.as_ref().unwrap()))
+        });
     }
 }

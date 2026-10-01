@@ -3,7 +3,7 @@ use crate::{
     control::{ControlError, Request},
     feedback::TerminalCapture,
 };
-use gpui::{Bounds, GpuCapture, Pixels};
+use gpui::{AppContext, Bounds, GpuCapture, IntoElement, Pixels};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
@@ -131,21 +131,22 @@ pub fn validate_size(size: gpui::Size<Pixels>, scale: f32) -> Result<(), Control
     }
     Ok(())
 }
-struct Scratch;
+struct Scratch(Option<gpui::AnyElement>);
 impl gpui::Render for Scratch {
     fn render(
         &mut self,
         _: &mut gpui::Window,
         _: &mut gpui::Context<Self>,
     ) -> impl gpui::IntoElement {
-        gpui::Empty
+        self.0
+            .take()
+            .unwrap_or_else(|| gpui::Empty.into_any_element())
     }
 }
 pub fn scratch_window(
     size: gpui::Size<Pixels>,
     cx: &mut gpui::App,
 ) -> Result<gpui::AnyWindowHandle, ControlError> {
-    use gpui::AppContext;
     let handle = cx
         .open_window(
             gpui::WindowOptions {
@@ -158,7 +159,7 @@ pub fn scratch_window(
                 ))),
                 ..Default::default()
             },
-            |_, cx| cx.new(|_| Scratch),
+            |_, cx| cx.new(|_| Scratch(None)),
         )
         .map_err(|e| ControlError::new("frame_unavailable", e.to_string()))?;
     Ok(handle.into())
@@ -172,7 +173,9 @@ pub fn paint_offscreen(
 ) -> Result<GpuCapture, ControlError> {
     handle
         .update(cx, |_, window, cx| {
-            let result = window.capture_element(element, size, scale, cx);
+            // Interactive children need a rendering view even on a scratch surface.
+            let view = cx.new(|_| Scratch(Some(element)));
+            let result = window.capture_element(view.into_any_element(), size, scale, cx);
             window.remove_window();
             result.map_err(|e| ControlError::new("frame_unavailable", e.to_string()))
         })
@@ -390,7 +393,7 @@ pub fn write(
                 None
             }
         };
-        let environment = json!({"build":{"mightty_version":env!("CARGO_PKG_VERSION"),"mightty_revision":env!("MIGHTTY_BUILD_REVISION"),"target":env!("MIGHTTY_BUILD_TARGET"),"profile":env!("MIGHTTY_BUILD_PROFILE"),"ghostty_headers":env!("MIGHTTY_GHOSTTY_HEADERS"),"embedded_fonts":env!("MIGHTTY_FONT_FINGERPRINTS"),"ghostty_revision":crate::ghostty::SOURCE_REVISION,"gpui_version":"0.2.2 with local capture patch","debug_assertions":cfg!(debug_assertions)},"os":operating_system(),"backend":"Direct3D11","color":{"source":"BGRA8 UNORM","export":"RGBA8 PNG","conversion":"lossless channel swizzle; no color correction"},"dpi_scale":prepared.frame.dpi_scale,"frame_effective_settings":prepared.frame.window["settings"],"gpu":prepared.frame.window["gpu"],"current_settings_generations":state["windows"].as_array().map(|windows|windows.iter().map(|window|json!({"window_id":window["window_id"],"generation":window["settings_generation"]})).collect::<Vec<_>>()),"launch_recipes":prepared.frame.panes.iter().map(|pane|&pane.state["launch"]).collect::<Vec<_>>()});
+        let environment = json!({"build":{"mightty_version":env!("CARGO_PKG_VERSION"),"mightty_revision":env!("MIGHTTY_BUILD_REVISION"),"target":env!("MIGHTTY_BUILD_TARGET"),"profile":env!("MIGHTTY_BUILD_PROFILE"),"ghostty_optimize":env!("MIGHTTY_GHOSTTY_OPTIMIZE"),"ghostty_headers":env!("MIGHTTY_GHOSTTY_HEADERS"),"embedded_fonts":env!("MIGHTTY_FONT_FINGERPRINTS"),"ghostty_revision":crate::ghostty::SOURCE_REVISION,"gpui_version":"0.2.2 with local capture patch","debug_assertions":cfg!(debug_assertions)},"os":operating_system(),"backend":"Direct3D11","color":{"source":"BGRA8 UNORM","export":"RGBA8 PNG","conversion":"lossless channel swizzle; no color correction"},"dpi_scale":prepared.frame.dpi_scale,"frame_effective_settings":prepared.frame.window["settings"],"gpu":prepared.frame.window["gpu"],"current_settings_generations":state["windows"].as_array().map(|windows|windows.iter().map(|window|json!({"window_id":window["window_id"],"generation":window["settings_generation"]})).collect::<Vec<_>>()),"launch_recipes":prepared.frame.panes.iter().map(|pane|&pane.state["launch"]).collect::<Vec<_>>()});
         for (name, value) in [
             (
                 "frame.json",

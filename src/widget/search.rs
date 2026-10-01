@@ -12,6 +12,8 @@ pub(super) struct SearchOverlay {
     pub diagnostic: Option<String>,
     pub revision: u64,
     pub step_scheduled: bool,
+    pub output_revision: u64,
+    pub geometry: (u16, u16),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -32,6 +34,8 @@ impl Default for SearchOverlay {
             diagnostic: None,
             revision: 0,
             step_scheduled: false,
+            output_revision: 0,
+            geometry: (0, 0),
         }
     }
 }

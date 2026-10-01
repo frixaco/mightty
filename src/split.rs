@@ -455,7 +455,7 @@ impl Split {
     }
 
     pub fn focus_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(terminal) = self.active_terminal(window, cx) {
+        if let Some(terminal) = self.terminal(self.active_pane_id) {
             terminal.update(cx, |terminal, _cx| terminal.request_focus(window));
         }
     }

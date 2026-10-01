@@ -552,7 +552,7 @@ impl WindowsApplication {
         if changed || force {
             self.persistence_pending = true;
             self.control_revision += 1;
-            self.diagnostic_state = json!({"schema_version":1,"instance_id":mightty::control::instance_id(),"pid":std::process::id(),"started_at":self.started_at,"uptime_ms":self.started.elapsed().as_millis().to_string(),"observed_at":mightty::diagnostics::timestamp(),"revision":self.control_revision.to_string(),"source":"live","orderly_shutdown":false,"last_focused_window_id":self.last_focused_window,"build":{"mightty_version":env!("CARGO_PKG_VERSION"),"mightty_revision":env!("MIGHTTY_BUILD_REVISION"),"target":env!("MIGHTTY_BUILD_TARGET"),"profile":env!("MIGHTTY_BUILD_PROFILE"),"ghostty_revision":mightty::ghostty::SOURCE_REVISION},"windows":windows,"outcomes":outcomes,"diagnostics":logs,"persistence":self.diagnostic_writer.status()});
+            self.diagnostic_state = json!({"schema_version":1,"instance_id":mightty::control::instance_id(),"pid":std::process::id(),"started_at":self.started_at,"uptime_ms":self.started.elapsed().as_millis().to_string(),"observed_at":mightty::diagnostics::timestamp(),"revision":self.control_revision.to_string(),"source":"live","orderly_shutdown":false,"last_focused_window_id":self.last_focused_window,"build":{"mightty_version":env!("CARGO_PKG_VERSION"),"mightty_revision":env!("MIGHTTY_BUILD_REVISION"),"target":env!("MIGHTTY_BUILD_TARGET"),"profile":env!("MIGHTTY_BUILD_PROFILE"),"ghostty_optimize":env!("MIGHTTY_GHOSTTY_OPTIMIZE"),"ghostty_revision":mightty::ghostty::SOURCE_REVISION},"windows":windows,"outcomes":outcomes,"diagnostics":logs,"persistence":self.diagnostic_writer.status()});
             mightty::snapshot::publish_state(self.diagnostic_state.clone());
             let event = json!({"protocol_version":1,"instance_id":mightty::control::instance_id(),"revision":self.control_revision.to_string(),"type":"change","changes":[{"kind":"windows_changed","windows":self.diagnostic_state["windows"]},{"kind":"outcomes_changed","outcomes":self.diagnostic_state["outcomes"]},{"kind":"diagnostics_changed","diagnostics":self.diagnostic_state["diagnostics"]}]});
             self.subscribers.retain(|sender|{if sender.len()>=31 {let _=sender.try_send(json!({"protocol_version":1,"instance_id":mightty::control::instance_id(),"revision":self.control_revision.to_string(),"type":"resync_required"}));false}else{sender.try_send(event.clone()).is_ok()}});
@@ -805,6 +805,16 @@ impl WindowsApplication {
                                 panes.update(cx, |panes, cx| panes.offscreen(&request, window, cx)),
                             );
                         }
+                        if next {
+                            match panes.read(cx).snapshot_presentation_ready(&request, cx) {
+                                Err(error) => return Some(Err(error)),
+                                Ok(false) => {
+                                    requested = false;
+                                    return None;
+                                }
+                                Ok(true) => {}
+                            }
+                        }
                         if !requested {
                             baseline = window
                                 .prepared_metadata()
@@ -833,7 +843,7 @@ impl WindowsApplication {
                         }
                         _ if std::time::Instant::now() >= deadline => {
                             break Err(ControlError::new(
-                                if offscreen || !requested {
+                                if offscreen {
                                     "layout_unavailable"
                                 } else {
                                     "timeout"

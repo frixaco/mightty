@@ -133,6 +133,7 @@ fn build_and_link_ghostty(ghostty_dir: &Path) {
     let cache_dir = out_dir.join("ghostty-zig-cache");
     let target = env::var("TARGET").expect("missing TARGET");
     let optimize = optimize_mode();
+    println!("cargo:rustc-env=MIGHTTY_GHOSTTY_OPTIMIZE={optimize}");
     let zig = env::var_os("ZIG").unwrap_or_else(|| OsString::from("zig"));
 
     let mut command = Command::new(&zig);
@@ -227,8 +228,10 @@ fn build_and_link_search(repo_dir: &Path) {
 }
 
 fn optimize_mode() -> &'static str {
-    if env::var("DEBUG").as_deref() == Ok("true") {
+    if env::var_os("CARGO_FEATURE_GHOSTTY_DEBUG").is_some() {
         "Debug"
+    } else if env::var("DEBUG").as_deref() == Ok("true") {
+        "ReleaseSafe"
     } else {
         match env::var("OPT_LEVEL").as_deref() {
             Ok("s" | "z") => "ReleaseSmall",

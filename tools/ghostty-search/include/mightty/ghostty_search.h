@@ -10,6 +10,9 @@ extern "C" {
 /* Fresh presentation snapshot without consuming the live renderer's dirty flags. */
 GhosttyResult mightty_ghostty_render_observe(GhosttyRenderState state, GhosttyTerminal terminal);
 
+/* Parse using native ground boundaries; count new synchronized-output holds. */
+uint64_t mightty_ghostty_vt_write(GhosttyTerminal terminal, const uint8_t* data, size_t len);
+
 typedef struct MighttyGhosttySearchImpl* MighttyGhosttySearch;
 
 typedef enum {

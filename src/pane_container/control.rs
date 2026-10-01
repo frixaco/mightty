@@ -6,6 +6,28 @@ use crate::{
 use serde_json::{Value, json};
 
 impl PaneContainer {
+    pub fn snapshot_presentation_ready(
+        &self,
+        request: &Request,
+        cx: &gpui::App,
+    ) -> Result<bool, ControlError> {
+        let (index, target) = if request.target.pane_id.is_some() {
+            let (index, pane, _) = self.targeted_terminal(request, cx)?;
+            (index, Some(pane))
+        } else {
+            (self.control_tab(request, cx)?, None)
+        };
+        let split = self.tabs[index].split.read(cx);
+        Ok(split
+            .pane_entities()
+            .filter(|(id, _, _)| {
+                target.map_or_else(
+                    || split.zoomed_pane_id().is_none_or(|zoom| zoom == *id),
+                    |target| target == *id,
+                )
+            })
+            .all(|(_, _, terminal)| !terminal.read(cx).presentation_held()))
+    }
     pub(super) fn title_provenance(&self, index: usize, cx: &gpui::App) -> Value {
         let tab = &self.tabs[index];
         let split = tab.split.read(cx);
@@ -106,7 +128,7 @@ impl PaneContainer {
         let mut panes = Vec::new();
         let mut cell_budget = 40000usize;
         for (id, profile, terminal) in entities {
-            let count = terminal.read(cx).capture_cell_count();
+            let count = terminal.read(cx).capture_cell_count(revision == 0);
             let include_source = count <= 20000 && count <= cell_budget;
             if include_source {
                 cell_budget -= count;
@@ -184,6 +206,12 @@ impl PaneContainer {
             px(bounds["height"].as_f64().unwrap() as f32),
         );
         crate::snapshot::validate_size(size, window.scale_factor())?;
+        // Opening a GPUI window draws and clears the element arena; do it
+        // before allocating the capture tree.
+        let scratch = crate::snapshot::scratch_window(size, cx)?;
+        let element = self.tabs[index]
+            .split
+            .update(cx, |split, cx| split.offscreen_element(target, window, cx));
         let mut frame = self.presentation_tab(index, target, 0, window, cx);
         let owned = std::sync::Arc::get_mut(&mut frame).unwrap();
         owned.scene_revision = format!("offscreen:{}", request.request_id);
@@ -192,12 +220,6 @@ impl PaneContainer {
         owned.window["sidebar_visible"] = json!(false);
         owned.window["image_origin_logical"] = json!({"x":bounds["x"],"y":bounds["y"]});
         owned.window["bounds"] = json!({"width":bounds["width"],"height":bounds["height"]});
-        // Opening a GPUI window draws and clears the element arena; do it
-        // before allocating the capture tree.
-        let scratch = crate::snapshot::scratch_window(size, cx)?;
-        let element = self.tabs[index]
-            .split
-            .update(cx, |split, cx| split.offscreen_element(target, window, cx));
         let gpu =
             crate::snapshot::paint_offscreen(scratch, element, size, window.scale_factor(), cx)?;
         Ok(crate::snapshot::Prepared {

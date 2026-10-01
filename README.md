@@ -11,6 +11,8 @@ shell I/O through a forkpty-backed bridge.
 - GPU-rendered terminal UI through GPUI.
 - Terminal emulation through Ghostty's `libghostty-vt`, built directly from the
   pinned Ghostty source submodule.
+- Protocol-controlled cursor appearance and synchronized output, with one owned
+  presentation frame shared by rendering, IME positioning and capture.
 - Scrollback, selection, mouse reporting, safe paste, hyperlinks, a scrollbar,
   and full-scrollback search.
 - Typed profiles, themes, fonts, key bindings, and safe settings reload.
@@ -75,6 +77,10 @@ mise exec -- cargo build --release
 The root `build.rs` runs Zig against the local `ghostty/` submodule and links
 the resulting static `libghostty-vt` archive. It never fetches a separate
 Ghostty checkout and there are no `libghostty-vt` Rust crate dependencies.
+
+Development builds use Zig `ReleaseSafe`, retaining runtime safety without
+Ghostty's expensive page integrity audits. Use `cargo run --features ghostty-debug`
+when investigating Ghostty core integrity. Release builds use `ReleaseFast`.
 
 The binding generator records the Ghostty commit and public-header fingerprint
 in `src/ghostty/bindings.version`. Every build verifies the submodule against
@@ -227,7 +233,9 @@ src/
 │   ├── mod.rs           # Terminal widget lifecycle and GPUI task wiring
 │   ├── pty.rs           # Wake-driven PTY worker bridge
 │   ├── input.rs         # GPUI key event to Ghostty key encoding
+│   ├── presentation.rs  # Owned frame builder and synchronized publication
 │   ├── render.rs        # Terminal cell rendering
+│   ├── native_presentation.rs # Explicit Windows GPU regression (tests only)
 │   ├── graphics.rs      # Kitty graphics resource cache and placement
 │   ├── search.rs        # Search result projection and overlay state
 │   └── capture.rs       # Terminal-state feedback snapshot

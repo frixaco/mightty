@@ -37,15 +37,15 @@ fn byte_range(text: &str, range: Range<usize>) -> Range<usize> {
 impl TerminalWidget {
     pub(super) fn input_cursor_bounds(&mut self) -> Option<Bounds<Pixels>> {
         let origin = self.layout_bounds?.origin;
-        let snapshot = self.render_state.update(&self.terminal).ok()?;
-        let cursor = snapshot.cursor_viewport().ok()??;
+        let frame = self.committed.as_ref()?;
+        let (column, row, columns) = frame.cursor_footprint()?;
         Some(Bounds::new(
             origin
                 + point(
-                    self.cell_size.0 * f32::from(cursor.x),
-                    self.cell_size.1 * f32::from(cursor.y),
+                    frame.cell_size.0 * f32::from(column),
+                    frame.cell_size.1 * f32::from(row),
                 ),
-            size(self.cell_size.0, self.cell_size.1),
+            size(frame.cell_size.0 * f32::from(columns), frame.cell_size.1),
         ))
     }
 }
@@ -118,6 +118,7 @@ impl EntityInputHandler for TerminalWidget {
             }
             self.reset_cursor_blink(cx);
         }
+        self.presentation_dirty = true;
         cx.notify();
     }
     fn replace_and_mark_text_in_range(

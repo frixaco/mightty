@@ -31,13 +31,14 @@ pub(super) struct GraphicsRenderer {
     cache: TextureCache,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(super) struct GraphicsFrame {
     pub below_background: Vec<RenderedPlacement>,
     pub below_text: Vec<RenderedPlacement>,
     pub above_text: Vec<RenderedPlacement>,
 }
 
+#[derive(Clone)]
 pub(super) struct RenderedPlacement {
     image: Arc<RenderImage>,
     layout: PlacementLayout,
@@ -178,6 +179,10 @@ impl GraphicsRenderer {
     #[cfg(test)]
     fn cache_len(&self) -> usize {
         self.cache.entries.len()
+    }
+    #[cfg(test)]
+    pub(super) fn test_cache_limit(&mut self, bytes: usize) {
+        self.cache.limit = bytes;
     }
 }
 

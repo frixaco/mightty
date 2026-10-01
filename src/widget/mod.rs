@@ -7,6 +7,9 @@ mod capture;
 mod control;
 mod graphics;
 mod input;
+#[cfg(all(test, windows))]
+mod native_presentation;
+mod presentation;
 mod pty;
 mod render;
 mod search;
@@ -141,6 +144,15 @@ pub struct TerminalWidget {
     row_iterator: RowIterator,
     cell_iterator: CellIterator,
     graphics_renderer: graphics::GraphicsRenderer,
+    committed: Option<Rc<presentation::TerminalFrame>>,
+    painted: Option<presentation::PaintedTerminal>,
+    offscreen_painted: Option<presentation::PaintedTerminal>,
+    presentation_dirty: bool,
+    sync_hold: Option<(u64, Instant)>,
+    sync_task: Task<()>,
+    presentation_retry: Task<()>,
+    presentation_snapshot_invalid: bool,
+    presentation_resize_failed: bool,
     search: Option<search::SearchOverlay>,
     search_restore_focus: Option<gpui::WeakFocusHandle>,
     search_task: Task<()>,
@@ -363,6 +375,16 @@ impl TerminalWidget {
             .on_bell(move || effects.borrow_mut().bell = true)
             .expect("Failed to configure terminal bell updates");
         terminal
+            .set_default_cursor(
+                match config.cursor_style {
+                    CursorStyle::Block => crate::ghostty::render::CursorShape::Block,
+                    CursorStyle::Line => crate::ghostty::render::CursorShape::Bar,
+                    CursorStyle::Underline => crate::ghostty::render::CursorShape::Underline,
+                },
+                config.cursor_blink,
+            )
+            .expect("Failed to configure terminal cursor defaults");
+        terminal
             .set_default_fg_color(Some(rgba_to_rgb(theme.foreground)))
             .and_then(|terminal| terminal.set_default_bg_color(Some(rgba_to_rgb(theme.background))))
             .and_then(|terminal| terminal.set_default_cursor_color(Some(rgba_to_rgb(theme.cursor))))
@@ -383,7 +405,7 @@ impl TerminalWidget {
 
         let size = (config.initial_cols, config.initial_rows);
 
-        let has_exited = exit_flag.load(Ordering::Relaxed);
+        let has_exited = pty_event_rx.is_none() && exit_flag.load(Ordering::Relaxed);
         let bindings_generation = config.settings_generation;
 
         let mut widget = Self {
@@ -396,6 +418,15 @@ impl TerminalWidget {
             row_iterator,
             cell_iterator,
             graphics_renderer,
+            committed: None,
+            painted: None,
+            offscreen_painted: None,
+            presentation_dirty: true,
+            sync_hold: None,
+            sync_task: Task::ready(()),
+            presentation_retry: Task::ready(()),
+            presentation_snapshot_invalid: false,
+            presentation_resize_failed: false,
             search: None,
             search_restore_focus: None,
             search_task: Task::ready(()),
@@ -445,7 +476,7 @@ impl TerminalWidget {
         if let Some(event_rx) = pty_event_rx {
             widget.start_output_task(event_rx, cx);
         }
-        widget.schedule_cursor_blink(cx);
+        widget.publish_terminal(cx);
         widget
     }
 
@@ -454,7 +485,10 @@ impl TerminalWidget {
     }
 
     pub fn has_exited(&self) -> bool {
-        self.has_exited || self.exit_flag.load(Ordering::Relaxed)
+        self.has_exited
+    }
+    pub fn presentation_held(&self) -> bool {
+        self.terminal.synchronized_output().unwrap_or(true)
     }
     pub fn launch_succeeded(&self) -> bool {
         self.pty_worker.is_some()
@@ -481,7 +515,9 @@ impl TerminalWidget {
     }
 
     pub(crate) fn has_selection(&self) -> bool {
-        self.terminal.has_selection().unwrap_or(false)
+        self.committed
+            .as_ref()
+            .is_some_and(|frame| frame.selection.is_some())
     }
 
     pub(crate) fn reported_local_working_directory(&self) -> Option<PathBuf> {
@@ -517,7 +553,10 @@ impl TerminalWidget {
 
     pub(crate) fn jump_to_prompt(&mut self, direction: PromptDirection, cx: &mut Context<Self>) {
         match self.terminal.jump_to_prompt(direction) {
-            Ok(true) => cx.notify(),
+            Ok(true) => {
+                self.presentation_dirty = true;
+                cx.notify();
+            }
             Ok(false) => {}
             Err(error) => eprintln!("Failed to navigate semantic prompts: {error}"),
         }
@@ -525,7 +564,10 @@ impl TerminalWidget {
 
     pub(crate) fn select_command_output(&mut self, cx: &mut Context<Self>) {
         match self.terminal.select_command_output() {
-            Ok(true) => cx.notify(),
+            Ok(true) => {
+                self.presentation_dirty = true;
+                cx.notify();
+            }
             Ok(false) => {}
             Err(error) => eprintln!("Failed to select command output: {error}"),
         }
@@ -572,6 +614,7 @@ impl TerminalWidget {
         self.preedit.clear();
         self.composing = false;
         self.pending_text_key = None;
+        self.presentation_dirty = true;
         cx.notify();
     }
 
@@ -586,6 +629,7 @@ impl TerminalWidget {
             .and_then(|focus| focus.upgrade())
             .unwrap_or_else(|| self.focus_handle.clone())
             .focus(window);
+        self.presentation_dirty = true;
         cx.notify();
     }
 
@@ -602,6 +646,7 @@ impl TerminalWidget {
             search.progress = SearchProgress::Complete;
             self.terminal.stop_search();
             self.search_task = Task::ready(());
+            self.presentation_dirty = true;
             cx.notify();
             return;
         }
@@ -614,6 +659,7 @@ impl TerminalWidget {
             Err(error) => {
                 search.progress = SearchProgress::Complete;
                 search.diagnostic = Some(error.to_string());
+                self.presentation_dirty = true;
                 cx.notify();
             }
         }
@@ -649,6 +695,8 @@ impl TerminalWidget {
                     (Ok(progress), Ok(ranges)) => {
                         search.progress = progress;
                         search.ranges = ranges;
+                        search.output_revision = this.terminal.write_revision();
+                        search.geometry = this.size;
                         if search
                             .active
                             .is_some_and(|active| !search.ranges.contains(&active))
@@ -656,6 +704,7 @@ impl TerminalWidget {
                             search.active = None;
                         }
                         search.diagnostic = None;
+                        this.presentation_dirty = true;
                         cx.notify();
                         if progress == SearchProgress::Pending {
                             this.schedule_search_step(cx);
@@ -664,6 +713,7 @@ impl TerminalWidget {
                     (Err(error), _) | (_, Err(error)) => {
                         search.progress = SearchProgress::Complete;
                         search.diagnostic = Some(error.to_string());
+                        this.presentation_dirty = true;
                         cx.notify();
                     }
                 }
@@ -687,6 +737,7 @@ impl TerminalWidget {
                 if let Some(search) = self.search.as_mut() {
                     search.active = Some(range);
                 }
+                self.presentation_dirty = true;
                 cx.notify();
             }
             Ok(None) => {}
@@ -694,13 +745,16 @@ impl TerminalWidget {
                 if let Some(search) = self.search.as_mut() {
                     search.diagnostic = Some(error.to_string());
                 }
+                self.presentation_dirty = true;
                 cx.notify();
             }
         }
     }
 
     fn schedule_cursor_blink(&mut self, cx: &mut Context<Self>) {
-        if !self.config.cursor_blink {
+        if !self.committed.as_ref().is_some_and(|frame| {
+            frame.cursor.visible && frame.cursor.blinking && frame.cursor.position.is_some()
+        }) {
             self.cursor_blink_phase = true;
             self.cursor_blink_task = Task::ready(());
             return;
@@ -711,7 +765,11 @@ impl TerminalWidget {
             Timer::after(interval).await;
             if let Some(this) = this.upgrade() {
                 this.update(cx, |this, cx| {
-                    if !this.config.cursor_blink {
+                    if !this.committed.as_ref().is_some_and(|frame| {
+                        frame.cursor.visible
+                            && frame.cursor.blinking
+                            && frame.cursor.position.is_some()
+                    }) {
                         this.cursor_blink_phase = true;
                         this.cursor_blink_task = Task::ready(());
                         cx.notify();
@@ -729,36 +787,63 @@ impl TerminalWidget {
 
     fn start_output_task(&mut self, event_rx: flume::Receiver<PtyEvent>, cx: &mut Context<Self>) {
         self.output_task = cx.spawn(async move |this, cx| {
+            let executor = cx.background_executor().clone();
+            let mut turns = 0u64;
+            let mut bytes = 0u64;
+            let mut processing = Duration::ZERO;
+            let mut longest_turn = Duration::ZERO;
+            let mut longest_event = Duration::ZERO;
             while let Ok(first_event) = event_rx.recv_async().await {
-                let mut events = vec![first_event];
-                let mut drained_bytes = events.iter().map(PtyEvent::len).sum::<usize>();
-
-                while drained_bytes < OUTPUT_DRAIN_BUDGET {
-                    match event_rx.try_recv() {
-                        Ok(event) => {
-                            drained_bytes += event.len();
-                            events.push(event);
-                        }
-                        Err(flume::TryRecvError::Empty) => break,
-                        Err(flume::TryRecvError::Disconnected) => break,
-                    }
-                }
-
-                let Some(this) = this.upgrade() else {
+                let Some(widget) = this.upgrade() else {
                     break;
                 };
-
-                this.update(cx, |this, cx| {
-                    for event in events {
+                let completed = widget.update(cx, |this, cx| {
+                    let started = executor.now();
+                    let mut drained_bytes = 0;
+                    let mut event = first_event;
+                    loop {
+                        drained_bytes += event.len();
+                        let event_started = executor.now();
                         this.apply_pty_event(event, cx);
+                        longest_event = longest_event.max(executor.now().duration_since(event_started));
+                        if this.output_eof
+                            || drained_bytes >= OUTPUT_DRAIN_BUDGET
+                            || executor.now().duration_since(started) >= Duration::from_millis(2)
+                        {
+                            break;
+                        }
+                        match event_rx.try_recv() {
+                            Ok(next) => event = next,
+                            Err(_) => break,
+                        }
                     }
-                    if this.exit_flag.load(Ordering::Relaxed) {
-                        this.mark_exited();
+                    let elapsed = executor.now().duration_since(started);
+                    turns += 1;
+                    bytes += drained_bytes as u64;
+                    processing += elapsed;
+                    longest_turn = longest_turn.max(elapsed);
+                    this.poll_presentation_mode(cx);
+                    if this.output_eof {
+                        eprintln!("PTY output completed: {}", serde_json::json!({"turns": turns, "bytes": bytes,
+                            "processing_ms": processing.as_secs_f64()*1000.0, "max_turn_ms": longest_turn.as_secs_f64()*1000.0,
+                            "max_event_ms": longest_event.as_secs_f64()*1000.0}));
                     }
                     cx.notify();
-                })
-                .ok();
+                    this.output_eof
+                });
+                drop(widget);
+                if !matches!(completed, Ok(false)) {
+                    return;
+                }
+                // A ready receiver never yields. A nonzero timer also lets Windows
+                // dispatch input and painting between posted foreground tasks.
+                executor.timer(Duration::from_millis(1)).await;
             }
+            // All senders are gone and the queue has been drained.
+            let _ = this.update(cx, |this, cx| {
+                this.apply_pty_event(PtyEvent::OutputEnded(None), cx);
+                cx.notify();
+            });
         });
     }
 
@@ -766,6 +851,7 @@ impl TerminalWidget {
         match event {
             PtyEvent::Output(data) => {
                 self.terminal.vt_write(&data);
+                self.presentation_dirty = true;
                 self.output_seq = self.output_seq.saturating_add(data.len() as u64);
                 self.schedule_search_step(cx);
                 if !self.semantic_commands_available {
@@ -777,8 +863,12 @@ impl TerminalWidget {
                 }
                 self.emit_terminal_effects(cx);
             }
-            PtyEvent::OutputEnded => {
+            PtyEvent::OutputEnded(error) => {
+                if let Some(error) = error {
+                    self.apply_pty_event(PtyEvent::IoFailed(error), cx);
+                }
                 self.output_eof = true;
+                self.recover_presentation(cx);
                 self.mark_exited();
             }
             PtyEvent::IoFailed(error) => {
@@ -789,7 +879,6 @@ impl TerminalWidget {
                     launch_context(&self.config.launch),
                 );
                 self.io_error = Some(error);
-                self.mark_exited();
             }
         }
     }
@@ -857,7 +946,11 @@ impl TerminalWidget {
     }
 
     fn reset_cursor_blink(&mut self, cx: &mut Context<Self>) {
-        if self.config.cursor_blink {
+        if self
+            .committed
+            .as_ref()
+            .is_some_and(|frame| frame.cursor.visible && frame.cursor.blinking)
+        {
             self.cursor_blink_phase = true;
             cx.notify();
             self.schedule_cursor_blink(cx);
@@ -885,6 +978,7 @@ impl TerminalWidget {
                     .resize(cols, rows, cell_width as u32, cell_height as u32)
             {
                 self.geometry_dirty = true;
+                self.presentation_resize_failed = true;
                 crate::diagnostics::record(
                     "layout",
                     "terminal_resize_failed",
@@ -895,11 +989,22 @@ impl TerminalWidget {
                     written_bytes: 0,
                     error: Some(error.to_string()),
                 });
+                self.presentation_retry = cx.spawn(async move |this, cx| {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(16))
+                        .await;
+                    let _ = this.update(cx, |this, cx| {
+                        this.resize_to_size(size, cx);
+                    });
+                });
                 return Some(ack);
             }
             {
                 self.size = (cols, rows);
                 self.geometry_dirty = false;
+                self.presentation_resize_failed = false;
+                self.schedule_search_step(cx);
+                self.recover_presentation(cx);
                 if self.pty_tx.is_none() {
                     let _ = reply.try_send(crate::control::Acknowledgement {
                         written_bytes: 0,
@@ -1139,6 +1244,8 @@ impl TerminalWidget {
                 eprintln!("Failed to clear terminal selection after typing: {error}");
             }
             self.send_pty_command(PtyCommand::Write(vt_bytes));
+            self.presentation_dirty = true;
+            cx.notify();
         }
         self.reset_cursor_blink(cx);
     }
@@ -1195,6 +1302,7 @@ impl TerminalWidget {
         match self.terminal.selection_press(press) {
             Ok(()) => {
                 self.selecting = true;
+                self.presentation_dirty = true;
                 cx.notify();
             }
             Err(error) => {
@@ -1221,6 +1329,7 @@ impl TerminalWidget {
                 eprintln!("Failed to update terminal selection: {error}");
                 return;
             }
+            self.presentation_dirty = true;
             cx.notify();
             return;
         }
@@ -1248,6 +1357,7 @@ impl TerminalWidget {
                 eprintln!("Failed to finish terminal selection: {error}");
             }
             self.selecting = false;
+            self.presentation_dirty = true;
             cx.notify();
             return;
         }
@@ -1294,6 +1404,7 @@ impl TerminalWidget {
             } else {
                 self.terminal
                     .scroll_viewport(wheel_rows_to_viewport_scroll(wheel_rows));
+                self.presentation_dirty = true;
                 cx.notify();
             }
         }
@@ -1388,16 +1499,22 @@ impl TerminalWidget {
         let Some(point) = self.selection_point(event.position) else {
             return false;
         };
-        let Ok(Some(uri)) = self.terminal.hyperlink_uri(point.column, point.row) else {
+        let Some(uri) = self
+            .committed
+            .as_ref()
+            .and_then(|frame| frame.rows.get(point.row as usize))
+            .and_then(|row| row.cells.get(usize::from(point.column)))
+            .and_then(|cell| cell.hyperlink.as_ref())
+        else {
             return false;
         };
         window.prevent_default();
         cx.stop_propagation();
-        if !allowed_hyperlink(&uri) {
+        if !allowed_hyperlink(uri) {
             eprintln!("Blocked terminal hyperlink with an unsupported URI scheme");
             return true;
         }
-        if let Err(error) = open_hyperlink(&uri) {
+        if let Err(error) = open_hyperlink(uri) {
             eprintln!("Failed to open terminal hyperlink: {error}");
         }
         true
@@ -1450,16 +1567,19 @@ impl TerminalWidget {
             return;
         };
         self.terminal.scroll_viewport(ViewportScroll::Row(row));
+        self.presentation_dirty = true;
         cx.notify();
     }
 
     pub(crate) fn copy_selection(&mut self, cx: &mut Context<Self>) {
-        match self.terminal.selected_text() {
-            Ok(Some(text)) if !text.is_empty() => {
-                cx.write_to_clipboard(ClipboardItem::new_string(text));
-            }
-            Ok(_) => {}
-            Err(error) => eprintln!("Failed to copy terminal selection: {error}"),
+        self.publish_terminal(cx);
+        if let Some(text) = self
+            .committed
+            .as_ref()
+            .and_then(|frame| frame.selection_text.as_ref())
+            .filter(|text| !text.is_empty())
+        {
+            cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
         }
     }
 
@@ -1500,6 +1620,7 @@ impl TerminalWidget {
                 }
                 self.send_pty_command(PtyCommand::Write(bytes));
                 self.reset_cursor_blink(cx);
+                self.presentation_dirty = true;
                 cx.notify();
             }
             Err(error) => eprintln!("Failed to encode terminal paste: {error}"),
@@ -1507,7 +1628,8 @@ impl TerminalWidget {
     }
 
     fn selection_point(&self, position: Point<Pixels>) -> Option<SelectionPoint> {
-        terminal_selection_point(position, self.layout_bounds?, self.cell_size, self.size)
+        let frame = self.committed.as_ref()?;
+        terminal_selection_point(position, self.layout_bounds?, frame.cell_size, frame.size)
     }
 
     fn selection_geometry(&self) -> SelectionGeometry {
@@ -1769,6 +1891,100 @@ mod interaction_tests {
     use gpui::{point, size};
 
     use super::*;
+
+    #[gpui::test]
+    fn output_task_yields_and_finishes_before_signalling_exit(cx: &mut gpui::TestAppContext) {
+        let (tx, rx) = flume::bounded(64);
+        // An already-finished reader must not make queued output removable.
+        let flag = Arc::new(AtomicBool::new(true));
+        for _ in 0..16 {
+            tx.send(PtyEvent::Output(vec![0; 32 * 1024])).unwrap();
+        }
+        tx.send(PtyEvent::IoFailed("control failed".into()))
+            .unwrap();
+        tx.send(PtyEvent::Output(b"FINAL".to_vec())).unwrap();
+        tx.send(PtyEvent::OutputEnded(Some("reader failed".into())))
+            .unwrap();
+        let pending = rx.clone();
+        let (exit_tx, exit_rx) = flume::unbounded();
+        let widget = cx.new(|cx| {
+            let mut widget = TerminalWidget::with_pty(
+                TerminalConfig {
+                    cursor_blink: false,
+                    ..Default::default()
+                },
+                flag,
+                None,
+                Some(rx),
+                None,
+                cx,
+            );
+            widget.set_exit_signal(exit_tx);
+            widget
+        });
+        cx.run_until_parked();
+        cx.read(|cx| {
+            let widget = widget.read(cx);
+            assert_eq!(widget.output_seq, OUTPUT_DRAIN_BUDGET as u64);
+            assert!(!widget.has_exited());
+        });
+        assert!(!pending.is_empty());
+        assert!(exit_rx.is_empty());
+        let ran = Rc::new(RefCell::new(false));
+        let foreground_ran = ran.clone();
+        cx.foreground_executor
+            .spawn(async move {
+                foreground_ran.replace(true);
+            })
+            .detach();
+        cx.run_until_parked();
+        assert!(*ran.borrow());
+        assert!(exit_rx.is_empty());
+        for _ in 0..3 {
+            cx.background_executor
+                .advance_clock(Duration::from_millis(1));
+            cx.run_until_parked();
+        }
+        cx.read(|cx| {
+            let widget = widget.read(cx);
+            assert_eq!(widget.output_seq, 16 * 32 * 1024 + 5);
+            assert!(widget.output_eof && widget.has_exited());
+            assert_eq!(widget.io_error.as_deref(), Some("reader failed"));
+        });
+        assert_eq!(exit_rx.len(), 1);
+        assert!(pending.is_empty());
+        widget.update(cx, |widget, _cx| {
+            let capture = widget.build_feedback_capture(true).unwrap();
+            assert!(capture.rows.iter().any(|row| row.text.contains("FINAL")));
+        });
+        drop(widget);
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn output_task_does_not_retain_widget_while_waiting(cx: &mut gpui::TestAppContext) {
+        let (_tx, rx) = flume::bounded(1);
+        let pending = rx.clone();
+        let widget = cx.new(|cx| {
+            TerminalWidget::with_pty(
+                TerminalConfig {
+                    cursor_blink: false,
+                    ..Default::default()
+                },
+                Arc::new(AtomicBool::new(false)),
+                None,
+                Some(rx),
+                None,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        let weak = widget.downgrade();
+        drop(widget);
+        cx.run_until_parked();
+        assert!(weak.upgrade().is_none());
+        assert_eq!(pending.len(), 0);
+    }
 
     #[test]
     fn maps_window_position_to_clamped_viewport_cell() {

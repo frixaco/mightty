@@ -32,6 +32,7 @@ impl TerminalWidget {
             self.search_input = None;
             self.search_input_subscription = None;
             self.search_task = gpui::Task::ready(());
+            self.presentation_dirty = true;
             cx.notify();
         }
     }
@@ -196,6 +197,7 @@ impl TerminalWidget {
             self.terminal
                 .scroll_viewport(ViewportScroll::Delta(rows as isize));
         }
+        self.presentation_dirty = true;
         cx.notify();
         let s = self.terminal.scrollbar()?;
         Ok(json!({"offset":s.offset,"length":s.len,"total":s.total}))

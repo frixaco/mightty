@@ -61,20 +61,26 @@ impl RenderState {
     }
 
     /// Copy presentation data without consuming terminal dirty flags.
-    /// This is for diagnostic/offscreen observations, not the live update loop.
+    /// Used by live diagnostics and complete rebuilds after a failed snapshot update.
     pub fn observe(&mut self, terminal: &Terminal) -> Result<Snapshot<'_>> {
         from_result(unsafe {
             ffi::mightty_ghostty_render_observe(self.raw.as_ptr(), terminal.as_raw())
         })?;
         Ok(Snapshot { state: self })
     }
-    /// Borrow the data already prepared by the live painter, without updating it.
-    pub fn current(&mut self) -> Snapshot<'_> {
-        Snapshot { state: self }
-    }
 }
 
 impl Snapshot<'_> {
+    pub fn cursor(&self) -> Result<Cursor> {
+        Ok(Cursor {
+            position: self.cursor_viewport()?,
+            visible: unsafe { self.get_unchecked(ffi::RenderStateData::CURSOR_VISIBLE) }?,
+            blinking: unsafe { self.get_unchecked(ffi::RenderStateData::CURSOR_BLINKING) }?,
+            shape: CursorShape::from_raw(unsafe {
+                self.get_unchecked(ffi::RenderStateData::CURSOR_VISUAL_STYLE)
+            }?)?,
+        })
+    }
     pub fn colors(&self) -> Result<Colors> {
         let mut raw = ffi::RenderStateColors {
             size: size_of::<ffi::RenderStateColors>(),
@@ -237,6 +243,18 @@ impl CellIterator {
 }
 
 impl CellIteration<'_, '_> {
+    pub fn has_hyperlink(&self) -> Result<bool> {
+        let cell = unsafe { self.get_unchecked::<ffi::Cell>(ffi::RenderStateRowCellsData::RAW) }?;
+        let mut value = false;
+        from_result(unsafe {
+            ffi::ghostty_cell_get(
+                cell,
+                ffi::CellData::HAS_HYPERLINK,
+                std::ptr::from_mut(&mut value).cast(),
+            )
+        })?;
+        Ok(value)
+    }
     #[expect(
         clippy::should_implement_trait,
         reason = "this is a lending iterator whose item borrows the iterator"
@@ -387,6 +405,42 @@ pub struct CursorViewport {
     pub x: u16,
     pub y: u16,
     pub at_wide_tail: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CursorShape {
+    Bar,
+    Block,
+    Underline,
+    HollowBlock,
+}
+
+impl CursorShape {
+    pub(crate) fn from_raw(raw: ffi::TerminalCursorStyle::Type) -> Result<Self> {
+        match raw {
+            ffi::TerminalCursorStyle::BAR => Ok(Self::Bar),
+            ffi::TerminalCursorStyle::BLOCK => Ok(Self::Block),
+            ffi::TerminalCursorStyle::UNDERLINE => Ok(Self::Underline),
+            ffi::TerminalCursorStyle::BLOCK_HOLLOW => Ok(Self::HollowBlock),
+            _ => Err(Error::InvalidValue),
+        }
+    }
+    pub(crate) fn into_raw(self) -> ffi::TerminalCursorStyle::Type {
+        match self {
+            Self::Bar => ffi::TerminalCursorStyle::BAR,
+            Self::Block => ffi::TerminalCursorStyle::BLOCK,
+            Self::Underline => ffi::TerminalCursorStyle::UNDERLINE,
+            Self::HollowBlock => ffi::TerminalCursorStyle::BLOCK_HOLLOW,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Cursor {
+    pub position: Option<CursorViewport>,
+    pub visible: bool,
+    pub blinking: bool,
+    pub shape: CursorShape,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
