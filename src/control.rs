@@ -317,6 +317,19 @@ pub const OPERATIONS: &[(&str, &[&str])] = &[
     ("pane.input", &["steps"]),
     ("window.resize", &["width", "height"]),
     ("window.focus", &[]),
+    ("events", &[]),
+    (
+        "wait",
+        &[
+            "text",
+            "after_output",
+            "condition",
+            "value",
+            "layout",
+            "at_least",
+            "overlay",
+        ],
+    ),
 ];
 
 pub fn validate(request: &Request, instance_id: &str) -> Result<(), ControlError> {
@@ -443,6 +456,15 @@ fn run_cli(arguments: Vec<String>) -> Result<Value, String> {
         );
     }
     let (mut request, instance, json_output) = parse_cli(arguments)?;
+    if request.op == "state" && bool_arg(&request, "saved", false).map_err(|e| e.message)? {
+        let state = crate::diagnostics::read_saved(
+            instance.as_deref(),
+            string_arg(&request, "data_dir").map_err(|e| e.message)?,
+        )?;
+        return Ok(
+            json!({"protocol_version":1,"request_id":request.request_id,"instance_id":state["instance_id"],"revision":state["revision"],"ok":true,"result":state}),
+        );
+    }
     #[cfg(windows)]
     {
         let descriptors =
@@ -470,6 +492,15 @@ fn run_cli(arguments: Vec<String>) -> Result<Value, String> {
         request.instance_id = descriptor.instance_id.clone();
         let value = crate::application::windows::send_control(descriptor, &request)
             .map_err(|e| format!("outcome_unknown: {e}"))?;
+        if request.op == "events" {
+            std::process::exit(
+                if value["ok"] == false || value["type"] == "resync_required" {
+                    1
+                } else {
+                    0
+                },
+            );
+        }
         if !json_output
             && request.op == "pane.read"
             && value["ok"] == true
@@ -509,7 +540,7 @@ fn parse_cli(arguments: Vec<String>) -> Result<(Request, Option<String>, bool), 
             json_output = true;
             continue;
         }
-        if matches!(option.as_str(), "--viewport" | "--focus") {
+        if matches!(option.as_str(), "--viewport" | "--focus" | "--saved") {
             args.insert(option[2..].to_string(), json!(true));
             continue;
         }
@@ -602,7 +633,10 @@ fn parse_cli(arguments: Vec<String>) -> Result<(Request, Option<String>, bool), 
     let target = if explicit.window_id.is_none()
         && explicit.tab_id.is_none()
         && explicit.pane_id.is_none()
-        && op != "state"
+        && !matches!(
+            op.as_str(),
+            "state" | "capabilities" | "profiles" | "instances" | "events"
+        )
         && use_inherited
     {
         Target {
@@ -613,7 +647,11 @@ fn parse_cli(arguments: Vec<String>) -> Result<(Request, Option<String>, bool), 
     } else {
         explicit
     };
-    let instance = instance.or(inherited_instance);
+    let instance = if args.get("saved") == Some(&json!(true)) {
+        instance
+    } else {
+        instance.or(inherited_instance)
+    };
     Ok((
         Request {
             protocol_version: PROTOCOL_VERSION,

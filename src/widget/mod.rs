@@ -173,6 +173,8 @@ pub struct TerminalWidget {
     theme: TerminalTheme,
     has_exited: bool,
     output_seq: u64,
+    output_eof: bool,
+    io_error: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -254,6 +256,12 @@ impl TerminalWidget {
                 }
                 Err(err) => {
                     eprintln!("Failed to spawn shell: {err}");
+                    crate::diagnostics::record(
+                        "pty",
+                        "launch_failed",
+                        &err.to_string(),
+                        serde_json::json!({"executable":config.launch.executable}),
+                    );
                     exit_flag.store(true, Ordering::Relaxed);
                     (None, None, None)
                 }
@@ -410,6 +418,8 @@ impl TerminalWidget {
             theme,
             has_exited,
             output_seq: 0,
+            output_eof: false,
+            io_error: None,
         };
 
         if let Some(event_rx) = pty_event_rx {
@@ -450,9 +460,7 @@ impl TerminalWidget {
     }
 
     pub(crate) fn has_selection(&self) -> bool {
-        self.terminal
-            .selected_text()
-            .is_ok_and(|text| text.is_some_and(|text| !text.is_empty()))
+        self.terminal.has_selection().unwrap_or(false)
     }
 
     pub(crate) fn reported_local_working_directory(&self) -> Option<PathBuf> {
@@ -730,7 +738,15 @@ impl TerminalWidget {
                 }
                 self.emit_terminal_effects(cx);
             }
-            PtyEvent::Exited => self.mark_exited(),
+            PtyEvent::OutputEnded => {
+                self.output_eof = true;
+                self.mark_exited();
+            }
+            PtyEvent::IoFailed(error) => {
+                crate::diagnostics::record("pty", "io_failed", &error, serde_json::json!({}));
+                self.io_error = Some(error);
+                self.mark_exited();
+            }
         }
     }
 

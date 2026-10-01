@@ -4,6 +4,7 @@ pub mod action;
 pub mod application;
 mod command_palette;
 pub mod control;
+pub mod diagnostics;
 pub mod feedback;
 pub mod ghostty;
 pub mod profile;

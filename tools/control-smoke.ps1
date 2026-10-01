@@ -60,18 +60,21 @@ try {
     $steps | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $caseDirectory 'input.json') -Encoding utf8NoBOM
     $input = Invoke-Control @('pane', 'input', '--pane', $backgroundPane, '--file', (Join-Path $caseDirectory 'input.json'))
     if ($input.completion.completed_steps -ne 2) { throw 'Ordered input completion is wrong' }
-    $deadline = [datetime]::UtcNow.AddSeconds(10)
-    do {
-        $read = Invoke-Control @('pane', 'read', '--pane', $backgroundPane, '--tail', '100')
-        if ($read.text.Contains($marker)) { break }
-        Start-Sleep -Milliseconds 100
-    } while ([datetime]::UtcNow -lt $deadline)
+    $null = Invoke-Control @('wait', '--pane', $backgroundPane, '--text', $marker, '--after-output', $input.output_cursor, '--timeout', '10s')
+    $read = Invoke-Control @('pane', 'read', '--pane', $backgroundPane, '--tail', '100')
     $read | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath (Join-Path $caseDirectory 'read.json') -Encoding utf8NoBOM
     if (!$read.text.Contains($marker) -or !$read.text.Contains('hello world')) { throw "Ordered input or launch environment failed; read: $caseDirectory/read.json" }
     foreach ($createdPane in $created) { $closed = Invoke-Control @('pane', 'close', '--pane', $createdPane) }
     $remaining = Invoke-Control @('state', '--tab', $background.tab_id)
     if ($remaining.selected_pane_id -ne $backgroundPane) { throw 'Closing unselected panes changed selection' }
     $null = Invoke-Control @('tab', 'close', '--tab', $background.tab_id)
+    $outcome = Invoke-Control @('state', '--pane', $backgroundPane)
+    if (!$outcome.removed_at -or !$outcome.final_tail.Contains($marker)) { throw 'Removed pane outcome unavailable' }
+    $null = Invoke-Control @('wait', '--pane', $backgroundPane, '--condition', 'process-exited', '--timeout', '10s')
+    $events = @(& $Executable ctl events --instance $instance[0].instance_id --json --timeout 2s | ForEach-Object { $_ | ConvertFrom-Json })
+    if ($events[0].type -ne 'state' -or $events[-1].type -ne 'end') { throw 'Event subscription did not deliver initial state and clean end' }
+    $saved = & $Executable ctl state --saved --data-dir $caseDirectory --instance $instance[0].instance_id --json | ConvertFrom-Json
+    if (!$saved.ok -or $saved.result.source -ne 'saved') { throw 'Saved state unavailable' }
     Write-Output "Control inspection passed: $($instance[0].instance_id); artifacts: $caseDirectory"
 } finally {
     if (!$application.HasExited) { Stop-Process -Id $application.Id }

@@ -363,6 +363,29 @@ impl ControlServer {
                                             )
                                         }
                                         Ok(()) => {
+                                            if request.op == "events" {
+                                                let (reply_tx, reply_rx) = flume::bounded(32);
+                                                let pending = crate::control::Dispatch {request:request.clone(),reply:reply_tx,deadline};
+                                                if sender.try_send(pending).is_ok() {
+                                                    let mut last_revision = serde_json::Value::Null;
+                                                    loop {
+                                                        let mut value = match reply_rx.recv_timeout(Duration::from_millis(10)) {
+                                                            Ok(value)=>value,
+                                                            Err(flume::RecvTimeoutError::Disconnected)=>return Ok(()),
+                                                            Err(_) if stop.load(Ordering::Acquire)=>return Ok(()),
+                                                            Err(_) if Instant::now()>=deadline=>serde_json::json!({"type":"end","revision":last_revision}),
+                                                            Err(_)=>continue,
+                                                        };
+                                                        if value["type"] == "resync_required" {value["last_delivered_revision"]=last_revision.clone();}
+                                                        let terminal = value["type"] == "resync_required" || value["type"] == "end" || value["ok"] == false;
+                                                        let io_deadline=Instant::now()+Duration::from_secs(2);
+                                                        write_control_frame(pipe.raw(), &serde_json::to_vec(&value).map_err(io::Error::other)?, io_deadline,&stop)?;
+                                                        control_io(pipe.raw(), &mut [0u8],false,io_deadline,&stop)?;
+                                                        last_revision=value["revision"].clone();
+                                                        if terminal {return Ok(());}
+                                                    }
+                                                }
+                                            }
                                             let (reply_tx, reply_rx) = flume::bounded(1);
                                             let pending = crate::control::Dispatch {
                                                 request: request.clone(),
@@ -392,7 +415,7 @@ impl ControlServer {
                                                             ));
                                                         }
                                                         Err(_)
-                                                            if Instant::now() >= deadline
+                                                            if Instant::now() >= deadline + Duration::from_millis(250)
                                                                 || stop.load(Ordering::Acquire) =>
                                                         {
                                                             return Err(io::Error::new(
@@ -409,13 +432,13 @@ impl ControlServer {
                                     write_control_frame(
                                         pipe.raw(),
                                         &serde_json::to_vec(&response).map_err(io::Error::other)?,
-                                        deadline,
+                                        deadline + Duration::from_millis(250),
                                         &stop,
                                     )?;
                                     // DisconnectNamedPipe discards unread bytes. Wait for the client
                                     // to confirm receipt without a blocking FlushFileBuffers call.
                                     let mut received = [0u8; 1];
-                                    control_io(pipe.raw(), &mut received, false, deadline, &stop)
+                                    control_io(pipe.raw(), &mut received, false, deadline + Duration::from_millis(250), &stop)
                                 });
                             let _ = result;
                             unsafe {
@@ -494,7 +517,10 @@ pub fn discover_control_instances() -> io::Result<Vec<crate::control::Descriptor
         if entry.path().extension().is_none_or(|v| v != "json") {
             continue;
         }
-        if entry.metadata()?.len() > 4096 {
+        if !entry
+            .metadata()
+            .is_ok_and(|metadata| metadata.len() <= 4096)
+        {
             continue;
         }
         let Ok(bytes) = std::fs::read(entry.path()) else {
@@ -571,9 +597,26 @@ pub fn send_control(
         deadline,
         &stop,
     )?;
-    let bytes = read_control_frame(pipe.raw(), deadline, &stop)?;
-    control_io(pipe.raw(), &mut [1u8], true, deadline, &stop)?;
-    serde_json::from_slice(&bytes).map_err(io::Error::other)
+    loop {
+        let bytes = read_control_frame(pipe.raw(), deadline + Duration::from_secs(2), &stop)?;
+        control_io(
+            pipe.raw(),
+            &mut [1u8],
+            true,
+            deadline + Duration::from_secs(2),
+            &stop,
+        )?;
+        let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+        if request.op != "events" {
+            return Ok(value);
+        }
+        use std::io::Write;
+        println!("{value}");
+        std::io::stdout().flush()?;
+        if value["type"] == "end" || value["type"] == "resync_required" || value["ok"] == false {
+            return Ok(value);
+        }
+    }
 }
 
 fn read_control_frame(pipe: HANDLE, deadline: Instant, stop: &AtomicBool) -> io::Result<Vec<u8>> {

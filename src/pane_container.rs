@@ -24,6 +24,8 @@ use crate::workspace::{
     trusted_working_directory,
 };
 mod control;
+mod wait;
+pub use wait::ControlWait;
 
 const WINDOW_BACKGROUND: u32 = 0x000000;
 const WINDOW_HORIZONTAL_PADDING_PX: f32 = 8.0;
@@ -349,6 +351,8 @@ impl PaneContainer {
         let terminal = cx.new(|cx| TerminalWidget::new(config, cx));
         terminal.update(cx, |terminal, _cx| terminal.set_exit_signal(exit_tx));
         cx.subscribe(&terminal, Self::on_terminal_event).detach();
+        cx.observe(&terminal, |_, _, _| crate::diagnostics::mark_dirty())
+            .detach();
         terminal
     }
 
@@ -396,6 +400,8 @@ impl PaneContainer {
             terminal.set_exit_signal(self.exit_tx.clone())
         });
         cx.subscribe(&terminal, Self::on_terminal_event).detach();
+        cx.observe(&terminal, |_, _, _| crate::diagnostics::mark_dirty())
+            .detach();
         let split = cx.new(|_cx| Split::with_terminal(terminal, profile_id));
         let tab = Tab {
             id: TabId::fresh(),
@@ -756,6 +762,7 @@ impl PaneContainer {
         let pane_count = split.read(cx).pane_count();
 
         if pane_count > 1 {
+            self.retain_pane(self.active_tab_index, split.read(cx).active_pane_id(), cx);
             let pane_to_focus = split.update(cx, |split, cx| split.remove_active_pane(window, cx));
             if let Some(pane) = pane_to_focus {
                 pane.update(cx, |pane, _cx| pane.request_focus(window));
@@ -829,16 +836,23 @@ impl PaneContainer {
     fn remove_exited_panes(&mut self, cx: &mut Context<Self>) -> bool {
         let mut removed_any = false;
 
-        for tab in &self.tabs {
-            let exited_panes = tab.split.read(cx).exited_terminal_ids(cx);
+        for index in 0..self.tabs.len() {
+            let split = self.tabs[index].split.clone();
+            let exited_panes = split.read(cx).exited_terminal_ids(cx);
             for pane_id in exited_panes {
-                if tab.split.read(cx).pane_count() <= 1 {
+                if split.read(cx).pane_count() <= 1 {
                     break;
                 }
 
-                let removed = tab
-                    .split
-                    .update(cx, |split, _cx| split.remove_pane_by_entity(pane_id));
+                let id = split
+                    .read(cx)
+                    .pane_entities()
+                    .find(|(_, _, terminal)| terminal.entity_id() == pane_id)
+                    .map(|(id, _, _)| id);
+                if let Some(id) = id {
+                    self.retain_pane(index, id, cx);
+                }
+                let removed = split.update(cx, |split, _cx| split.remove_pane_by_entity(pane_id));
                 removed_any |= removed.is_some();
             }
         }

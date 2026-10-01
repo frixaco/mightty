@@ -36,6 +36,10 @@ GhosttyResult mightty_ghostty_search_new(
 
 void mightty_ghostty_search_free(MighttyGhosttySearch search);
 
+/* One incremental diagnostic step; never selects or changes the viewport. */
+GhosttyResult mightty_ghostty_search_probe(
+    MighttyGhosttySearch search, bool* out_match, bool* out_buffer_changed);
+
 GhosttyResult mightty_ghostty_search_step(
     MighttyGhosttySearch search,
     MighttyGhosttySearchStep* out_step);

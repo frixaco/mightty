@@ -6,6 +6,40 @@ use crate::{
 use serde_json::{Value, json};
 
 impl PaneContainer {
+    pub(super) fn retain_pane(&self, index: usize, pane: PaneId, cx: &mut Context<Self>) {
+        if let Some(terminal) = self.tabs[index].split.read(cx).terminal(pane) {
+            let mut state = terminal.read(cx).control_state();
+            state["window_id"] = json!(self.window_id);
+            state["tab_id"] = json!(format!("t{}", self.tabs[index].id.value()));
+            state["pane_id"] = json!(format!("p{}", pane.value()));
+            let root = terminal.read(cx).control_root_process();
+            let mut request = control::request(
+                &control::Descriptor {
+                    protocol_version: 1,
+                    instance_id: control::instance_id().into(),
+                    pid: 0,
+                    process_creation_time: String::new(),
+                    endpoint: String::new(),
+                    started_unix_ms: "0".into(),
+                },
+                "pane.read",
+            );
+            request.args.insert("tail".into(), json!(100));
+            state["final_tail"] = terminal
+                .update(cx, |terminal, _| terminal.control_read(&request))
+                .ok()
+                .map(|read| {
+                    read["text"]
+                        .as_str()
+                        .unwrap_or("")
+                        .chars()
+                        .take(8192)
+                        .collect::<String>()
+                })
+                .map_or(Value::Null, Value::String);
+            crate::diagnostics::retain_outcome(state, root);
+        }
+    }
     pub fn window_layout_token(&self, window: &Window, cx: &gpui::App) -> String {
         use std::hash::{Hash, Hasher};
         let mut hash = std::collections::hash_map::DefaultHasher::new();
@@ -54,7 +88,11 @@ impl PaneContainer {
         Ok(())
     }
 
-    fn control_tab(&self, request: &Request, cx: &gpui::App) -> Result<usize, ControlError> {
+    pub(super) fn control_tab(
+        &self,
+        request: &Request,
+        cx: &gpui::App,
+    ) -> Result<usize, ControlError> {
         if request.target.pane_id.is_some() {
             return self.control_target(&request.target, cx).map(|v| v.0);
         }
@@ -160,7 +198,7 @@ impl PaneContainer {
         Ok((config, profile, label))
     }
 
-    fn targeted_terminal(
+    pub(super) fn targeted_terminal(
         &self,
         request: &Request,
         cx: &gpui::App,
@@ -190,6 +228,15 @@ impl PaneContainer {
         cx: &mut Context<Self>,
     ) -> Value {
         let removed = format!("t{}", self.tabs[index].id.value());
+        let panes = self.tabs[index]
+            .split
+            .read(cx)
+            .pane_entities()
+            .map(|(id, _, _)| id)
+            .collect::<Vec<_>>();
+        for pane in panes {
+            self.retain_pane(index, pane, cx);
+        }
         self.tabs.remove(index);
         if self.tabs.is_empty() {
             window.remove_window();
@@ -299,6 +346,18 @@ impl PaneContainer {
                 let split = self.tabs[index].split.clone();
                 match request.op.as_str() {
                     "pane.split" => {
+                        if self
+                            .tabs
+                            .iter()
+                            .map(|tab| tab.split.read(cx).pane_count())
+                            .sum::<usize>()
+                            >= 128
+                        {
+                            return Err(ControlError::new(
+                                "pane_limit",
+                                "at most 128 panes per window",
+                            ));
+                        }
                         let direction = control::direction(
                             control::string_arg(request, "direction")?.ok_or_else(|| {
                                 ControlError::new("invalid_argument", "direction required")
@@ -392,6 +451,7 @@ impl PaneContainer {
                             return Ok(self.close_tab_target(index, window, cx));
                         }
                         let selected = split.read(cx).active_pane_id() == pane_id;
+                        self.retain_pane(index, pane_id, cx);
                         split.update(cx, |s, _| s.remove_pane(pane_id));
                         if selected && index == self.active_tab_index {
                             self.needs_focus = true;

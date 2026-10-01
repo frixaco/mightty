@@ -61,6 +61,29 @@ impl Drop for SearchState {
 }
 
 impl Terminal {
+    pub fn register_search(&mut self, query: &str) -> Result<u64> {
+        if self.control_searches.len() >= 32 || query.is_empty() || query.len() > 4096 {
+            return Err(Error::InvalidValue);
+        }
+        let search = SearchState::new(self.as_raw(), query)?;
+        let id = self.next_control_search;
+        self.next_control_search += 1;
+        self.control_searches.insert(id, search);
+        Ok(id)
+    }
+    /// Returns (matched, buffer changed) without using interactive search state.
+    pub fn probe_search(&mut self, id: u64) -> Result<(bool, bool)> {
+        let search = self.control_searches.get(&id).ok_or(Error::InvalidValue)?;
+        let mut matched = false;
+        let mut changed = false;
+        from_result(unsafe {
+            ffi::mightty_ghostty_search_probe(search.as_raw(), &mut matched, &mut changed)
+        })?;
+        Ok((matched, changed))
+    }
+    pub fn release_search(&mut self, id: u64) {
+        self.control_searches.remove(&id);
+    }
     /// Start a search. An empty query stops the current search.
     pub fn start_search(&mut self, query: &str) -> Result<()> {
         if query.is_empty() {
@@ -173,6 +196,30 @@ mod tests {
     use super::*;
     use crate::ghostty::TerminalOptions;
 
+    #[test]
+    fn diagnostic_search_is_independent_and_detects_buffer_switch() {
+        let mut terminal = search_terminal();
+        terminal.vt_write(b"needle");
+        terminal.start_search("other").unwrap();
+        let id = terminal.register_search("needle").unwrap();
+        let before = terminal.scrollbar().unwrap();
+        let mut matched = false;
+        for _ in 0..128 {
+            let result = terminal.probe_search(id).unwrap();
+            assert!(!result.1);
+            matched |= result.0;
+            if matched {
+                break;
+            }
+        }
+        assert!(matched);
+        assert_eq!(terminal.scrollbar().unwrap().offset, before.offset);
+        finish_search(&mut terminal);
+        assert!(terminal.search_ranges().unwrap().is_empty());
+        terminal.vt_write(b"\x1b[?1049h");
+        assert!(terminal.probe_search(id).unwrap().1);
+        terminal.release_search(id);
+    }
     #[test]
     fn searches_the_full_scrollback() {
         let mut terminal = search_terminal();

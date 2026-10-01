@@ -104,6 +104,20 @@ fn open_terminal_window(
     let _ = handle.update(cx, |_, window, cx| {
         panes.update(cx, |panes, cx| panes.establish_layout(window, cx))
     });
+    cx.observe(&panes, |_, _| mightty::diagnostics::mark_dirty())
+        .detach();
+    let bounds_panes = panes.clone();
+    let _ = handle.update(cx, |_, window, cx| {
+        bounds_panes.update(cx, |_, cx| {
+            cx.observe_window_bounds(window, |panes, window, cx| {
+                panes.establish_layout(window, cx);
+                mightty::diagnostics::mark_dirty();
+            })
+            .detach();
+            cx.observe_window_activation(window, |_, _, _| mightty::diagnostics::mark_dirty())
+                .detach();
+        })
+    });
     TerminalWindow { handle, panes }
 }
 
@@ -310,6 +324,8 @@ fn start_windows_application(
             .expect("failed to start the default-terminal COM server")
     });
 
+    let diagnostic_writer =
+        mightty::diagnostics::Writer::start(&control_server.descriptor().instance_id);
     let controller = Rc::new(RefCell::new(WindowsApplication {
         normal_window,
         quick_window: None,
@@ -321,6 +337,13 @@ fn start_windows_application(
         default_terminal_server,
         control_server: Some(control_server),
         control_revision: 1,
+        diagnostic_writer,
+        diagnostic_state: serde_json::Value::Null,
+        started_at: mightty::diagnostics::timestamp(),
+        last_persistence: std::time::Instant::now() - Duration::from_secs(1),
+        persistence_pending: true,
+        subscribers: Vec::new(),
+        last_focused_window: "w1".into(),
         replace_initial_handoff_tab: embedding,
         shutting_down: false,
     }));
@@ -394,6 +417,23 @@ fn start_windows_application(
     })
     .detach();
 
+    let diagnostic_controller = Rc::clone(&controller);
+    cx.spawn(async move |cx| {
+        loop {
+            Timer::after(Duration::from_millis(100)).await;
+            if cx
+                .update(|cx| {
+                    diagnostic_controller
+                        .borrow_mut()
+                        .publish_diagnostics(cx, false)
+                })
+                .is_err()
+            {
+                break;
+            }
+        }
+    })
+    .detach();
     let poll_controller = Rc::clone(&controller);
     cx.spawn(async move |cx| {
         loop {
@@ -418,6 +458,7 @@ fn start_windows_application(
     if let Some(startup_request) = startup_request {
         controller.borrow_mut().dispatch(startup_request, cx);
     }
+    controller.borrow_mut().publish_diagnostics(cx, true);
 }
 
 #[cfg(windows)]
@@ -434,10 +475,70 @@ struct WindowsApplication {
     shutting_down: bool,
     control_server: Option<mightty::application::windows::ControlServer>,
     control_revision: u64,
+    diagnostic_writer: mightty::diagnostics::Writer,
+    diagnostic_state: serde_json::Value,
+    started_at: String,
+    last_persistence: std::time::Instant,
+    persistence_pending: bool,
+    subscribers: Vec<flume::Sender<serde_json::Value>>,
+    last_focused_window: String,
 }
 
 #[cfg(windows)]
 impl WindowsApplication {
+    fn publish_diagnostics(&mut self, cx: &mut App, force: bool) {
+        use serde_json::json;
+        if !mightty::diagnostics::take_dirty() && !force {
+            if self.persistence_pending && self.last_persistence.elapsed() >= Duration::from_secs(1)
+            {
+                self.diagnostic_writer.submit(self.diagnostic_state.clone());
+                self.last_persistence = std::time::Instant::now();
+                self.persistence_pending = false;
+            }
+            return;
+        }
+        let mut windows = Vec::new();
+        for (id, handle, panes) in std::iter::once((
+            "w1",
+            self.normal_window.handle,
+            self.normal_window.panes.clone(),
+        ))
+        .chain(
+            self.quick_window
+                .as_ref()
+                .map(|w| ("w2", w.handle, w.panes.clone())),
+        ) {
+            if let Ok(mut state) =
+                handle.update(cx, |_, window, cx| panes.read(cx).control_state(window, cx))
+            {
+                state["window_id"] = json!(id);
+                if state["os_focused"] == true {
+                    self.last_focused_window = id.into();
+                }
+                windows.push(state);
+            }
+        }
+        let logs = mightty::diagnostics::recent();
+        let outcomes = mightty::diagnostics::outcomes();
+        let changed = self.diagnostic_state["windows"] != json!(windows)
+            || self.diagnostic_state["diagnostics"] != json!(logs)
+            || self.diagnostic_state["outcomes"] != json!(outcomes);
+        if changed || force {
+            self.persistence_pending = true;
+            self.control_revision += 1;
+            self.diagnostic_state = json!({"schema_version":1,"instance_id":mightty::control::instance_id(),"pid":std::process::id(),"started_at":self.started_at,"observed_at":mightty::diagnostics::timestamp(),"revision":self.control_revision.to_string(),"source":"live","orderly_shutdown":false,"last_focused_window_id":self.last_focused_window,"build":{"mightty_version":env!("CARGO_PKG_VERSION"),"ghostty_revision":mightty::ghostty::SOURCE_REVISION},"windows":windows,"outcomes":outcomes,"diagnostics":logs,"persistence":self.diagnostic_writer.status()});
+            let event = json!({"protocol_version":1,"instance_id":mightty::control::instance_id(),"revision":self.control_revision.to_string(),"type":"change","changes":[{"kind":"windows_changed","windows":self.diagnostic_state["windows"]},{"kind":"outcomes_changed","outcomes":self.diagnostic_state["outcomes"]},{"kind":"diagnostics_changed","diagnostics":self.diagnostic_state["diagnostics"]}]});
+            self.subscribers.retain(|sender|{if sender.len()>=31 {let _=sender.try_send(json!({"protocol_version":1,"instance_id":mightty::control::instance_id(),"revision":self.control_revision.to_string(),"type":"resync_required"}));false}else{sender.try_send(event.clone()).is_ok()}});
+        }
+        // Debounce traversal/publication separately from disk I/O; continuous output gets a one-second write deadline.
+        if self.persistence_pending
+            && (force || self.last_persistence.elapsed() >= Duration::from_secs(1))
+        {
+            self.diagnostic_writer.submit(self.diagnostic_state.clone());
+            self.last_persistence = std::time::Instant::now();
+            self.persistence_pending = false;
+        }
+    }
     fn control_dispatch(
         &mut self,
         dispatch: &mightty::control::Dispatch,
@@ -446,6 +547,51 @@ impl WindowsApplication {
         use mightty::control::{ControlError, reply};
         use serde_json::json;
         let request = &dispatch.request;
+        self.publish_diagnostics(cx, false);
+        if let Some(outcome) = mightty::diagnostics::outcome(&request.target) {
+            if request.op == "state" {
+                return Some(reply(request, self.control_revision, Ok(outcome)));
+            }
+            if request.op == "wait" && request.args["condition"] == "process-exited" {
+                let request = request.clone();
+                let sender = dispatch.reply.clone();
+                let deadline = dispatch.deadline;
+                let revision = self.control_revision;
+                cx.spawn(async move |_| {
+                    loop {
+                        let result = match mightty::diagnostics::outcome(&request.target) {
+                            Some(outcome) if outcome["processes"]["lifecycle"] == "exited" => Some(
+                                Ok(json!({"condition":"process-exited","observation":outcome})),
+                            ),
+                            Some(outcome) if std::time::Instant::now() >= deadline => {
+                                let mut error =
+                                    ControlError::new("timeout", "root exit was not observed");
+                                error.details = Box::new(json!({"last_observation":outcome}));
+                                Some(Err(error))
+                            }
+                            Some(_) => None,
+                            None => Some(Err(ControlError::new(
+                                "outcome_expired",
+                                "removed pane outcome expired",
+                            ))),
+                        };
+                        if let Some(result) = result {
+                            let _ = sender.try_send(reply(&request, revision, result));
+                            break;
+                        }
+                        if sender.is_disconnected() {
+                            break;
+                        }
+                        Timer::after(Duration::from_millis(50)).await;
+                    }
+                })
+                .detach();
+                return None;
+            }
+            let mut error = ControlError::new("pane_closed", "pane was removed");
+            error.details = Box::new(json!({"outcome":outcome}));
+            return Some(reply(request, self.control_revision, Err(error)));
+        }
         if std::time::Instant::now() >= dispatch.deadline {
             return Some(reply(
                 request,
@@ -470,28 +616,40 @@ impl WindowsApplication {
             && request.target.tab_id.is_none()
             && request.target.pane_id.is_none()
         {
-            let mut states = Vec::new();
-            for (id, handle, panes) in windows {
-                if let Ok(mut state) =
-                    handle.update(cx, |_, window, cx| panes.read(cx).control_state(window, cx))
-                {
-                    state["window_id"] = json!(id);
-                    states.push(state);
-                }
-            }
             return Some(reply(
                 request,
                 self.control_revision,
-                Ok(
-                    json!({"schema_version":1,"instance_id":request.instance_id,"pid":std::process::id(),"observed_unix_ms":mightty::feedback::unix_timestamp_ms().to_string(),"revision":self.control_revision.to_string(),"windows":states}),
-                ),
+                Ok({
+                    let mut state = self.diagnostic_state.clone();
+                    state["persistence"] = self.diagnostic_writer.status();
+                    state
+                }),
+            ));
+        }
+        if request.op == "events" {
+            if self.subscribers.len() >= 8 {
+                return Some(reply(
+                    request,
+                    self.control_revision,
+                    Err(ControlError::new("busy", "event subscriber limit reached")),
+                ));
+            }
+            let _=dispatch.reply.try_send(json!({"protocol_version":1,"instance_id":mightty::control::instance_id(),"revision":self.control_revision.to_string(),"type":"state","state":self.diagnostic_state}));
+            self.subscribers.push(dispatch.reply.clone());
+            return None;
+        }
+        if request.op == "capabilities" {
+            return Some(reply(
+                request,
+                self.control_revision,
+                Ok(mightty::control::capabilities()),
             ));
         }
         let active = windows
             .iter()
             .find(|(_, handle, _)| handle.is_active(cx) == Some(true))
             .map(|(id, _, _)| *id)
-            .unwrap_or("w1");
+            .unwrap_or(&self.last_focused_window);
         let targets = windows
             .into_iter()
             .filter(|(id, _, panes)| {
@@ -500,9 +658,83 @@ impl WindowsApplication {
                     .window_id
                     .as_ref()
                     .is_none_or(|w| w == *id || (w == "active" && *id == active))
+                    && (request.target.window_id.is_some()
+                        || (request.target.tab_id.as_deref() != Some("active")
+                            && request.target.pane_id.as_deref() != Some("active"))
+                        || *id == active)
                     && panes.read(cx).control_contains(&request.target, cx)
             })
             .collect::<Vec<_>>();
+        if request.op == "wait"
+            && let [(_, handle, panes)] = targets.as_slice()
+        {
+            let registration =
+                panes.update(cx, |panes, cx| panes.register_control_wait(request, cx));
+            let mut wait = match registration {
+                Ok(wait) => wait,
+                Err(error) => return Some(reply(request, self.control_revision, Err(error))),
+            };
+            let initial = handle.update(cx, |_, window, cx| {
+                panes.update(cx, |panes, cx| {
+                    panes.probe_control_wait(&mut wait, window, cx)
+                })
+            });
+            match initial {
+                Ok(Ok(None)) => {}
+                result => {
+                    wait.release(cx);
+                    return Some(reply(
+                        request,
+                        self.control_revision,
+                        result
+                            .map_err(|e| ControlError::new("window_closed", e.to_string()))
+                            .and_then(|r| r)
+                            .map(|v| v.unwrap()),
+                    ));
+                }
+            }
+            let handle = *handle;
+            let panes = panes.clone();
+            let request = request.clone();
+            let sender = dispatch.reply.clone();
+            let deadline = dispatch.deadline;
+            let revision = self.control_revision;
+            cx.spawn(async move |cx| {
+                loop {
+                    if sender.is_disconnected() {
+                        let _ = cx.update(|cx| wait.release(cx));
+                        break;
+                    }
+                    Timer::after(Duration::from_millis(15)).await;
+                    let result = handle
+                        .update(cx, |_, window, cx| {
+                            panes.update(cx, |panes, cx| {
+                                panes.probe_control_wait(&mut wait, window, cx)
+                            })
+                        })
+                        .map_err(|e| ControlError::new("window_closed", e.to_string()))
+                        .and_then(|r| r);
+                    let completion = match result {
+                        Ok(Some(value)) => Some(Ok(value)),
+                        Err(error) => Some(Err(error)),
+                        Ok(None) if std::time::Instant::now() >= deadline => {
+                            let mut error =
+                                ControlError::new("timeout", "wait condition was not observed");
+                            error.details = Box::new(json!({"last_observation":wait.last}));
+                            Some(Err(error))
+                        }
+                        _ => None,
+                    };
+                    if let Some(result) = completion {
+                        let _ = cx.update(|cx| wait.release(cx));
+                        let _ = sender.try_send(reply(&request, revision, result));
+                        break;
+                    }
+                }
+            })
+            .detach();
+            return None;
+        }
         let result = match targets.as_slice() {
             [(id, handle, panes)] => handle
                 .update(cx, |_, window, cx| {
@@ -596,16 +828,25 @@ impl WindowsApplication {
         {
             acknowledgements = panes.update(cx, |panes, cx| panes.take_control_acks(cx));
         }
+        self.publish_diagnostics(cx, false);
         let response = reply(request, self.control_revision, result);
+        if acknowledgements.is_empty()
+            && (!matches!(request.op.as_str(), "state" | "pane.read" | "profiles")
+                || response["ok"] != true)
+        {
+            mightty::diagnostics::record_control(request, &response);
+        }
         if acknowledgements.is_empty() {
             return Some(response);
         }
         let deadline = dispatch.deadline;
         let sender = dispatch.reply.clone();
+        let request = request.clone();
         cx.spawn(async move |_| {
             let response =
                 mightty::control::complete_acknowledgements(response, acknowledgements, deadline)
                     .await;
+            mightty::diagnostics::record_control(&request, &response);
             let _ = sender.try_send(response);
         })
         .detach();
@@ -674,6 +915,9 @@ impl WindowsApplication {
     }
 
     fn apply_settings(&mut self, cx: &mut App) {
+        if mightty::control::test_directory().is_some() {
+            return;
+        }
         let quick_settings = self.settings.current().app.quick_terminal.clone();
         if quick_settings == self.quick_settings {
             return;
@@ -771,6 +1015,20 @@ impl WindowsApplication {
 
     fn shutdown(&mut self) {
         self.shutting_down = true;
+        mightty::diagnostics::stop_sampler();
+        if self.diagnostic_state.is_object() {
+            self.control_revision += 1;
+            self.diagnostic_state["revision"] =
+                serde_json::json!(self.control_revision.to_string());
+            self.diagnostic_state["orderly_shutdown"] = serde_json::json!(true);
+            self.diagnostic_state["observed_at"] =
+                serde_json::json!(mightty::diagnostics::timestamp());
+            self.diagnostic_writer.submit(self.diagnostic_state.clone());
+            self.diagnostic_writer.flush(
+                &self.control_revision.to_string(),
+                std::time::Instant::now() + Duration::from_millis(500),
+            );
+        }
         self.control_server = None;
         self.default_terminal_server = None;
         self.global_hotkey = None;

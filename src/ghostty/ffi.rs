@@ -3038,13 +3038,13 @@ pub struct MighttyGhosttySearchImpl {
 }
 pub type MighttyGhosttySearch = *mut MighttyGhosttySearchImpl;
 pub mod MighttyGhosttySearchStep {
-    pub type Type = ::std::os::raw::c_uint;
+    pub type Type = ::std::os::raw::c_int;
     pub const PENDING: Type = 0;
     pub const COMPLETE: Type = 1;
     pub const MAX_VALUE: Type = 2147483647;
 }
 pub mod MighttyGhosttySearchDirection {
-    pub type Type = ::std::os::raw::c_uint;
+    pub type Type = ::std::os::raw::c_int;
     pub const NEXT: Type = 0;
     pub const PREVIOUS: Type = 1;
     pub const MAX_VALUE: Type = 2147483647;
@@ -3067,6 +3067,13 @@ unsafe extern "C" {
 }
 unsafe extern "C" {
     pub fn mightty_ghostty_search_free(search: MighttyGhosttySearch);
+}
+unsafe extern "C" {
+    pub fn mightty_ghostty_search_probe(
+        search: MighttyGhosttySearch,
+        out_match: *mut bool,
+        out_buffer_changed: *mut bool,
+    ) -> Result::Type;
 }
 unsafe extern "C" {
     pub fn mightty_ghostty_search_step(

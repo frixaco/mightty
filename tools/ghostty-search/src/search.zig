@@ -213,9 +213,24 @@ fn highlightRange(screen: *Screen, highlight: FlattenedHighlight) ?Range {
     };
 }
 
+fn probe(search: ?*Search, out_match: ?*bool, out_buffer_changed: ?*bool) callconv(.c) Result {
+    const value = search orelse return .invalid_value;
+    const matched = out_match orelse return .invalid_value;
+    const changed = out_buffer_changed orelse return .invalid_value;
+    changed.* = value.terminal.screens.active_key != value.screen_key or !value.screenIsValid();
+    matched.* = false;
+    if (changed.*) return .success;
+    var progress: Step = .pending;
+    const result = step(value, &progress);
+    if (result != .success) return result;
+    if (value.state) |*state| matched.* = state.matchesLen() > 0;
+    return .success;
+}
+
 comptime {
     @export(&new, .{ .name = "mightty_ghostty_search_new" });
     @export(&free, .{ .name = "mightty_ghostty_search_free" });
+    @export(&probe, .{ .name = "mightty_ghostty_search_probe" });
     @export(&step, .{ .name = "mightty_ghostty_search_step" });
     @export(&ranges, .{ .name = "mightty_ghostty_search_ranges" });
     @export(&select, .{ .name = "mightty_ghostty_search_select" });

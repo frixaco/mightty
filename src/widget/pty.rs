@@ -95,20 +95,22 @@ impl TestReceiver {
 
 pub(super) enum PtyEvent {
     Output(Vec<u8>),
-    Exited,
+    OutputEnded,
+    IoFailed(String),
 }
 
 impl PtyEvent {
     pub(super) fn len(&self) -> usize {
         match self {
             Self::Output(data) => data.len(),
-            Self::Exited => 0,
+            Self::OutputEnded | Self::IoFailed(_) => 0,
         }
     }
 }
 
 #[cfg(any(windows, unix))]
 pub(super) struct PtyWorker {
+    root_process: Option<crate::diagnostics::RootProcess>,
     command_tx: PtySender,
     control_thread: Option<JoinHandle<()>>,
     reader_thread: Option<JoinHandle<()>>,
@@ -141,6 +143,10 @@ impl PtyWorker {
         parts: PtyParts,
         exit_flag: Arc<AtomicBool>,
     ) -> (Self, flume::Receiver<PtyEvent>) {
+        #[cfg(windows)]
+        let root_process = parts.control.process_watch();
+        #[cfg(not(windows))]
+        let root_process = None;
         let (sender, command_rx) = flume::bounded::<QueuedCommand>(256);
         let command_tx = PtySender {
             sender,
@@ -199,7 +205,7 @@ impl PtyWorker {
                     }
                     eprintln!("ConPTY command failed: {err}");
                     control_exit_flag.store(true, Ordering::Relaxed);
-                    let _ = control_event_tx.try_send(PtyEvent::Exited);
+                    let _ = control_event_tx.try_send(PtyEvent::IoFailed(err.to_string()));
                     break;
                 }
             }
@@ -213,6 +219,7 @@ impl PtyWorker {
         let reader_cancel = stop_reader.clone();
         let reader_thread = std::thread::spawn(move || {
             let mut buf = [0u8; READ_BUFFER_SIZE];
+            let mut failure = None;
 
             loop {
                 match output.read_interruptible(&mut buf, &reader_cancel) {
@@ -234,6 +241,7 @@ impl PtyWorker {
                     Err(err) => {
                         if !reader_cancel.load(Ordering::Acquire) {
                             eprintln!("PTY output read failed: {err}");
+                            failure = Some(err.to_string());
                         }
                         break;
                     }
@@ -241,11 +249,13 @@ impl PtyWorker {
             }
 
             reader_exit_flag.store(true, Ordering::Relaxed);
-            let _ = event_tx.try_send(PtyEvent::Exited);
+            let event = failure.map_or(PtyEvent::OutputEnded, PtyEvent::IoFailed);
+            let _ = event_tx.send_timeout(event, std::time::Duration::from_millis(100));
         });
 
         (
             Self {
+                root_process,
                 command_tx,
                 control_thread: Some(control_thread),
                 reader_thread: Some(reader_thread),
@@ -258,6 +268,9 @@ impl PtyWorker {
 
     pub(super) fn command_tx(&self) -> PtySender {
         self.command_tx.clone()
+    }
+    pub(super) fn root_process(&self) -> Option<crate::diagnostics::RootProcess> {
+        self.root_process.clone()
     }
 
     pub(super) fn shutdown(&mut self) {

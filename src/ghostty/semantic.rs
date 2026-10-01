@@ -15,6 +15,17 @@ pub enum PromptDirection {
 }
 
 impl Terminal {
+    pub fn cursor_at_prompt(&self) -> Result<bool> {
+        let mut value = false;
+        from_result(unsafe {
+            ffi::ghostty_terminal_get(
+                self.as_raw(),
+                ffi::TerminalData::CURSOR_AT_PROMPT,
+                std::ptr::from_mut(&mut value).cast(),
+            )
+        })?;
+        Ok(value)
+    }
     pub fn has_semantic_prompt(&self) -> Result<bool> {
         let total_rows = self.total_rows()?;
         let first_recent_row = total_rows.saturating_sub(usize::from(self.visible_rows()?));

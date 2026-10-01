@@ -570,6 +570,24 @@ impl PtyOutput {
 }
 
 impl PtyControl {
+    pub fn process_watch(&self) -> Option<crate::diagnostics::RootProcess> {
+        use std::os::windows::io::BorrowedHandle;
+        let handle = self.process_handle.as_ref()?;
+        match crate::diagnostics::watch_process(unsafe {
+            BorrowedHandle::borrow_raw(handle.raw().cast())
+        }) {
+            Ok(watch) => Some(watch),
+            Err(error) => {
+                crate::diagnostics::record(
+                    "process",
+                    "watch_unavailable",
+                    &error,
+                    serde_json::json!({}),
+                );
+                None
+            }
+        }
+    }
     pub fn resize(&mut self, size: PtySize) -> Result<(), PtyError> {
         if !size.is_valid() {
             return Err(PtyError::InvalidDimensions);

@@ -18,6 +18,8 @@ use crate::ghostty::{Error, Result, ffi};
 pub struct Terminal {
     raw: NonNull<ffi::TerminalImpl>,
     pub(crate) search: Option<SearchState>,
+    pub(crate) control_searches: std::collections::BTreeMap<u64, SearchState>,
+    pub(crate) next_control_search: u64,
     selection_gesture: SelectionGesture,
     callbacks: Box<CallbackState>,
     _not_send_or_sync: PhantomData<Rc<()>>,
@@ -119,6 +121,8 @@ impl Terminal {
         let mut terminal = Self {
             raw,
             search: None,
+            control_searches: Default::default(),
+            next_control_search: 1,
             selection_gesture,
             callbacks: Box::new(CallbackState::default()),
             _not_send_or_sync: PhantomData,
@@ -283,6 +287,21 @@ impl Terminal {
 
     pub fn selected_text(&self) -> Result<Option<String>> {
         self.format_selection_text(None)
+    }
+    pub fn has_selection(&self) -> Result<bool> {
+        let mut selection = ffi::Selection::default();
+        let result = unsafe {
+            ffi::ghostty_terminal_get(
+                self.as_raw(),
+                ffi::TerminalData::SELECTION,
+                std::ptr::from_mut(&mut selection).cast(),
+            )
+        };
+        if result == ffi::Result::NO_VALUE {
+            return Ok(false);
+        }
+        from_result(result)?;
+        Ok(true)
     }
 
     pub(super) fn format_selection_text(
@@ -483,6 +502,7 @@ impl Terminal {
 impl Drop for Terminal {
     fn drop(&mut self) {
         self.search.take();
+        self.control_searches.clear();
         self.selection_gesture.deinit(self.raw.as_ptr());
         unsafe {
             ffi::ghostty_terminal_free(self.as_raw());

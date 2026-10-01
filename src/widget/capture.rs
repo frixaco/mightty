@@ -11,6 +11,29 @@ use super::TerminalWidget;
 use super::render::CellWidthExt;
 
 impl TerminalWidget {
+    pub fn control_root_process(&self) -> Option<crate::diagnostics::RootProcess> {
+        self.pty_worker
+            .as_ref()
+            .and_then(|worker| worker.root_process())
+    }
+    pub fn control_register_search(&mut self, query: &str) -> crate::ghostty::Result<u64> {
+        self.terminal.register_search(query)
+    }
+    pub fn control_release_search(&mut self, id: u64) {
+        self.terminal.release_search(id);
+    }
+    pub fn control_probe_search(&mut self, id: u64) -> crate::ghostty::Result<(bool, bool)> {
+        self.terminal.probe_search(id)
+    }
+    pub fn control_prompt_ready(&self) -> Result<bool, crate::control::ControlError> {
+        if !self.semantic_commands_available {
+            return Err(crate::control::ControlError::new(
+                "unavailable",
+                "shell prompt integration has not been observed",
+            ));
+        }
+        Ok(self.terminal.cursor_at_prompt()?)
+    }
     pub fn control_state(&self) -> serde_json::Value {
         use serde_json::json;
         let bounds = self.layout_bounds.map(|b| json!({"x":f32::from(b.origin.x),"y":f32::from(b.origin.y),"width":f32::from(b.size.width),"height":f32::from(b.size.height)}));
@@ -21,7 +44,7 @@ impl TerminalWidget {
             "terminal_size":{"cols":self.size.0,"rows":self.size.1},"computed_bounds":bounds,
             "pty_size":self.pty_tx.as_ref().and_then(|tx|tx.acknowledged_size()).map(|s|json!({"cols":s.cols,"rows":s.rows})),
             "output_seq":self.output_seq.to_string(),"output_cursor":format!("{}:{}",crate::control::instance_id(),self.output_seq),
-            "lifecycle":if self.has_exited {"output_ended"} else {"running"},"processes":{"availability":"not_sampled"},
+            "lifecycle":if self.has_exited {"output_ended"} else {"running"},"output_eof":self.output_eof,"io_error":self.io_error,"processes":self.pty_worker.as_ref().and_then(|worker|worker.root_process()).map(|root|root.state()).unwrap_or(serde_json::json!({"availability":"unavailable"})),
             "font":{"family":self.config.font_family,"size_px":self.config.font_size_px},
             "viewport":self.terminal.scrollbar().ok().map(|s|json!({"offset":s.offset,"length":s.len,"total":s.total})),
             "selection":self.has_selection(),"search_open":self.search.is_some()})
