@@ -34,6 +34,7 @@ use crate::profile::LaunchSpec;
 #[cfg(windows)]
 use crate::shell::PtyParts;
 use crate::shell::PtySize;
+use crate::theme;
 use gpui::{
     App, AppContext, Bounds, ClipboardItem, Context, EventEmitter, FocusHandle, KeyBinding,
     KeyDownEvent, KeyUpEvent, Keystroke, Modifiers, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
@@ -227,28 +228,11 @@ pub struct TerminalTheme {
 impl Default for TerminalTheme {
     fn default() -> Self {
         Self {
-            foreground: gpui::rgb(0xc0c0c0),
-            background: gpui::rgb(0x000000),
-            cursor: gpui::rgb(0xffffff),
-            selection: gpui::rgb(0x3d3d3d),
-            palette: [
-                gpui::rgb(0x000000),
-                gpui::rgb(0xcd0000),
-                gpui::rgb(0x00cd00),
-                gpui::rgb(0xcdcd00),
-                gpui::rgb(0x0000ee),
-                gpui::rgb(0xcd00cd),
-                gpui::rgb(0x00cdcd),
-                gpui::rgb(0xe5e5e5),
-                gpui::rgb(0x7f7f7f),
-                gpui::rgb(0xff0000),
-                gpui::rgb(0x00ff00),
-                gpui::rgb(0xffff00),
-                gpui::rgb(0x5c5cff),
-                gpui::rgb(0xff00ff),
-                gpui::rgb(0x00ffff),
-                gpui::rgb(0xffffff),
-            ],
+            foreground: gpui::rgb(theme::FG),
+            background: gpui::rgb(theme::BG),
+            cursor: gpui::rgb(theme::FG),
+            selection: gpui::rgb(theme::BG_HIGHLIGHT),
+            palette: theme::ANSI.map(gpui::rgb),
         }
     }
 }
@@ -1891,6 +1875,49 @@ mod interaction_tests {
     use gpui::{point, size};
 
     use super::*;
+
+    #[gpui::test]
+    fn cyberdream_colors_reach_terminal_snapshots(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            theme::init(cx);
+            let ui = gpui_component::Theme::global(cx);
+            assert!(ui.is_dark());
+            assert_eq!(ui.background, gpui::rgb(0x16181a).into());
+            assert_eq!(ui.primary, gpui::rgb(0x5ea1ff).into());
+            assert_eq!(ui.selection, gpui::rgb(0x3c4048).into());
+        });
+        cx.new(|cx| {
+            let mut widget = TerminalWidget::with_pty(
+                TerminalConfig::default(),
+                Arc::new(AtomicBool::new(false)),
+                None,
+                None,
+                None,
+                cx,
+            );
+            let snapshot = widget.render_state.update(&widget.terminal).unwrap();
+            let colors = snapshot.colors().unwrap();
+            assert_eq!(rgb_to_rgba(colors.background), gpui::rgb(0x16181a));
+            assert_eq!(rgb_to_rgba(colors.foreground), gpui::rgb(0xffffff));
+            assert_eq!(colors.cursor.map(rgb_to_rgba), Some(gpui::rgb(0xffffff)));
+            let expected = [
+                0x16181a, 0xff6e5e, 0x5eff6c, 0xf1ff5e, 0x5ea1ff, 0xbd5eff, 0x5ef1ff, 0xffffff,
+                0x3c4048, 0xff6e5e, 0x5eff6c, 0xf1ff5e, 0x5ea1ff, 0xbd5eff, 0x5ef1ff, 0xffffff,
+            ]
+            .map(gpui::rgb);
+            assert_eq!(
+                colors.palette[..16]
+                    .iter()
+                    .copied()
+                    .map(rgb_to_rgba)
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            assert_eq!(widget.theme.selection, gpui::rgb(0x3c4048));
+            widget
+        });
+    }
 
     #[gpui::test]
     fn output_task_yields_and_finishes_before_signalling_exit(cx: &mut gpui::TestAppContext) {

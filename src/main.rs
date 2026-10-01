@@ -2,7 +2,7 @@ use gpui::{
     App, Application, Bounds, WindowBounds, WindowHandle, WindowKind, WindowOptions, prelude::*,
     px, size,
 };
-use gpui_component::{Root, Theme, ThemeMode, TitleBar};
+use gpui_component::{Root, TitleBar};
 use mightty::{action::app_menus, pane_container::PaneContainer, settings::SettingsStore};
 use std::borrow::Cow;
 
@@ -38,7 +38,7 @@ fn main() {
         load_embedded_fonts(cx);
         gpui_component::init(cx);
         mightty::widget::init(cx);
-        Theme::change(ThemeMode::Dark, None, cx);
+        mightty::theme::init(cx);
         cx.set_menus(app_menus());
 
         #[cfg(windows)]

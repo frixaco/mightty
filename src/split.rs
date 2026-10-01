@@ -11,9 +11,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::action::{ActionBinding, Direction};
 use crate::profile::ProfileId;
+use crate::theme;
 use crate::widget::TerminalWidget;
 
-const SEPARATOR_COLOR: u32 = 0x00c853;
+const SEPARATOR_COLOR: u32 = theme::GREEN;
 const SEPARATOR_SIZE_PX: f32 = 4.0;
 const MIN_PANE_WIDTH_PX: f32 = 80.0;
 const MIN_PANE_HEIGHT_PX: f32 = 54.0;
@@ -587,7 +588,7 @@ impl Split {
                     .min_h_0()
                     .rounded(px(4.))
                     .overflow_hidden()
-                    .bg(gpui::rgb(0x000000))
+                    .bg(gpui::rgb(theme::BG))
                     .child(terminal)
                     .into_any_element(),
             );
@@ -608,7 +609,7 @@ impl Split {
             .size_full()
             .relative()
             .overflow_hidden()
-            .bg(gpui::rgb(0x000000))
+            .bg(gpui::rgb(theme::BG))
             .children(elements)
             .into_any_element()
     }
@@ -705,7 +706,7 @@ impl Split {
                     .min_h_0()
                     .rounded(px(4.0))
                     .overflow_hidden()
-                    .bg(gpui::rgb(0x000000))
+                    .bg(gpui::rgb(theme::BG))
                     .child(pane.terminal.clone())
                     .into_any_element(),
             );
@@ -1218,7 +1219,7 @@ impl Render for Split {
             .size_full()
             .relative()
             .overflow_hidden()
-            .bg(gpui::rgb(0x000000))
+            .bg(gpui::rgb(theme::BG))
             .on_drag_move(cx.listener(Self::on_divider_drag_move))
             .children(elements)
             .child(

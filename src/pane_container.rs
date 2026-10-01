@@ -22,6 +22,7 @@ use crate::settings::{ReloadOutcome, SettingsStore};
 #[cfg(windows)]
 use crate::shell::PtyParts;
 use crate::split::{Split, SplitAxis};
+use crate::theme;
 use crate::widget::{TerminalConfig, TerminalEvent, TerminalWidget};
 use crate::workspace::{
     TabId, WorkspaceId, WorkspaceLayout, WorkspacePane, WorkspaceStore, WorkspaceTab,
@@ -31,7 +32,7 @@ mod control;
 mod wait;
 pub use wait::ControlWait;
 
-const WINDOW_BACKGROUND: u32 = 0x000000;
+const WINDOW_BACKGROUND: u32 = theme::BG;
 const WINDOW_HORIZONTAL_PADDING_PX: f32 = 8.0;
 const TITLE_BAR_HEIGHT_PX: f32 = 34.0;
 const MAC_TRAFFIC_LIGHT_SPACER_PX: f32 = 78.0;
@@ -1184,20 +1185,24 @@ fn window_control_button(
         .window_control_area(area)
         .hover(move |style| {
             if is_close {
-                style.bg(gpui::rgb(0xc42b1c))
+                style
+                    .bg(gpui::rgb(theme::RED))
+                    .text_color(gpui::rgb(theme::BG))
             } else {
-                style.bg(gpui::rgb(0x202020))
+                style.bg(gpui::rgb(theme::BG_HIGHLIGHT))
             }
         })
         .active(move |style| {
             if is_close {
-                style.bg(gpui::rgb(0x8f1f14))
+                style
+                    .bg(gpui::rgb(theme::RED))
+                    .text_color(gpui::rgb(theme::BG))
             } else {
-                style.bg(gpui::rgb(0x2a2a2a))
+                style.bg(gpui::rgb(theme::BG_ALT))
             }
         })
         .text_size(px(10.0))
-        .text_color(gpui::white())
+        .text_color(gpui::rgb(theme::FG))
         .line_height(px(TITLE_BAR_HEIGHT_PX))
         .font(caption_icon_font())
         .child(button.icon())
@@ -1278,7 +1283,7 @@ impl Render for PaneContainer {
                     .w(px(18.0))
                     .h(px(14.0))
                     .border_1()
-                    .border_color(gpui::rgb(0xb0b0b0))
+                    .border_color(gpui::rgb(theme::GREY))
                     .rounded(px(2.0))
                     .overflow_hidden()
                     .child(
@@ -1286,8 +1291,8 @@ impl Render for PaneContainer {
                             .w(px(5.0))
                             .h_full()
                             .border_r_1()
-                            .border_color(gpui::rgb(0xb0b0b0))
-                            .when(self.sidebar_visible, |icon| icon.bg(gpui::rgb(0xb0b0b0))),
+                            .border_color(gpui::rgb(theme::GREY))
+                            .when(self.sidebar_visible, |icon| icon.bg(gpui::rgb(theme::GREY))),
                     ),
             )
             .on_mouse_down(MouseButton::Left, |_, window, cx| {
@@ -1367,8 +1372,8 @@ fn render_settings_diagnostic(message: String) -> impl IntoElement {
     div()
         .px(px(10.0))
         .py(px(6.0))
-        .bg(gpui::rgb(0x5a1717))
-        .text_color(gpui::rgb(0xffffff))
+        .bg(gpui::rgb(theme::RED))
+        .text_color(gpui::rgb(theme::BG))
         .text_size(px(12.0))
         .child(format!("Settings error: {message}"))
 }
@@ -1377,8 +1382,8 @@ fn render_workspace_diagnostic(message: String) -> impl IntoElement {
     div()
         .px(px(10.0))
         .py(px(6.0))
-        .bg(gpui::rgb(0x4c3414))
-        .text_color(gpui::rgb(0xffffff))
+        .bg(gpui::rgb(theme::YELLOW))
+        .text_color(gpui::rgb(theme::BG))
         .text_size(px(12.0))
         .child(format!("Workspace: {message}"))
 }
@@ -1482,7 +1487,7 @@ impl PaneContainer {
             .justify_center()
             .items_start()
             .pt(px(72.0))
-            .bg(gpui::rgba(0x00000099))
+            .bg(gpui::rgba((theme::BG << 8) | 0x99))
             .occlude()
             .track_focus(&self.palette_focus)
             .capture_action(
@@ -1517,8 +1522,8 @@ impl PaneContainer {
                     .overflow_hidden()
                     .rounded(px(8.0))
                     .border_1()
-                    .border_color(gpui::rgb(0x383838))
-                    .bg(gpui::rgb(0x151515))
+                    .border_color(gpui::rgb(theme::BG_HIGHLIGHT))
+                    .bg(gpui::rgb(theme::BG_ALT))
                     .shadow_lg()
                     .on_mouse_down(MouseButton::Left, |_event: &MouseDownEvent, window, cx| {
                         window.prevent_default();
@@ -1531,9 +1536,9 @@ impl PaneContainer {
                             .flex()
                             .items_center()
                             .border_b_1()
-                            .border_color(gpui::rgb(0x303030))
+                            .border_color(gpui::rgb(theme::BG_HIGHLIGHT))
                             .text_size(px(15.0))
-                            .text_color(gpui::rgb(0xf2f2f2))
+                            .text_color(gpui::rgb(theme::FG))
                             .children(
                                 self.palette_input
                                     .as_ref()
@@ -1563,17 +1568,17 @@ impl PaneContainer {
                                     .items_center()
                                     .justify_between()
                                     .bg(if result_index == selected {
-                                        gpui::rgb(0x292929)
+                                        gpui::rgb(theme::BG_HIGHLIGHT)
                                     } else {
-                                        gpui::rgb(0x151515)
+                                        gpui::rgb(theme::BG_ALT)
                                     })
                                     .text_color(if available {
-                                        gpui::rgb(0xeeeeee)
+                                        gpui::rgb(theme::FG)
                                     } else {
-                                        gpui::rgb(0x777777)
+                                        gpui::rgb(theme::GREY)
                                     })
                                     .when(available, |row| {
-                                        row.hover(|style| style.bg(gpui::rgb(0x242424)))
+                                        row.hover(|style| style.bg(gpui::rgb(theme::BG_HIGHLIGHT)))
                                             .on_mouse_down(
                                             MouseButton::Left,
                                             cx.listener(
@@ -1594,11 +1599,7 @@ impl PaneContainer {
                                     .child(
                                         div()
                                             .text_size(px(11.0))
-                                            .text_color(if available {
-                                                gpui::rgb(0x999999)
-                                            } else {
-                                                gpui::rgb(0x6f6f6f)
-                                            })
+                                            .text_color(gpui::rgb(theme::GREY))
                                             .child(detail),
                                     )
                             }),
@@ -1635,16 +1636,16 @@ impl PaneContainer {
                     .gap(px(6.0))
                     .px(px(8.0))
                     .text_color(if is_active {
-                        gpui::rgb(0xf0f0f0)
+                        gpui::rgb(theme::FG)
                     } else {
-                        gpui::rgb(0x8a8a8a)
+                        gpui::rgb(theme::GREY)
                     })
                     .bg(if is_active {
-                        gpui::rgb(0x1a1a1a)
+                        gpui::rgb(theme::BG_HIGHLIGHT)
                     } else {
                         gpui::rgb(WINDOW_BACKGROUND)
                     })
-                    .hover(|style| style.bg(gpui::rgb(0x202020)))
+                    .hover(|style| style.bg(gpui::rgb(theme::BG_HIGHLIGHT)))
                     .tooltip(move |window, cx| {
                         gpui_component::tooltip::Tooltip::new(tooltip.clone()).build(window, cx)
                     })

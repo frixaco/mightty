@@ -1127,6 +1127,8 @@ mod tests {
         assert_eq!(settings.terminal.font_family, "Test Mono");
         assert_eq!(settings.terminal.font_size_px, 18.0);
         assert_eq!(settings.terminal.theme.background, gpui::rgb(0x102030));
+        assert_eq!(settings.terminal.theme.foreground, gpui::rgb(0xffffff));
+        assert_eq!(settings.terminal.theme.palette[4], gpui::rgb(0x5ea1ff));
         let binding = settings
             .key_bindings
             .iter()

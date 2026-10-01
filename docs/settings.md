@@ -17,6 +17,10 @@ The default file is `%APPDATA%\mightty\settings.json` on Windows. Unix uses
 Set `MIGHTTY_CONFIG_FILE` to use an explicit file. Create `mightty.portable`
 beside the application to use `settings.json` in the application directory.
 
+The app and default terminal colors use [Cyberdream's dark palette](https://github.com/scottmckendry/cyberdream.nvim).
+Terminal theme overrides still apply; its optional `palette` field accepts 16 ANSI
+colors. Colors 16–255 retain the standard xterm color cube and grayscale.
+
 All fields are optional. This example shows the main settings:
 
 ```json
@@ -43,10 +47,10 @@ All fields are optional. This example shows the main settings:
     "font_family": "JetBrainsMono Nerd Font Mono",
     "font_size_px": 16,
     "theme": {
-      "foreground": "#c0c0c0",
-      "background": "#000000",
+      "foreground": "#ffffff",
+      "background": "#16181a",
       "cursor": "#ffffff",
-      "selection": "#3d3d3d"
+      "selection": "#3c4048"
     }
   },
   "profiles": [

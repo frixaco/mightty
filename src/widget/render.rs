@@ -2,6 +2,7 @@ use crate::ghostty::{
     render::CellWidth,
     style::{RgbColor, Underline},
 };
+use crate::theme;
 use gpui::{
     Bounds, ContentMask, Context, FontFallbacks, FontFeatures, FontStyle, FontWeight, IntoElement,
     KeyDownEvent, KeyUpEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
@@ -52,7 +53,6 @@ impl CellWidthExt for CellWidth {
 struct RowTextStyle {
     fg: RgbColor,
     bg: Option<RgbColor>,
-    default_bg: RgbColor,
     bold: bool,
     italic: bool,
     underline: Underline,
@@ -206,7 +206,6 @@ impl TerminalWidget {
                     RowTextStyle {
                         fg: fg_color,
                         bg: background,
-                        default_bg: colors.background,
                         bold: style.bold,
                         italic: style.italic,
                         underline: style.underline,
@@ -256,9 +255,9 @@ impl TerminalWidget {
         ));
         elements.extend(search_highlights.into_iter().map(|highlight| {
             let color = if highlight.active {
-                gpui::rgba(0xffa500cc)
+                gpui::rgba((theme::ORANGE << 8) | 0x33)
             } else {
-                gpui::rgba(0xffd54f66)
+                gpui::rgba((theme::YELLOW << 8) | 0x1a)
             };
             div()
                 .absolute()
@@ -422,7 +421,6 @@ impl TerminalWidget {
                         colors.background,
                     ),
                     bg: None,
-                    default_bg: colors.background,
                     bold: cell.style.bold,
                     italic: cell.style.italic,
                     underline: cell.style.underline,
@@ -518,7 +516,7 @@ impl TerminalWidget {
                             .w(px(6.0))
                             .h(px(layout.height))
                             .rounded(px(3.0))
-                            .bg(gpui::rgba(0xffffff55)),
+                            .bg(gpui::rgba((theme::GREY << 8) | 0x99)),
                     )
             });
         let paste_confirmation = self.pending_paste.as_ref().map(|text| {
@@ -530,7 +528,7 @@ impl TerminalWidget {
                 .flex()
                 .items_center()
                 .justify_center()
-                .bg(gpui::rgba(0x000000aa))
+                .bg(gpui::rgba((theme::BG << 8) | 0xaa))
                 .occlude()
                 .on_mouse_down(
                     MouseButton::Left,
@@ -544,8 +542,8 @@ impl TerminalWidget {
                         .w(px(420.0))
                         .p(px(20.0))
                         .rounded(px(8.0))
-                        .bg(gpui::rgb(0x202020))
-                        .text_color(gpui::white())
+                        .bg(gpui::rgb(theme::BG_ALT))
+                        .text_color(gpui::rgb(theme::FG))
                         .flex()
                         .flex_col()
                         .gap(px(12.0))
@@ -561,7 +559,7 @@ impl TerminalWidget {
                         .child(
                             div()
                                 .text_size(px(12.0))
-                                .text_color(gpui::rgb(0xa0a0a0))
+                                .text_color(gpui::rgb(theme::GREY))
                                 .child(detail),
                         )
                         .child(
@@ -575,8 +573,12 @@ impl TerminalWidget {
                                         .px(px(14.0))
                                         .py(px(8.0))
                                         .rounded(px(4.0))
-                                        .bg(gpui::rgb(0x383838))
-                                        .hover(|style| style.bg(gpui::rgb(0x484848)))
+                                        .bg(gpui::rgb(theme::BG_HIGHLIGHT))
+                                        .hover(|style| {
+                                            style
+                                                .bg(gpui::rgb(theme::GREY))
+                                                .text_color(gpui::rgb(theme::BG))
+                                        })
                                         .on_mouse_down(
                                             MouseButton::Left,
                                             cx.listener(
@@ -595,8 +597,9 @@ impl TerminalWidget {
                                         .px(px(14.0))
                                         .py(px(8.0))
                                         .rounded(px(4.0))
-                                        .bg(gpui::rgb(0x0e639c))
-                                        .hover(|style| style.bg(gpui::rgb(0x1177bb)))
+                                        .bg(gpui::rgb(theme::BLUE))
+                                        .text_color(gpui::rgb(theme::BG))
+                                        .hover(|style| style.bg(gpui::rgb(theme::CYAN)))
                                         .on_mouse_down(
                                             MouseButton::Left,
                                             cx.listener(
@@ -629,7 +632,7 @@ impl TerminalWidget {
             let diagnostic = search.diagnostic.as_ref().map(|diagnostic| {
                 div()
                     .text_size(px(11.0))
-                    .text_color(gpui::rgb(0xff8a80))
+                    .text_color(gpui::rgb(theme::RED))
                     .child(diagnostic.clone())
             });
             div()
@@ -639,10 +642,10 @@ impl TerminalWidget {
                 .w(px(420.0))
                 .p(px(10.0))
                 .rounded(px(6.0))
-                .bg(gpui::rgba(0x20242aee))
+                .bg(gpui::rgba((theme::BG_ALT << 8) | 0xee))
                 .border_1()
-                .border_color(gpui::rgb(0x4b5563))
-                .text_color(gpui::white())
+                .border_color(gpui::rgb(theme::BG_HIGHLIGHT))
+                .text_color(gpui::rgb(theme::FG))
                 .occlude()
                 .flex()
                 .flex_col()
@@ -656,7 +659,7 @@ impl TerminalWidget {
                         .child(
                             div()
                                 .text_size(px(11.0))
-                                .text_color(gpui::rgb(0xaeb8c4))
+                                .text_color(gpui::rgb(theme::GREY))
                                 .child(search.result_label()),
                         ),
                 )
@@ -664,7 +667,7 @@ impl TerminalWidget {
                 .child(
                     div()
                         .text_size(px(10.0))
-                        .text_color(gpui::rgb(0x8c98a8))
+                        .text_color(gpui::rgb(theme::GREY))
                         .child("Enter: next · Shift+Enter: previous · Esc: close"),
                 )
         });
@@ -845,152 +848,9 @@ pub(super) fn terminal_font_fallbacks(primary: &str) -> FontFallbacks {
     ])
 }
 
-fn mix_rgb(a: RgbColor, b: RgbColor, ratio: f32) -> RgbColor {
-    let t = ratio.clamp(0.0, 1.0);
-    let blend = |lhs: u8, rhs: u8| -> u8 {
-        ((lhs as f32 * (1.0 - t)) + (rhs as f32 * t))
-            .round()
-            .clamp(0.0, 255.0) as u8
-    };
-
-    RgbColor {
-        r: blend(a.r, b.r),
-        g: blend(a.g, b.g),
-        b: blend(a.b, b.b),
-    }
-}
-
-fn rgb_to_hsv(rgb: RgbColor) -> (f32, f32, f32) {
-    let r = rgb.r as f32 / 255.0;
-    let g = rgb.g as f32 / 255.0;
-    let b = rgb.b as f32 / 255.0;
-    let max = r.max(g).max(b);
-    let min = r.min(g).min(b);
-    let delta = max - min;
-
-    let hue = if delta == 0.0 {
-        0.0
-    } else if max == r {
-        60.0 * (((g - b) / delta).rem_euclid(6.0))
-    } else if max == g {
-        60.0 * (((b - r) / delta) + 2.0)
-    } else {
-        60.0 * (((r - g) / delta) + 4.0)
-    };
-
-    let saturation = if max == 0.0 { 0.0 } else { delta / max };
-    (hue, saturation, max)
-}
-
-fn bold_display_palette_color(rgb: RgbColor, base_bg: RgbColor) -> RgbColor {
-    let (hue, saturation, value) = rgb_to_hsv(rgb);
-
-    if saturation < 0.16 || value < 0.2 {
-        return if relative_luminance(base_bg) < 0.35 {
-            RgbColor {
-                r: 230,
-                g: 237,
-                b: 243,
-            }
-        } else {
-            RgbColor {
-                r: 30,
-                g: 41,
-                b: 59,
-            }
-        };
-    }
-
-    match hue {
-        h if !(15.0..345.0).contains(&h) => RgbColor {
-            r: 255,
-            g: 123,
-            b: 114,
-        },
-        h if h < 45.0 => RgbColor {
-            r: 255,
-            g: 184,
-            b: 108,
-        },
-        h if h < 70.0 => RgbColor {
-            r: 229,
-            g: 192,
-            b: 123,
-        },
-        h if h < 150.0 => RgbColor {
-            r: 152,
-            g: 195,
-            b: 121,
-        },
-        h if h < 210.0 => RgbColor {
-            r: 86,
-            g: 212,
-            b: 221,
-        },
-        h if h < 270.0 => RgbColor {
-            r: 97,
-            g: 175,
-            b: 239,
-        },
-        _ => RgbColor {
-            r: 198,
-            g: 120,
-            b: 221,
-        },
-    }
-}
-
-fn relative_luminance(rgb: RgbColor) -> f32 {
-    fn channel(value: u8) -> f32 {
-        let normalized = value as f32 / 255.0;
-        if normalized <= 0.03928 {
-            normalized / 12.92
-        } else {
-            ((normalized + 0.055) / 1.055).powf(2.4)
-        }
-    }
-
-    0.2126 * channel(rgb.r) + 0.7152 * channel(rgb.g) + 0.0722 * channel(rgb.b)
-}
-
-fn contrast_ratio(a: RgbColor, b: RgbColor) -> f32 {
-    let a_lum = relative_luminance(a);
-    let b_lum = relative_luminance(b);
-    let lighter = a_lum.max(b_lum);
-    let darker = a_lum.min(b_lum);
-    (lighter + 0.05) / (darker + 0.05)
-}
-
-fn emphasized_bold_colors(style: RowTextStyle) -> (RgbColor, Option<RgbColor>) {
-    let base_bg = style.bg.unwrap_or(style.default_bg);
-    let mut fg = bold_display_palette_color(style.fg, base_bg);
-    let target = if relative_luminance(base_bg) < 0.35 {
-        RgbColor {
-            r: 255,
-            g: 255,
-            b: 255,
-        }
-    } else {
-        RgbColor { r: 0, g: 0, b: 0 }
-    };
-
-    if contrast_ratio(fg, base_bg) < 7.0 {
-        for ratio in [0.55_f32, 0.7, 0.82, 0.9] {
-            let candidate = mix_rgb(fg, target, ratio);
-            fg = candidate;
-            if contrast_ratio(fg, base_bg) >= 7.0 {
-                break;
-            }
-        }
-    }
-
-    (fg, style.bg)
-}
-
 fn resolved_render_style(style: RowTextStyle) -> (RgbColor, Option<RgbColor>, FontWeight) {
     if style.bold {
-        let (fg, bg) = emphasized_bold_colors(style);
-        (fg, bg, FontWeight::BOLD)
+        (style.fg, style.bg, FontWeight::BOLD)
     } else {
         (style.fg, style.bg, FontWeight::NORMAL)
     }
@@ -1158,6 +1018,24 @@ mod tests {
                 .size_full()
                 .child(self.terminal.clone())
                 .child(div().track_focus(&self.next_focus))
+        }
+    }
+
+    #[test]
+    fn bold_preserves_palette_and_program_colors() {
+        for color in theme::ANSI.into_iter().chain([0x123456]) {
+            let style = RowTextStyle {
+                fg: super::super::rgba_to_rgb(gpui::rgb(color)),
+                bg: Some(super::super::rgba_to_rgb(gpui::rgb(theme::BG))),
+                bold: true,
+                italic: false,
+                underline: Underline::None,
+                strikethrough: false,
+            };
+            assert_eq!(
+                resolved_render_style(style),
+                (style.fg, style.bg, FontWeight::BOLD)
+            );
         }
     }
 
