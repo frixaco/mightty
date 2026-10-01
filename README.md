@@ -6,6 +6,20 @@ PTYs, and Ghostty's `libghostty-vt`.
 mightty targets Windows first, with Windows shell I/O through ConPTY and Unix
 shell I/O through a forkpty-backed bridge.
 
+## Screenshots
+
+PowerShell with colored output and Nerd Font icons.
+
+![PowerShell terminal with colored commands, folder icons, and sidebar tabs](docs/screenshots/terminal.png)
+
+Split panes with source files, Git history, and truecolor output.
+
+![Three terminal panes showing Git history, Rust source, and six truecolor swatches](docs/screenshots/split-panes.png)
+
+The command palette over the active terminal layout.
+
+![Command palette with pane and tab actions over colored terminal output](docs/screenshots/command-palette.png)
+
 ## Features
 
 - GPU-rendered terminal UI through GPUI.
