@@ -59,6 +59,19 @@ impl RenderState {
         from_result(result)?;
         Ok(Snapshot { state: self })
     }
+
+    /// Copy presentation data without consuming terminal dirty flags.
+    /// This is for diagnostic/offscreen observations, not the live update loop.
+    pub fn observe(&mut self, terminal: &Terminal) -> Result<Snapshot<'_>> {
+        from_result(unsafe {
+            ffi::mightty_ghostty_render_observe(self.raw.as_ptr(), terminal.as_raw())
+        })?;
+        Ok(Snapshot { state: self })
+    }
+    /// Borrow the data already prepared by the live painter, without updating it.
+    pub fn current(&mut self) -> Snapshot<'_> {
+        Snapshot { state: self }
+    }
 }
 
 impl Snapshot<'_> {
@@ -388,4 +401,45 @@ pub struct Colors {
     pub foreground: RgbColor,
     pub cursor: Option<RgbColor>,
     pub palette: [RgbColor; 256],
+}
+
+#[cfg(test)]
+mod observation_tests {
+    use super::*;
+    fn text(state: &mut RenderState, terminal: &Terminal, observe: bool) -> String {
+        let snapshot = if observe {
+            state.observe(terminal)
+        } else {
+            state.update(terminal)
+        }
+        .unwrap();
+        let mut rows = RowIterator::new().unwrap();
+        let mut cells = CellIterator::new().unwrap();
+        let mut result = String::new();
+        let mut rows = rows.update(&snapshot).unwrap();
+        while let Some(row) = rows.next() {
+            let mut cells = cells.update(row).unwrap();
+            while let Some(cell) = cells.next() {
+                result.push_str(&cell.text().unwrap());
+            }
+        }
+        result
+    }
+    #[test]
+    fn independent_observation_preserves_the_live_renderers_updates() {
+        let mut terminal = Terminal::new(crate::ghostty::TerminalOptions {
+            cols: 12,
+            rows: 2,
+            max_scrollback: 100,
+        })
+        .unwrap();
+        let mut live = RenderState::new().unwrap();
+        terminal.vt_write(b"before");
+        assert!(text(&mut live, &terminal, false).contains("before"));
+        terminal.vt_write(b"\r\x1b[2Kafter");
+        assert!(text(&mut RenderState::new().unwrap(), &terminal, true).contains("after"));
+        assert!(text(&mut live, &terminal, false).contains("after"));
+        // A second independent observation must also work after all flags are clean.
+        assert!(text(&mut RenderState::new().unwrap(), &terminal, true).contains("after"));
+    }
 }

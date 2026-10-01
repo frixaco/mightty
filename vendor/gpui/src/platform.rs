@@ -457,6 +457,32 @@ pub(crate) struct RequestFrameOptions {
     pub(crate) force_render: bool,
 }
 
+/// Maximum bytes in one retained or readback RGBA surface.
+pub const MAX_CAPTURE_RGBA_BYTES: usize = 64 * 1024 * 1024;
+
+/// A latched renderer surface. CPU readback may run on a worker thread.
+pub struct GpuCapture {
+    /// Renderer-local frame identity; zero denotes an offscreen preparation.
+    pub frame_id: u64,
+    /// Native pixel width.
+    pub width: u32,
+    /// Native pixel height.
+    pub height: u32,
+    /// Successful presentation or offscreen preparation time.
+    pub timestamp: std::time::SystemTime,
+    /// Retained and spare texture bytes, excluding readback and normal rendering.
+    pub retained_bytes: u64,
+    /// CPU retention submission time; GPU completion is not measured.
+    pub copy_submission_ns: u64,
+    pub(crate) readback: Box<dyn FnOnce() -> Result<Vec<u8>> + Send>,
+}
+impl GpuCapture {
+    /// Read lossless RGBA8 pixels from the already latched staging surface.
+    pub fn read(self) -> Result<Vec<u8>> {
+        (self.readback)()
+    }
+}
+
 pub(crate) trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn bounds(&self) -> Bounds<Pixels>;
     fn is_maximized(&self) -> bool;
@@ -498,6 +524,15 @@ pub(crate) trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn on_close(&self, callback: Box<dyn FnOnce()>);
     fn on_appearance_changed(&self, callback: Box<dyn FnMut()>);
     fn draw(&self, scene: &Scene);
+    fn presented_frame_id(&self) -> u64 {
+        0
+    }
+    fn capture_presented(&self) -> Result<GpuCapture> {
+        anyhow::bail!("renderer readback unsupported")
+    }
+    fn capture_offscreen(&self, _scene: &Scene, _size: Size<DevicePixels>) -> Result<GpuCapture> {
+        anyhow::bail!("offscreen rendering unsupported")
+    }
     fn completed_frame(&self) {}
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas>;
 

@@ -3031,6 +3031,9 @@ unsafe extern "C" {
 unsafe extern "C" {
     pub fn ghostty_unicode_grapheme_width(cps: *const u32, len: usize, width: *mut u8) -> usize;
 }
+unsafe extern "C" {
+    pub fn mightty_ghostty_render_observe(state: RenderState, terminal: Terminal) -> Result::Type;
+}
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct MighttyGhosttySearchImpl {

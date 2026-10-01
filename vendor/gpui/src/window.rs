@@ -5,18 +5,19 @@ use crate::{
     AsyncWindowContext, AvailableSpace, Background, BorderStyle, Bounds, BoxShadow, Capslock,
     Context, Corners, CursorStyle, Decorations, DevicePixels, DispatchActionListener,
     DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity, EntityId, EventEmitter,
-    FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs, Hsla, InputHandler, IsZero,
-    KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke, KeystrokeEvent, LayoutId,
-    LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite, MouseButton, MouseEvent,
-    MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
-    PlatformInputHandler, PlatformWindow, Point, PolychromeSprite, PromptButton, PromptLevel, Quad,
-    Render, RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge,
-    SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow,
-    SharedString, Size, StrikethroughStyle, Style, SubscriberSet, Subscription, SystemWindowTab,
-    SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextStyle, TextStyleRefinement,
-    TransformationMatrix, Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance,
-    WindowBounds, WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem,
-    point, prelude::*, px, rems, size, transparent_black,
+    FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuCapture, GpuSpecs, Hsla,
+    InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke,
+    KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite,
+    MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas,
+    PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PolychromeSprite,
+    PromptButton, PromptLevel, Quad, Render, RenderGlyphParams, RenderImage, RenderImageParams,
+    RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X,
+    SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size, StrikethroughStyle,
+    Style, SubscriberSet, Subscription, SystemWindowTab, SystemWindowTabController, TabStopMap,
+    TaffyLayoutEngine, Task, TextStyle, TextStyleRefinement, TransformationMatrix, Underline,
+    UnderlineStyle, WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControls,
+    WindowDecorations, WindowOptions, WindowParams, WindowTextSystem, point, prelude::*, px, rems,
+    size, transparent_black,
 };
 use anyhow::{Context as _, Result, anyhow};
 use collections::{FxHashMap, FxHashSet};
@@ -817,6 +818,9 @@ impl Frame {
 
 /// Holds the state for a specific window.
 pub struct Window {
+    capture_observer: Option<Rc<dyn Fn(&mut Window, &mut App) -> Arc<dyn Any + Send + Sync>>>,
+    capture_metadata: Option<Arc<dyn Any + Send + Sync>>,
+    presented_metadata: RefCell<Option<(u64, Arc<dyn Any + Send + Sync>)>>,
     pub(crate) handle: AnyWindowHandle,
     pub(crate) invalidator: WindowInvalidator,
     pub(crate) removed: bool,
@@ -927,6 +931,66 @@ fn default_bounds(display_id: Option<DisplayId>, cx: &mut App) -> Bounds<Pixels>
 }
 
 impl Window {
+    /// Retain owned application metadata after each completed scene preparation.
+    pub fn on_frame_prepared(
+        &mut self,
+        observer: impl Fn(&mut Window, &mut App) -> Arc<dyn Any + Send + Sync> + 'static,
+    ) {
+        self.capture_observer = Some(Rc::new(observer));
+    }
+    /// Latch the latest successfully presented surface without preparing another scene.
+    pub fn capture_presented(&self) -> Result<(GpuCapture, Option<Arc<dyn Any + Send + Sync>>)> {
+        let capture = self.platform_window.capture_presented()?;
+        let metadata = self
+            .presented_metadata
+            .borrow()
+            .as_ref()
+            .filter(|(id, _)| *id == capture.frame_id)
+            .map(|(_, metadata)| metadata.clone());
+        Ok((capture, metadata))
+    }
+    /// Last successful renderer presentation identity.
+    pub fn presented_frame_id(&self) -> u64 {
+        self.platform_window.presented_frame_id()
+    }
+    /// Paint an owned element tree on a private scratch window, without presentation.
+    /// The caller must not use a live application window for this operation.
+    pub fn capture_element(
+        &mut self,
+        mut element: AnyElement,
+        size: Size<Pixels>,
+        scale: f32,
+        cx: &mut App,
+    ) -> Result<GpuCapture> {
+        self.viewport_size = size;
+        self.scale_factor = scale;
+        self.next_frame.clear();
+        self.refreshing = true;
+        self.invalidator.set_phase(DrawPhase::Prepaint);
+        element.prepaint_as_root(Point::default(), size.into(), self, cx);
+        let mut deferred = (0..self.next_frame.deferred_draws.len()).collect::<SmallVec<[_; 8]>>();
+        deferred.sort_by_key(|ix| self.next_frame.deferred_draws[*ix].priority);
+        self.prepaint_deferred_draws(&deferred, cx);
+        self.invalidator.set_phase(DrawPhase::Paint);
+        element.paint(self, cx);
+        self.paint_deferred_draws(&deferred, cx);
+        self.next_frame.scene.finish();
+        let result = self.platform_window.capture_offscreen(
+            &self.next_frame.scene,
+            Size {
+                width: DevicePixels((f32::from(size.width) * scale).ceil() as i32),
+                height: DevicePixels((f32::from(size.height) * scale).ceil() as i32),
+            },
+        );
+        self.next_frame.clear();
+        self.layout_engine.as_mut().unwrap().clear();
+        self.text_system.finish_frame();
+        self.invalidator.set_phase(DrawPhase::None);
+        self.refreshing = false;
+        drop(element);
+        ELEMENT_ARENA.with_borrow_mut(|arena| arena.clear());
+        result
+    }
     pub(crate) fn new(
         handle: AnyWindowHandle,
         options: WindowOptions,
@@ -1205,6 +1269,9 @@ impl Window {
         platform_window.map_window().unwrap();
 
         Ok(Window {
+            capture_observer: None,
+            capture_metadata: None,
+            presented_metadata: RefCell::new(None),
             handle,
             invalidator,
             removed: false,
@@ -1980,6 +2047,10 @@ impl Window {
         self.invalidator.set_phase(DrawPhase::None);
         self.needs_present.set(true);
 
+        if let Some(observer) = self.capture_observer.clone() {
+            self.capture_metadata = Some(observer(self, cx));
+        }
+
         ArenaClearNeeded
     }
 
@@ -2008,7 +2079,14 @@ impl Window {
 
     #[profiling::function]
     fn present(&self) {
+        let previous = self.platform_window.presented_frame_id();
         self.platform_window.draw(&self.rendered_frame.scene);
+        let current = self.platform_window.presented_frame_id();
+        if current != previous
+            && let Some(metadata) = &self.capture_metadata
+        {
+            *self.presented_metadata.borrow_mut() = Some((current, metadata.clone()));
+        }
         self.needs_present.set(false);
         profiling::finish_frame!();
     }
@@ -3540,7 +3618,9 @@ impl Window {
 
     /// Commit text through the currently focused platform text-input handler.
     pub fn commit_text(&mut self, text: &str, cx: &mut App) -> bool {
-        let Some(mut handler) = self.platform_window.take_input_handler() else { return false; };
+        let Some(mut handler) = self.platform_window.take_input_handler() else {
+            return false;
+        };
         handler.dispatch_input(text, self, cx);
         self.platform_window.set_input_handler(handler);
         true

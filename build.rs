@@ -11,6 +11,57 @@ fn main() {
     let repo_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("missing manifest dir"));
     let ghostty_dir = repo_dir.join("ghostty");
     let bindings_version = repo_dir.join("src/ghostty/bindings.version");
+    let revision = command_stdout(
+        Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&repo_dir),
+        "identify mightty revision",
+    );
+    let head = command_stdout(
+        Command::new("git")
+            .args(["rev-parse", "--path-format=absolute", "--git-path", "HEAD"])
+            .current_dir(&repo_dir),
+        "locate mightty HEAD",
+    );
+    let symbolic = command_stdout(
+        Command::new("git")
+            .args(["rev-parse", "--symbolic-full-name", "HEAD"])
+            .current_dir(&repo_dir),
+        "identify mightty reference",
+    );
+    let reference = command_stdout(
+        Command::new("git")
+            .args([
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-path",
+                &symbolic,
+            ])
+            .current_dir(&repo_dir),
+        "locate mightty reference",
+    );
+    println!("cargo:rerun-if-changed={head}");
+    println!("cargo:rerun-if-changed={reference}");
+    println!("cargo:rustc-env=MIGHTTY_BUILD_REVISION={revision}");
+    println!(
+        "cargo:rustc-env=MIGHTTY_BUILD_TARGET={}",
+        env::var("TARGET").unwrap()
+    );
+    println!(
+        "cargo:rustc-env=MIGHTTY_BUILD_PROFILE={}",
+        env::var("PROFILE").unwrap()
+    );
+    let mut fonts = Vec::new();
+    for face in ["Regular", "Bold", "Italic", "BoldItalic"] {
+        let name = format!("JetBrainsMonoNerdFontMono-{face}.ttf");
+        let path = repo_dir.join("fonts/JetBrainsMono").join(&name);
+        println!("cargo:rerun-if-changed={}", path.display());
+        fonts.push(format!("{name}={}", fingerprint::file_fingerprint(&path)));
+    }
+    println!(
+        "cargo:rustc-env=MIGHTTY_FONT_FINGERPRINTS={}",
+        fonts.join(";")
+    );
 
     println!("cargo:rerun-if-env-changed=ZIG");
     println!("cargo:rerun-if-changed=build.rs");
@@ -73,6 +124,7 @@ fn require_matching_bindings(ghostty_dir: &Path, version_path: &Path) {
          Regenerate with `cargo run --manifest-path tools/ghostty-bindings/Cargo.toml`."
     );
     println!("cargo:rustc-env=MIGHTTY_GHOSTTY_REVISION={actual_commit}");
+    println!("cargo:rustc-env=MIGHTTY_GHOSTTY_HEADERS={actual_fingerprint}");
 }
 
 fn build_and_link_ghostty(ghostty_dir: &Path) {

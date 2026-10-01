@@ -844,6 +844,19 @@ impl PlatformWindow for WindowsWindow {
     fn draw(&self, scene: &Scene) {
         self.0.state.borrow_mut().renderer.draw(scene).log_err();
     }
+    fn presented_frame_id(&self) -> u64 {
+        self.0.state.borrow().renderer.presented_frame_id()
+    }
+    fn capture_presented(&self) -> Result<GpuCapture> {
+        self.0.state.borrow().renderer.capture_presented()
+    }
+    fn capture_offscreen(&self, scene: &Scene, size: Size<DevicePixels>) -> Result<GpuCapture> {
+        self.0
+            .state
+            .borrow_mut()
+            .renderer
+            .capture_offscreen(scene, size)
+    }
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
         self.0.state.borrow().renderer.sprite_atlas()

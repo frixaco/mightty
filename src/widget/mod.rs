@@ -16,7 +16,6 @@ use crate::action::{
     ActionBinding, AppAction, DispatchAppAction, PromptDirection, chord_for_keystroke,
     default_action_bindings,
 };
-use crate::feedback;
 use crate::ghostty::{
     ClipboardLocation, ClipboardWrite, ClipboardWriteResult, RenderState, Scrollbar,
     SearchDirection, SearchProgress, SelectionDrag, SelectionGeometry, SelectionPoint,
@@ -176,6 +175,7 @@ pub struct TerminalWidget {
     output_seq: u64,
     output_eof: bool,
     io_error: Option<String>,
+    capture_cache: Option<(String, Arc<crate::feedback::TerminalCapture>)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -422,6 +422,7 @@ impl TerminalWidget {
             output_seq: 0,
             output_eof: false,
             io_error: None,
+            capture_cache: None,
         };
 
         if let Some(event_rx) = pty_event_rx {
@@ -1085,36 +1086,8 @@ impl TerminalWidget {
                 .eq_ignore_ascii_case(FEEDBACK_CAPTURE_KEY)
     }
 
-    fn capture_feedback(&mut self, window: &mut Window, _cx: &mut Context<Self>) {
-        let capture = match self.build_feedback_capture() {
-            Ok(capture) => capture,
-            Err(err) => {
-                eprintln!("Feedback capture failed while snapshotting terminal state: {err:?}");
-                return;
-            }
-        };
-
-        match feedback::write_capture(&capture, window) {
-            Ok(paths) => {
-                if let Some(png_path) = &paths.png_path {
-                    eprintln!(
-                        "Feedback capture saved to {} (json: {}, png: {})",
-                        paths.directory.display(),
-                        paths.json_path.display(),
-                        png_path.display()
-                    );
-                } else if let Some(err) = &paths.pixel_capture_error {
-                    eprintln!(
-                        "Feedback capture saved JSON to {} but pixel capture failed: {}",
-                        paths.json_path.display(),
-                        err
-                    );
-                } else {
-                    eprintln!("Feedback capture saved to {}", paths.json_path.display());
-                }
-            }
-            Err(err) => eprintln!("Feedback capture write failed: {err}"),
-        }
+    fn capture_feedback(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        crate::snapshot::feedback(window, cx);
     }
 
     fn handle_mouse_down(

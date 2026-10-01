@@ -6,6 +6,185 @@ use crate::{
 use serde_json::{Value, json};
 
 impl PaneContainer {
+    pub fn snapshot_layout_ready(
+        &self,
+        request: &Request,
+        window: &Window,
+        cx: &gpui::App,
+    ) -> Result<bool, ControlError> {
+        let index = if request.target.tab_id.is_some() {
+            Some(self.control_tab(request, cx)?)
+        } else {
+            None
+        };
+        if let Some(layout) = control::string_arg(request, "layout")? {
+            let mut guarded = request.clone();
+            guarded.preconditions.layout_token = Some(layout.into());
+            self.check_layout(&guarded, index, window, cx)?;
+        }
+        Ok(self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| index.is_none_or(|index| index == *i))
+            .all(|(_, tab)| {
+                tab.split
+                    .read(cx)
+                    .pane_entities()
+                    .all(|(_, _, terminal)| terminal.read(cx).geometry_ready())
+            }))
+    }
+    pub fn resolve_snapshot_target(
+        &self,
+        request: &Request,
+        cx: &gpui::App,
+    ) -> Result<Request, ControlError> {
+        let mut request = request.clone();
+        request.target.window_id = Some(self.window_id.into());
+        if request.target.pane_id.is_some() {
+            let (index, pane, _) = self.targeted_terminal(&request, cx)?;
+            request.target.tab_id = Some(format!("t{}", self.tabs[index].id.value()));
+            request.target.pane_id = Some(format!("p{}", pane.value()));
+        } else if request.target.tab_id.is_some() {
+            let index = self.control_tab(&request, cx)?;
+            request.target.tab_id = Some(format!("t{}", self.tabs[index].id.value()));
+        }
+        Ok(request)
+    }
+    pub fn presentation(
+        &self,
+        revision: u64,
+        window: &Window,
+        cx: &mut gpui::App,
+    ) -> std::sync::Arc<crate::snapshot::Frame> {
+        self.presentation_tab(self.active_tab_index, None, revision, window, cx)
+    }
+    fn presentation_tab(
+        &self,
+        index: usize,
+        target: Option<PaneId>,
+        revision: u64,
+        window: &Window,
+        cx: &mut gpui::App,
+    ) -> std::sync::Arc<crate::snapshot::Frame> {
+        let tab = &self.tabs[index];
+        let split = tab.split.read(cx);
+        let entities = split
+            .pane_entities()
+            .filter(|(id, _, _)| {
+                target.map_or_else(
+                    || split.zoomed_pane_id().is_none_or(|zoom| zoom == *id),
+                    |target| target == *id,
+                )
+            })
+            .map(|(id, profile, terminal)| (id, profile.clone(), terminal))
+            .collect::<Vec<_>>();
+        let mut panes = Vec::new();
+        let mut cell_budget = 40000usize;
+        for (id, profile, terminal) in entities {
+            let count = terminal.read(cx).capture_cell_count();
+            let include_source = count <= 20000 && count <= cell_budget;
+            if include_source {
+                cell_budget -= count;
+            }
+            let mut pane = terminal.update(cx, |terminal, _| {
+                terminal.presentation(window, revision == 0, include_source)
+            });
+            pane.state["pane_id"] = json!(format!("p{}", id.value()));
+            pane.state["tab_id"] = json!(format!("t{}", tab.id.value()));
+            pane.state["profile_id"] = json!(profile.as_str());
+            pane.state["output_cursor"] = json!(format!(
+                "{}:p{}:{}",
+                control::instance_id(),
+                id.value(),
+                pane.state["output_seq"].as_str().unwrap()
+            ));
+            panes.push(pane);
+        }
+        let mut labels = Vec::new();
+        self.label_geometry
+            .borrow_mut()
+            .retain(|id, _| self.tabs.iter().any(|tab| tab.id.value() == *id));
+        if self.sidebar_visible && index == self.active_tab_index && target.is_none() {
+            for (index, tab) in self.tabs.iter().enumerate() {
+                labels.push(json!({"tab_id":format!("t{}",tab.id.value()),"chosen_title":tab.title,"fallback_title":tab.default_title,"decorated_label":tab.title,"badge":if tab.bell_pending{format!("{}•",index+1)}else{(index+1).to_string()},"geometry":self.label_geometry.borrow().get(&tab.id.value()),"measured_extents":{"availability":"unavailable"}}));
+            }
+        }
+        std::sync::Arc::new(crate::snapshot::Frame {
+            schema_version: 1,
+            instance_id: control::instance_id().into(),
+            window_id: self.window_id.into(),
+            scene_revision: revision.to_string(),
+            prepared_at: crate::diagnostics::timestamp(),
+            dpi_scale: window.scale_factor(),
+            window: json!({"bounds":{"width":f32::from(window.viewport_size().width),"height":f32::from(window.viewport_size().height)},"layout_token":self.window_layout_token(window,cx),"active_tab_id":format!("t{}",tab.id.value()),"tab_layout_token":tab.split.read(cx).layout_token(tab.id),"content_bounds":self.content_bounds.map(crate::snapshot::rect),"sidebar_visible":self.sidebar_visible,"palette":self.palette.as_ref().map(|palette|json!({"query":palette.query,"selected":palette.selected})),"gpu":window.gpu_specs(),"settings_generation":self.settings.generation().to_string(),"settings":{"app":self.settings.current().app,"key_bindings":self.settings.current().key_bindings}}),
+            panes,
+            labels,
+        })
+    }
+    pub fn offscreen(
+        &self,
+        request: &Request,
+        window: &mut Window,
+        cx: &mut gpui::App,
+    ) -> Result<crate::snapshot::Prepared, ControlError> {
+        let (index, target) = if request.target.pane_id.is_some() {
+            let (index, pane, _) = self.targeted_terminal(request, cx)?;
+            (index, Some(pane))
+        } else if request.target.tab_id.is_some() {
+            (self.control_tab(request, cx)?, None)
+        } else {
+            return Err(ControlError::new(
+                "unsupported",
+                "offscreen requires a tab or pane target",
+            ));
+        };
+        let bounds = if let Some(id) = target {
+            self.tabs[index]
+                .split
+                .read(cx)
+                .terminal(id)
+                .unwrap()
+                .read(cx)
+                .control_state()["computed_bounds"]
+                .clone()
+        } else {
+            self.content_bounds
+                .map(crate::snapshot::rect)
+                .ok_or_else(|| {
+                    ControlError::new("layout_unavailable", "content bounds not established")
+                })?
+        };
+        let size = gpui::size(
+            px(bounds["width"].as_f64().unwrap() as f32),
+            px(bounds["height"].as_f64().unwrap() as f32),
+        );
+        crate::snapshot::validate_size(size, window.scale_factor())?;
+        let mut frame = self.presentation_tab(index, target, 0, window, cx);
+        let owned = std::sync::Arc::get_mut(&mut frame).unwrap();
+        owned.labels.clear();
+        owned.window["palette"] = Value::Null;
+        owned.window["sidebar_visible"] = json!(false);
+        owned.window["image_origin_logical"] = json!({"x":bounds["x"],"y":bounds["y"]});
+        owned.window["bounds"] = json!({"width":bounds["width"],"height":bounds["height"]});
+        // Opening a GPUI window draws and clears the element arena; do it
+        // before allocating the capture tree.
+        let scratch = crate::snapshot::scratch_window(size, cx)?;
+        let element = self.tabs[index]
+            .split
+            .update(cx, |split, cx| split.offscreen_element(target, window, cx));
+        let gpu =
+            crate::snapshot::paint_offscreen(scratch, element, size, window.scale_factor(), cx)?;
+        Ok(crate::snapshot::Prepared {
+            gpu,
+            frame,
+            crop: None,
+            mode: "offscreen".into(),
+            visibility: crate::snapshot::visibility(window),
+            diagnostics: crate::diagnostics::recent(),
+            diagnostics_observed_at: crate::diagnostics::timestamp(),
+        })
+    }
     pub(super) fn retain_pane(&self, index: usize, pane: PaneId, cx: &mut Context<Self>) {
         if let Some(terminal) = self.tabs[index].split.read(cx).terminal(pane) {
             let mut state = terminal.read(cx).control_state();
@@ -401,6 +580,9 @@ impl PaneContainer {
                 Ok(self.control_state(window, cx))
             }
             "window.focus" => {
+                #[cfg(windows)]
+                crate::application::windows::show_default_terminal_window(window)
+                    .map_err(|e| ControlError::new("platform_error", e.to_string()))?;
                 window.activate_window();
                 Ok(json!({"os_focused":window.is_window_active()}))
             }

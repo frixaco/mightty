@@ -68,6 +68,7 @@ pub struct PaneContainer {
     tabs: Vec<Tab>,
     active_tab_index: usize,
     sidebar_visible: bool,
+    label_geometry: std::rc::Rc<std::cell::RefCell<BTreeMap<u64, serde_json::Value>>>,
     needs_focus: bool,
     titlebar_visible: bool,
     app_menu_bar: Option<Entity<AppMenuBar>>,
@@ -300,6 +301,7 @@ impl PaneContainer {
             tabs: vec![tab],
             active_tab_index: 0,
             sidebar_visible,
+            label_geometry: Default::default(),
             needs_focus: true,
             titlebar_visible,
             app_menu_bar: None,
@@ -1555,6 +1557,8 @@ impl PaneContainer {
                     (index + 1).to_string()
                 };
                 let title = tab.title.clone();
+                let geometry = self.label_geometry.clone();
+                let id = tab.id.value();
 
                 div()
                     .id(("tab", index))
@@ -1601,9 +1605,14 @@ impl PaneContainer {
                             .min_w_0()
                             .w_full()
                             .truncate()
+                            .relative()
                             .text_size(px(12.0))
                             .line_height(px(TAB_HEIGHT_PX))
-                            .child(title),
+                            .child(title)
+                            .child(gpui::canvas(move |bounds, window, _| {
+                                let style = window.text_style();
+                                geometry.borrow_mut().insert(id, serde_json::json!({"bounds":crate::snapshot::rect(bounds),"ancestor_clip":crate::snapshot::rect(window.content_mask().bounds),"font_family":style.font_family.as_ref(),"font_size_px":12,"line_height_px":TAB_HEIGHT_PX,"wrap":"nowrap","overflow":"ellipsis"}));
+                            }, |_, _, _, _| {}).absolute().top(px(0.)).left(px(0.)).size_full()),
                     )
             }))
     }

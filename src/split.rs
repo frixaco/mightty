@@ -544,6 +544,70 @@ impl Split {
         layout_tree(&self.root, self.current_root_rect(window))
     }
 
+    /// Frozen content and dividers; no entity render or geometry callbacks.
+    pub fn offscreen_element(
+        &self,
+        target: Option<PaneId>,
+        window: &mut Window,
+        cx: &mut gpui::App,
+    ) -> AnyElement {
+        if let Some(id) = target {
+            return self.panes[&id]
+                .terminal
+                .update(cx, |terminal, cx| terminal.offscreen_element(window, cx));
+        }
+        let layout = self.current_layout(window);
+        let root = self.current_root_rect(window);
+        let mut elements = Vec::new();
+        for pane in layout.panes {
+            if self.zoomed_pane_id.is_some_and(|id| id != pane.pane_id) {
+                continue;
+            }
+            let bounds = if self.zoomed_pane_id.is_some() {
+                root
+            } else {
+                pane.bounds
+            };
+            let terminal = self.panes[&pane.pane_id]
+                .terminal
+                .update(cx, |terminal, cx| terminal.offscreen_element(window, cx));
+            elements.push(
+                div()
+                    .absolute()
+                    .left(px(bounds.x))
+                    .top(px(bounds.y))
+                    .w(px(bounds.width))
+                    .h(px(bounds.height))
+                    .min_w_0()
+                    .min_h_0()
+                    .rounded(px(4.))
+                    .overflow_hidden()
+                    .bg(gpui::rgb(0x000000))
+                    .child(terminal)
+                    .into_any_element(),
+            );
+        }
+        if self.zoomed_pane_id.is_none() {
+            elements.extend(layout.dividers.into_iter().map(|divider| {
+                div()
+                    .absolute()
+                    .left(px(divider.bounds.x))
+                    .top(px(divider.bounds.y))
+                    .w(px(divider.bounds.width))
+                    .h(px(divider.bounds.height))
+                    .bg(gpui::rgb(SEPARATOR_COLOR))
+                    .into_any_element()
+            }));
+        }
+        div()
+            .size_full()
+            .relative()
+            .overflow_hidden()
+            .bg(gpui::rgb(0x000000))
+            .children(elements)
+            .into_any_element()
+    }
+
     fn update_layout_bounds(&mut self, bounds: Bounds<Pixels>, cx: &mut Context<Self>) {
         if self.layout_bounds != Some(bounds) {
             self.layout_bounds = Some(bounds);

@@ -1,6 +1,53 @@
 const std = @import("std");
 const terminal = @import("terminal/main.zig");
 const terminal_c = @import("terminal/c/terminal.zig");
+const render_c = @import("terminal/c/render.zig");
+
+// The pinned RenderState update only changes these terminal dirty flags.
+// Restore them even on allocation failure; no terminal borrow escapes this call.
+fn observe(state: render_c.RenderState, raw: terminal_c.Terminal) callconv(.c) Result {
+    const t = terminal_c.zigTerminal(raw) orelse return .invalid_value;
+    if (state == null) return .invalid_value;
+    const s = t.screens.active;
+    const alloc = s.alloc;
+    const row_dirty = alloc.alloc(bool, s.pages.rows) catch return .out_of_memory;
+    defer alloc.free(row_dirty);
+    const page_dirty = alloc.alloc(bool, s.pages.rows) catch return .out_of_memory;
+    defer alloc.free(page_dirty);
+    const top = s.pages.getTopLeft(.viewport);
+    var iterator = top.pageIterator(.right_down, null);
+    var y: usize = 0;
+    var n: usize = 0;
+    while (y < s.pages.rows) {
+        const chunk = iterator.next() orelse return .invalid_value;
+        const p = chunk.node.page();
+        const take = @min(@as(usize, chunk.end - chunk.start), s.pages.rows - y);
+        page_dirty[n] = p.dirty;
+        n += 1;
+        for (p.rows.ptr(p.memory)[chunk.start..][0..take], row_dirty[y..][0..take]) |row, *dirty| dirty.* = row.dirty;
+        y += take;
+    }
+    const terminal_dirty = t.flags.dirty;
+    const screen_dirty = s.dirty;
+    defer {
+        t.flags.dirty = terminal_dirty;
+        s.dirty = screen_dirty;
+        iterator = top.pageIterator(.right_down, null);
+        y = 0;
+        n = 0;
+        while (y < s.pages.rows) {
+            const chunk = iterator.next().?;
+            const p = chunk.node.page();
+            const take = @min(@as(usize, chunk.end - chunk.start), s.pages.rows - y);
+            p.dirty = page_dirty[n];
+            n += 1;
+            for (p.rows.ptr(p.memory)[chunk.start..][0..take], row_dirty[y..][0..take]) |*row, dirty| row.dirty = dirty;
+            y += take;
+        }
+    }
+    t.flags.dirty.palette = true; // force a complete independent copy
+    return @enumFromInt(@intFromEnum(render_c.update(state, raw)));
+}
 
 const Terminal = terminal.Terminal;
 const Screen = terminal.Screen;
@@ -228,6 +275,7 @@ fn probe(search: ?*Search, out_match: ?*bool, out_buffer_changed: ?*bool) callco
 }
 
 comptime {
+    @export(&observe, .{ .name = "mightty_ghostty_render_observe" });
     @export(&new, .{ .name = "mightty_ghostty_search_new" });
     @export(&free, .{ .name = "mightty_ghostty_search_free" });
     @export(&probe, .{ .name = "mightty_ghostty_search_probe" });

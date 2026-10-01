@@ -102,7 +102,15 @@ fn open_terminal_window(
         })
         .expect("failed to open terminal window");
     let _ = handle.update(cx, |_, window, cx| {
-        panes.update(cx, |panes, cx| panes.establish_layout(window, cx))
+        panes.update(cx, |panes, cx| panes.establish_layout(window, cx));
+        let metadata_panes = panes.downgrade();
+        let revision = std::cell::Cell::new(0u64);
+        window.on_frame_prepared(move |window, cx| {
+            revision.set(revision.get() + 1);
+            metadata_panes.upgrade().unwrap().update(cx, |panes, cx| {
+                panes.presentation(revision.get(), window, cx)
+            })
+        });
     });
     cx.observe(&panes, |_, _| mightty::diagnostics::mark_dirty())
         .detach();
@@ -527,6 +535,7 @@ impl WindowsApplication {
             self.persistence_pending = true;
             self.control_revision += 1;
             self.diagnostic_state = json!({"schema_version":1,"instance_id":mightty::control::instance_id(),"pid":std::process::id(),"started_at":self.started_at,"observed_at":mightty::diagnostics::timestamp(),"revision":self.control_revision.to_string(),"source":"live","orderly_shutdown":false,"last_focused_window_id":self.last_focused_window,"build":{"mightty_version":env!("CARGO_PKG_VERSION"),"ghostty_revision":mightty::ghostty::SOURCE_REVISION},"windows":windows,"outcomes":outcomes,"diagnostics":logs,"persistence":self.diagnostic_writer.status()});
+            mightty::snapshot::publish_state(self.diagnostic_state.clone());
             let event = json!({"protocol_version":1,"instance_id":mightty::control::instance_id(),"revision":self.control_revision.to_string(),"type":"change","changes":[{"kind":"windows_changed","windows":self.diagnostic_state["windows"]},{"kind":"outcomes_changed","outcomes":self.diagnostic_state["outcomes"]},{"kind":"diagnostics_changed","diagnostics":self.diagnostic_state["diagnostics"]}]});
             self.subscribers.retain(|sender|{if sender.len()>=31 {let _=sender.try_send(json!({"protocol_version":1,"instance_id":mightty::control::instance_id(),"revision":self.control_revision.to_string(),"type":"resync_required"}));false}else{sender.try_send(event.clone()).is_ok()}});
         }
@@ -665,6 +674,184 @@ impl WindowsApplication {
                     && panes.read(cx).control_contains(&request.target, cx)
             })
             .collect::<Vec<_>>();
+        if request.op == "snapshot"
+            && let [(_, handle, panes)] = targets.as_slice()
+        {
+            let permit = match mightty::snapshot::Permit::acquire() {
+                Ok(permit) => permit,
+                Err(error) => return Some(reply(request, self.control_revision, Err(error))),
+            };
+            let resolved = panes.read(cx).resolve_snapshot_target(request, cx);
+            let request = match resolved {
+                Ok(request) => request,
+                Err(error) => return Some(reply(request, self.control_revision, Err(error))),
+            };
+            let mode = match mightty::control::string_arg(&request, "frame") {
+                Ok(mode) => mode.unwrap_or(
+                    if request.target.tab_id.is_some() || request.target.pane_id.is_some() {
+                        "offscreen"
+                    } else {
+                        "presented"
+                    },
+                ),
+                Err(error) => return Some(reply(&request, self.control_revision, Err(error))),
+            };
+            if !matches!(mode, "presented" | "next" | "offscreen") {
+                return Some(reply(
+                    &request,
+                    self.control_revision,
+                    Err(ControlError::new(
+                        "invalid_argument",
+                        "frame must be presented, next or offscreen",
+                    )),
+                ));
+            }
+            if mode == "offscreen"
+                && request.target.tab_id.is_none()
+                && request.target.pane_id.is_none()
+            {
+                return Some(reply(
+                    &request,
+                    self.control_revision,
+                    Err(ControlError::new(
+                        "unsupported",
+                        "offscreen requires a tab or pane target",
+                    )),
+                ));
+            }
+            let handle = gpui::AnyWindowHandle::from(*handle);
+            let baseline = handle
+                .update(cx, |_, window, _| window.presented_frame_id())
+                .unwrap_or(0);
+            if mode == "next" {
+                let ready = handle
+                    .update(cx, |_, window, cx| {
+                        let visibility = mightty::snapshot::visibility(window);
+                        if visibility["visible"] != true || visibility["minimized"] == true {
+                            return Err(ControlError::new(
+                                "not_presentable",
+                                "window is hidden or minimized",
+                            ));
+                        }
+                        panes.read(cx).snapshot_layout_ready(&request, window, cx)?;
+                        Ok(())
+                    })
+                    .map_err(|e| ControlError::new("window_closed", e.to_string()))
+                    .and_then(|r| r);
+                if let Err(error) = ready {
+                    return Some(reply(&request, self.control_revision, Err(error)));
+                }
+            }
+            let sender = dispatch.reply.clone();
+            let deadline = dispatch.deadline;
+            let revision = self.control_revision;
+            let state = self.diagnostic_state.clone();
+            let next = mode == "next";
+            let offscreen = mode == "offscreen";
+            let mut immediate = if !next && !offscreen {
+                Some(
+                    handle
+                        .update(cx, |_, window, _| {
+                            mightty::snapshot::acquire_presented(&request, window)
+                        })
+                        .map_err(|e| ControlError::new("window_closed", e.to_string()))
+                        .and_then(|r| r),
+                )
+            } else {
+                None
+            };
+            let panes = panes.clone();
+            cx.spawn(async move |cx| {
+                let mut baseline = baseline;
+                let mut requested = false;
+                let prepared = loop {
+                    if let Some(prepared) = immediate.take() {
+                        break prepared;
+                    }
+                    let result = handle.update(cx, |_, window, cx| {
+                        match panes.read(cx).snapshot_layout_ready(&request, window, cx) {
+                            Err(error) => return Some(Err(error)),
+                            Ok(false) => return None,
+                            Ok(true) => {}
+                        }
+                        if offscreen {
+                            return Some(
+                                panes.update(cx, |panes, cx| panes.offscreen(&request, window, cx)),
+                            );
+                        }
+                        if !requested {
+                            baseline = window.presented_frame_id();
+                            window.refresh();
+                            requested = true;
+                            return None;
+                        }
+                        if !next || window.presented_frame_id() > baseline {
+                            Some(mightty::snapshot::acquire_presented(&request, window))
+                        } else {
+                            None
+                        }
+                    });
+                    match result {
+                        Ok(Some(result)) => break result,
+                        Err(error) => {
+                            break Err(ControlError::new("window_closed", error.to_string()));
+                        }
+                        _ if std::time::Instant::now() >= deadline => {
+                            break Err(ControlError::new(
+                                if offscreen || !requested {
+                                    "layout_unavailable"
+                                } else {
+                                    "timeout"
+                                },
+                                "layout or requested presentation did not become ready",
+                            ));
+                        }
+                        _ => {
+                            Timer::after(Duration::from_millis(10)).await;
+                        }
+                    }
+                };
+                let prepared = match prepared {
+                    Ok(prepared) => prepared,
+                    Err(error) => {
+                        let _ = sender.try_send(reply(&request, revision, Err(error)));
+                        return;
+                    }
+                };
+                let (done, result) = flume::bounded(1);
+                let work_request = request.clone();
+                cx.background_executor()
+                    .spawn(async move {
+                        let _ = done.try_send(mightty::snapshot::write(
+                            prepared,
+                            work_request,
+                            state,
+                            permit,
+                        ));
+                    })
+                    .detach();
+                loop {
+                    if let Ok(result) = result.try_recv() {
+                        let response = reply(&request, revision, result);
+                        mightty::diagnostics::record_control(&request, &response);
+                        let _ = sender.try_send(response);
+                        break;
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        let mut error = ControlError::new(
+                            "outcome_unknown",
+                            "capture worker did not finish within deadline",
+                        );
+                        error.effect = "unknown";
+                        let _ = sender.try_send(reply(&request, revision, Err(error)));
+                        break;
+                    }
+                    Timer::after(Duration::from_millis(10)).await;
+                }
+            })
+            .detach();
+            return None;
+        }
         if matches!(
             request.op.as_str(),
             "ui.key" | "ui.text" | "ui.pointer" | "ui.input"

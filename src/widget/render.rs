@@ -79,10 +79,30 @@ impl RowSegment {
 
 impl Render for TerminalWidget {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.paint_terminal(window, cx, false)
+    }
+}
+
+impl TerminalWidget {
+    /// Prepare the same painter on established geometry without live lifecycle effects.
+    pub fn offscreen_element(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        self.paint_terminal(window, cx, true).into_any_element()
+    }
+
+    fn paint_terminal(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        offscreen: bool,
+    ) -> gpui::Div {
         #[cfg(test)]
         reset_render_stage_trace();
 
-        if self.blur_subscription.is_none() {
+        if !offscreen && self.blur_subscription.is_none() {
             self.blur_subscription =
                 Some(cx.on_blur(&self.focus_handle, window, |this, _window, cx| {
                     this.preedit.clear();
@@ -94,14 +114,26 @@ impl Render for TerminalWidget {
                 }));
         }
 
-        self.resolve_font_metrics(window);
+        if !offscreen {
+            self.resolve_font_metrics(window);
+        }
 
         let layout_size = self
             .layout_bounds
             .map_or_else(|| window.viewport_size(), |bounds| bounds.size);
-        let _ = self.resize_to_size(layout_size, cx);
+        if !offscreen {
+            let _ = self.resize_to_size(layout_size, cx);
+        }
 
-        let snapshot = match self.render_state.update(&self.terminal) {
+        let mut observation = offscreen
+            .then(crate::ghostty::RenderState::new)
+            .transpose()
+            .expect("render snapshot allocation");
+        let snapshot = match if let Some(state) = &mut observation {
+            state.observe(&self.terminal)
+        } else {
+            self.render_state.update(&self.terminal)
+        } {
             Ok(s) => s,
             Err(_) => {
                 return div()
@@ -181,7 +213,8 @@ impl Render for TerminalWidget {
                 };
                 let advance = width.column_advance();
                 let start_col = col_idx;
-                col_idx += advance;
+                // Iteration includes wide-cell continuation slots; columns are physical.
+                col_idx += 1;
                 let text = match cell.text() {
                     Ok(text) => text,
                     Err(_) => {
@@ -591,6 +624,19 @@ impl Render for TerminalWidget {
                         ),
                 )
         });
+        // Use a disposable input entity for the readonly overlay so painting in a
+        // scratch window cannot change the live input's bounds or handler.
+        let search_input = if offscreen {
+            self.search.as_ref().map(|search| {
+                cx.new(|cx| {
+                    let mut input = gpui_component::input::InputState::new(window, cx);
+                    input.set_value(search.query.clone(), window, cx);
+                    input
+                })
+            })
+        } else {
+            self.search_input.clone()
+        };
         let search_overlay = self.search.as_ref().map(|search| {
             let diagnostic = search.diagnostic.as_ref().map(|diagnostic| {
                 div()
@@ -618,11 +664,7 @@ impl Render for TerminalWidget {
                         .flex()
                         .items_center()
                         .justify_between()
-                        .children(
-                            self.search_input
-                                .as_ref()
-                                .map(gpui_component::input::Input::new),
-                        )
+                        .children(search_input.as_ref().map(gpui_component::input::Input::new))
                         .child(
                             div()
                                 .text_size(px(11.0))
@@ -639,6 +681,17 @@ impl Render for TerminalWidget {
                 )
         });
 
+        if offscreen {
+            return div()
+                .size_full()
+                .bg(rgb_to_rgba(colors.background))
+                .relative()
+                .overflow_hidden()
+                .children(elements)
+                .children(scrollbar)
+                .children(paste_confirmation)
+                .children(search_overlay);
+        }
         div()
             .size_full()
             .bg(rgb_to_rgba(colors.background))
@@ -774,7 +827,7 @@ fn selected_background(
     }
 }
 
-fn terminal_font_features() -> FontFeatures {
+pub(super) fn terminal_font_features() -> FontFeatures {
     FontFeatures(Arc::new(vec![
         ("calt".to_string(), 0),
         ("liga".to_string(), 0),
@@ -782,7 +835,7 @@ fn terminal_font_features() -> FontFeatures {
     ]))
 }
 
-fn terminal_font_fallbacks(primary: &str) -> FontFallbacks {
+pub(super) fn terminal_font_fallbacks(primary: &str) -> FontFallbacks {
     FontFallbacks::from_fonts(vec![
         primary.to_string(),
         "Consolas".to_string(),

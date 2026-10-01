@@ -11,6 +11,97 @@ use super::TerminalWidget;
 use super::render::CellWidthExt;
 
 impl TerminalWidget {
+    pub fn capture_cell_count(&self) -> usize {
+        usize::from(self.size.0) * usize::from(self.size.1)
+    }
+    pub fn geometry_ready(&self) -> bool {
+        self.pty_tx
+            .as_ref()
+            .and_then(|tx| tx.acknowledged_size())
+            .is_some_and(|size| (size.cols, size.rows) == self.size)
+            && self.layout_bounds.is_some()
+    }
+    pub fn presentation(
+        &mut self,
+        window: &gpui::Window,
+        offscreen: bool,
+        include_source: bool,
+    ) -> crate::snapshot::PaneFrame {
+        let key = format!(
+            "{:?}",
+            (
+                self.output_seq,
+                offscreen,
+                self.size,
+                self.terminal.scrollbar().ok().map(|s| s.offset),
+                self.terminal.selection_coordinates().ok(),
+                &self.config.font_family,
+                self.config.font_size_px,
+                self.cell_size,
+                &self.theme
+            )
+        );
+        let source = if !include_source || self.capture_cell_count() > 20000 {
+            self.capture_cache = None;
+            None
+        } else {
+            if self
+                .capture_cache
+                .as_ref()
+                .is_none_or(|(old, _)| *old != key)
+            {
+                self.capture_cache = self
+                    .build_feedback_capture(offscreen)
+                    .ok()
+                    .map(|capture| (key, std::sync::Arc::new(capture)));
+            }
+            self.capture_cache
+                .as_ref()
+                .map(|(_, capture)| capture.clone())
+        };
+        let mut state = self.control_state();
+        for field in [
+            "processes",
+            "lifecycle",
+            "output_eof",
+            "io_error",
+            "pty_size",
+        ] {
+            state.as_object_mut().unwrap().remove(field);
+        }
+        state["focus_appearance"] = serde_json::json!(self.focus_handle.is_focused(window));
+        state["cursor_phase"] = serde_json::json!(self.cursor_blink_phase);
+        state["preedit"] = serde_json::json!(self.preedit);
+        state["pending_paste_confirmation"] = serde_json::json!(self.pending_paste.is_some());
+        state["selection_coordinates"] =
+            serde_json::json!(self.terminal.selection_coordinates().ok().flatten());
+        state["effective_settings"] = serde_json::json!({"font_family":self.config.font_family,"font_size_px":self.config.font_size_px,"cursor_style":format!("{:?}",self.config.cursor_style),"cursor_blink":self.config.cursor_blink,"blink_interval_ms":self.config.blink_interval.as_millis().to_string(),"scrollback":self.config.scrollback,"theme":format!("{:?}",self.theme),"clipboard_policy":format!("{:?}",self.config.terminal_clipboard_policy),"action_bindings":self.config.action_bindings});
+        state["launch"]["inherit_environment"] =
+            serde_json::json!(self.config.launch.inherit_environment);
+        state["launch"]["unset_environment"] = serde_json::json!(
+            self.config
+                .launch
+                .unset_environment
+                .iter()
+                .map(|v| v.to_string_lossy())
+                .collect::<Vec<_>>()
+        );
+        state["launch"]["shell_integration"] =
+            serde_json::json!(self.config.launch.shell_integration);
+        state["launch"]["environment_values"] = serde_json::json!(
+            self.config
+                .launch
+                .environment
+                .iter()
+                .map(|(key, value)| (
+                    key.to_string_lossy().into_owned(),
+                    value.to_string_lossy().into_owned()
+                ))
+                .collect::<std::collections::BTreeMap<_, _>>()
+        );
+        state["painter"] = serde_json::json!({"font_features":format!("{:?}",super::render::terminal_font_features()),"fallback_chain":format!("{:?}",super::render::terminal_font_fallbacks(&self.config.font_family)),"resolved_font_faces":{"availability":"unavailable","reason":"GPUI does not retain face/cluster diagnostics for this surface"}});
+        crate::snapshot::PaneFrame { state, source }
+    }
     pub fn control_root_process(&self) -> Option<crate::diagnostics::RootProcess> {
         self.pty_worker
             .as_ref()
@@ -87,7 +178,7 @@ impl TerminalWidget {
             ));
         }
         let mut state = crate::ghostty::RenderState::new()?;
-        let snapshot = state.update(&self.terminal)?;
+        let snapshot = state.observe(&self.terminal)?;
         let colors = snapshot.colors()?;
         let observation = self.terminal.diagnostic_rows(
             viewport,
@@ -118,12 +209,19 @@ impl TerminalWidget {
             "source":if viewport {"active_buffer_viewport"}else{"active_buffer_tail"},"truncation":{"omitted_rows":total-count,"reason":if observation.truncated {Some("byte_limit")}else if count<total {Some("requested_range")} else {None}},"terminal_size":{"cols":self.size.0,"rows":self.size.1}}),
         )
     }
-    pub fn build_feedback_capture(&mut self) -> crate::ghostty::Result<TerminalCapture> {
+    pub fn build_feedback_capture(
+        &mut self,
+        offscreen: bool,
+    ) -> crate::ghostty::Result<TerminalCapture> {
         // Observation must not alter the painter's reusable dirty snapshot.
         let mut state = crate::ghostty::RenderState::new()?;
         let mut row_iterator = crate::ghostty::render::RowIterator::new()?;
         let mut cell_iterator = crate::ghostty::render::CellIterator::new()?;
-        let snapshot = state.update(&self.terminal)?;
+        let snapshot = if offscreen {
+            state.observe(&self.terminal)?
+        } else {
+            self.render_state.current()
+        };
         let colors = snapshot.colors()?;
 
         let mut rows = Vec::new();
@@ -159,11 +257,12 @@ impl TerminalWidget {
                     inverse: style.inverse,
                     strikethrough: style.strikethrough,
                 });
-                col_idx += advance;
+                col_idx += 1;
             }
 
             rows.push(CaptureRow {
                 index: row_idx,
+                wrapped: self.terminal.viewport_row_wrapped(row_idx)?,
                 text: row_text,
                 cells,
             });

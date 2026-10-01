@@ -1,4 +1,4 @@
-param([string]$Executable = "$PSScriptRoot/../target/debug/mightty.exe", [switch]$UiOnly)
+param([string]$Executable = "$PSScriptRoot/../target/debug/mightty.exe", [switch]$UiOnly, [switch]$SnapshotOnly)
 $ErrorActionPreference = 'Stop'
 $Executable = (Resolve-Path -LiteralPath $Executable).Path
 $caseDirectory = Join-Path ([System.IO.Path]::GetTempPath()) ('mightty-control-' + [guid]::NewGuid())
@@ -27,6 +27,25 @@ try {
     $state = Invoke-Control @('state')
     if ($state.windows.Count -ne 1) { throw 'Isolated startup opened unexpected windows' }
     $pane = $state.windows[0].tabs[0].panes[0].pane_id
+    if ($SnapshotOnly) {
+        $null = Invoke-Control @('window', 'focus', '--window', 'w1')
+        $null = Invoke-Control @('snapshot', '--window', 'w1', '--frame', 'next', '--out', $caseDirectory)
+        $presented = Invoke-Control @('snapshot', '--window', 'w1', '--frame', 'presented', '--out', $caseDirectory)
+        $next = Invoke-Control @('snapshot', '--window', 'w1', '--frame', 'next', '--out', $caseDirectory)
+        $first = Get-Content -LiteralPath $presented.manifest -Raw | ConvertFrom-Json
+        $second = Get-Content -LiteralPath $next.manifest -Raw | ConvertFrom-Json
+        if ([long]$second.frame_id -le [long]$first.frame_id) { throw 'Next frame did not advance presentation' }
+        if (!(Test-Path -LiteralPath $presented.image) -or !(Test-Path -LiteralPath $next.image)) { throw 'Renderer capture image missing' }
+        $background = Invoke-Control @('tab', 'new', '--window', 'w1', '--profile', 'fixture')
+        $before = Invoke-Control @('state')
+        $offscreen = Invoke-Control @('snapshot', '--tab', $background.tab_id, '--layout', $background.layout_token, '--out', $caseDirectory)
+        $paneCapture = Invoke-Control @('snapshot', '--pane', $background.panes[0].pane_id, '--out', $caseDirectory)
+        $after = Invoke-Control @('state')
+        if ($before.windows[0].active_tab_id -ne $after.windows[0].active_tab_id -or $before.windows[0].tabs[1].panes[0].pty_size.cols -ne $after.windows[0].tabs[1].panes[0].pty_size.cols) { throw 'Offscreen capture changed selection or PTY geometry' }
+        if (!(Test-Path -LiteralPath $offscreen.image) -or !(Test-Path -LiteralPath $paneCapture.image)) { throw 'Background image missing' }
+        Write-Output "Offscreen tab: $($offscreen.image); pane: $($paneCapture.image)"
+        Write-Output "Renderer readback passed; presented: $($presented.image); next: $($next.image)"; return
+    }
     $null = Invoke-Control @('ui', 'sidebar', '--window', 'w1', '--visible', 'false')
     $sidebar = Invoke-Control @('state', '--window', 'w1')
     if ($sidebar.sidebar_visible) { throw 'Sidebar desired state failed' }

@@ -288,6 +288,34 @@ impl Terminal {
     pub fn selected_text(&self) -> Result<Option<String>> {
         self.format_selection_text(None)
     }
+    pub fn selection_coordinates(&self) -> Result<Option<[(u16, u32); 2]>> {
+        let mut selection = ffi::Selection::default();
+        let result = unsafe {
+            ffi::ghostty_terminal_get(
+                self.as_raw(),
+                ffi::TerminalData::SELECTION,
+                std::ptr::from_mut(&mut selection).cast(),
+            )
+        };
+        if result == ffi::Result::NO_VALUE {
+            return Ok(None);
+        }
+        from_result(result)?;
+        let mut points = [(0, 0); 2];
+        for (index, reference) in [&selection.start, &selection.end].into_iter().enumerate() {
+            let mut coordinate = ffi::PointCoordinate::default();
+            from_result(unsafe {
+                ffi::ghostty_terminal_point_from_grid_ref(
+                    self.as_raw(),
+                    reference,
+                    ffi::PointTag::SCREEN,
+                    &mut coordinate,
+                )
+            })?;
+            points[index] = (coordinate.x, coordinate.y);
+        }
+        Ok(Some(points))
+    }
     pub fn has_selection(&self) -> Result<bool> {
         let mut selection = ffi::Selection::default();
         let result = unsafe {

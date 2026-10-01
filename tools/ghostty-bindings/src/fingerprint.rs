@@ -1,6 +1,16 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+#[allow(dead_code)] // shared with the binding generator, which only hashes headers
+pub fn file_fingerprint(path: &Path) -> String {
+    let mut hash = FNV_OFFSET_BASIS;
+    hash_bytes(
+        &mut hash,
+        &fs::read(path).unwrap_or_else(|error| panic!("{}: {error}", path.display())),
+    );
+    format!("fnv1a64:{hash:016x}")
+}
+
 pub fn header_fingerprint(include_dir: &Path) -> String {
     let mut headers = Vec::new();
     collect_headers(include_dir, include_dir, &mut headers);

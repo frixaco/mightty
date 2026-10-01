@@ -45,6 +45,12 @@ pub(crate) struct DirectXRenderer {
     pipelines: DirectXRenderPipelines,
     direct_composition: Option<DirectComposition>,
     font_info: &'static FontInfo,
+    retained: Option<ID3D11Texture2D>,
+    spare: Option<ID3D11Texture2D>,
+    frame_id: u64,
+    presented_at: std::time::SystemTime,
+    capture_error: Option<String>,
+    copy_submission_ns: u64,
 }
 
 /// Direct3D objects
@@ -124,6 +130,140 @@ impl DirectXRendererDevices {
 }
 
 impl DirectXRenderer {
+    fn copy_for_retention(&mut self) -> Result<ID3D11Texture2D> {
+        let mut description = D3D11_TEXTURE2D_DESC::default();
+        unsafe { self.resources.render_target.GetDesc(&mut description) };
+        if u64::from(description.Width) * u64::from(description.Height) * 4
+            > MAX_CAPTURE_RGBA_BYTES as u64
+        {
+            anyhow::bail!("retained surface exceeds capture budget");
+        }
+        let texture = match self.spare.take() {
+            Some(texture)
+                if {
+                    let mut old = D3D11_TEXTURE2D_DESC::default();
+                    unsafe { texture.GetDesc(&mut old) };
+                    old.Width == description.Width && old.Height == description.Height
+                } =>
+            {
+                texture
+            }
+            _ => {
+                description.Usage = D3D11_USAGE_DEFAULT;
+                description.BindFlags = 0;
+                description.CPUAccessFlags = 0;
+                description.MiscFlags = 0;
+                let mut texture = None;
+                unsafe {
+                    self.devices
+                        .device
+                        .CreateTexture2D(&description, None, Some(&mut texture))
+                }?;
+                texture.context("missing capture texture")?
+            }
+        };
+        unsafe {
+            self.devices
+                .device_context
+                .CopyResource(&texture, &*self.resources.render_target)
+        };
+        Ok(texture)
+    }
+    pub(crate) fn presented_frame_id(&self) -> u64 {
+        self.frame_id
+    }
+    pub(crate) fn capture_presented(&self) -> Result<GpuCapture> {
+        let texture = self.retained.as_ref().context(
+            self.capture_error
+                .clone()
+                .unwrap_or_else(|| "no successfully presented frame".into()),
+        )?;
+        self.latch_readback(texture, self.frame_id, self.presented_at)
+    }
+    pub(crate) fn capture_offscreen(
+        &mut self,
+        scene: &Scene,
+        size: Size<DevicePixels>,
+    ) -> Result<GpuCapture> {
+        self.resize(size)?;
+        self.paint_scene(scene)?;
+        self.latch_readback(
+            &self.resources.render_target,
+            0,
+            std::time::SystemTime::now(),
+        )
+    }
+    fn latch_readback(
+        &self,
+        source: &ID3D11Texture2D,
+        frame_id: u64,
+        timestamp: std::time::SystemTime,
+    ) -> Result<GpuCapture> {
+        let mut description = D3D11_TEXTURE2D_DESC::default();
+        unsafe { source.GetDesc(&mut description) };
+        let width = description.Width;
+        let height = description.Height;
+        if u64::from(width) * u64::from(height) * 4 > MAX_CAPTURE_RGBA_BYTES as u64 {
+            anyhow::bail!("readback surface exceeds capture budget");
+        }
+        description.Usage = D3D11_USAGE_STAGING;
+        description.BindFlags = 0;
+        description.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
+        description.MiscFlags = 0;
+        let mut texture = None;
+        unsafe {
+            self.devices
+                .device
+                .CreateTexture2D(&description, None, Some(&mut texture))
+        }?;
+        let texture = texture.context("missing staging texture")?;
+        let context = self.devices.device_context.clone();
+        let protection: ID3D11Multithread = context.cast()?;
+        // The shared immediate context is also used by rendering and atlas uploads.
+        // D3D11's own protection serializes individual API calls across readback workers.
+        let _ = unsafe { protection.SetMultithreadProtected(true) };
+        unsafe { context.CopyResource(&texture, source) };
+        let retained_bytes = [&self.retained, &self.spare]
+            .into_iter()
+            .flatten()
+            .map(|texture| {
+                let mut desc = D3D11_TEXTURE2D_DESC::default();
+                unsafe { texture.GetDesc(&mut desc) };
+                u64::from(desc.Width) * u64::from(desc.Height) * 4
+            })
+            .sum();
+        Ok(GpuCapture {
+            frame_id,
+            width,
+            height,
+            timestamp,
+            retained_bytes,
+            copy_submission_ns: self.copy_submission_ns,
+            readback: Box::new(move || {
+                let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+                unsafe { context.Map(&texture, 0, D3D11_MAP_READ, 0, Some(&mut mapped)) }?;
+                let mut rgba = vec![0u8; width as usize * height as usize * 4];
+                for row in 0..height as usize {
+                    // Map owns readable rows until Unmap; each row has the reported pitch.
+                    let source = unsafe {
+                        std::slice::from_raw_parts(
+                            (mapped.pData as *const u8).add(row * mapped.RowPitch as usize),
+                            width as usize * 4,
+                        )
+                    };
+                    for (target, bgra) in rgba
+                        [row * width as usize * 4..(row + 1) * width as usize * 4]
+                        .chunks_exact_mut(4)
+                        .zip(source.chunks_exact(4))
+                    {
+                        target.copy_from_slice(&[bgra[2], bgra[1], bgra[0], bgra[3]]);
+                    }
+                }
+                unsafe { context.Unmap(&texture, 0) };
+                Ok(rgba)
+            }),
+        })
+    }
     pub(crate) fn new(
         hwnd: HWND,
         directx_devices: &DirectXDevices,
@@ -164,6 +304,12 @@ impl DirectXRenderer {
             pipelines,
             direct_composition,
             font_info: Self::get_font_info(),
+            retained: None,
+            spare: None,
+            frame_id: 0,
+            presented_at: std::time::SystemTime::now(),
+            capture_error: None,
+            copy_submission_ns: 0,
         })
     }
 
@@ -202,7 +348,28 @@ impl DirectXRenderer {
 
     #[inline]
     fn present(&mut self) -> Result<()> {
+        let start = std::time::Instant::now();
+        let candidate = self.copy_for_retention();
+        let submission_ns = start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
         let result = unsafe { self.resources.swap_chain.Present(0, DXGI_PRESENT(0)) };
+        if result.0 == 0 {
+            self.frame_id += 1;
+            self.presented_at = std::time::SystemTime::now();
+            self.copy_submission_ns = submission_ns;
+            match candidate {
+                Ok(texture) => {
+                    self.spare = self.retained.replace(texture);
+                    self.capture_error = None;
+                }
+                Err(error) => {
+                    self.retained = None;
+                    self.spare = None;
+                    self.capture_error = Some(error.to_string());
+                }
+            }
+        } else if let Ok(texture) = candidate {
+            self.spare = Some(texture);
+        }
         result.ok().context("Presenting swap chain failed")
     }
 
@@ -269,6 +436,9 @@ impl DirectXRenderer {
 
         self.atlas
             .handle_device_lost(&devices.device, &devices.device_context);
+        self.retained = None;
+        self.spare = None;
+        self.capture_error = Some("device changed; no new presentation yet".into());
         self.devices = devices;
         self.resources = resources;
         self.globals = globals;
@@ -284,6 +454,10 @@ impl DirectXRenderer {
     }
 
     pub(crate) fn draw(&mut self, scene: &Scene) -> Result<()> {
+        self.paint_scene(scene)?;
+        self.present()
+    }
+    fn paint_scene(&mut self, scene: &Scene) -> Result<()> {
         self.pre_draw()?;
         for batch in scene.batches() {
             match batch {
@@ -312,7 +486,7 @@ impl DirectXRenderer {
                     scene.polychrome_sprites.len(),
                     scene.surfaces.len(),))?;
         }
-        self.present()
+        Ok(())
     }
 
     pub(crate) fn resize(&mut self, new_size: Size<DevicePixels>) -> Result<()> {

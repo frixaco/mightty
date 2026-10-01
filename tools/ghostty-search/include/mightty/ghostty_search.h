@@ -7,6 +7,9 @@
 extern "C" {
 #endif
 
+/* Fresh presentation snapshot without consuming the live renderer's dirty flags. */
+GhosttyResult mightty_ghostty_render_observe(GhosttyRenderState state, GhosttyTerminal terminal);
+
 typedef struct MighttyGhosttySearchImpl* MighttyGhosttySearch;
 
 typedef enum {

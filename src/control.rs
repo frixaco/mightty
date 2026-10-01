@@ -318,6 +318,7 @@ pub const OPERATIONS: &[(&str, &[&str])] = &[
     ("window.resize", &["width", "height"]),
     ("window.focus", &[]),
     ("events", &[]),
+    ("snapshot", &["frame", "out", "layout"]),
     ("ui.sidebar", &["visible"]),
     ("ui.palette", &["open", "query"]),
     ("ui.search", &["open", "query"]),
@@ -600,7 +601,7 @@ fn parse_cli(arguments: Vec<String>) -> Result<(Request, Option<String>, bool), 
                     .unwrap()
                     .push(json!(value));
             }
-            "cwd" => {
+            "cwd" | "out" => {
                 let path = PathBuf::from(value);
                 let path = if path.is_absolute() {
                     path

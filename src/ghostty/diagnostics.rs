@@ -30,6 +30,35 @@ pub struct DiagnosticRows {
 }
 
 impl Terminal {
+    pub fn viewport_row_wrapped(&self, row: u16) -> Result<bool> {
+        let point = ffi::Point {
+            tag: ffi::PointTag::VIEWPORT,
+            value: ffi::PointValue {
+                coordinate: ffi::PointCoordinate {
+                    x: 0,
+                    y: u32::from(row),
+                },
+            },
+        };
+        let mut reference = ffi::GridRef {
+            size: size_of::<ffi::GridRef>(),
+            ..Default::default()
+        };
+        from_result(unsafe {
+            ffi::ghostty_terminal_grid_ref(self.as_raw(), point, &mut reference)
+        })?;
+        let mut raw = 0;
+        from_result(unsafe { ffi::ghostty_grid_ref_row(&reference, &mut raw) })?;
+        let mut wrapped = false;
+        from_result(unsafe {
+            ffi::ghostty_row_get(
+                raw,
+                ffi::RowData::WRAP,
+                std::ptr::from_mut(&mut wrapped).cast(),
+            )
+        })?;
+        Ok(wrapped)
+    }
     pub fn active_buffer_is_alternate(&self) -> Result<bool> {
         let mut screen = ffi::TerminalScreen::PRIMARY;
         from_result(unsafe {

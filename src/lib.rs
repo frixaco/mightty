@@ -11,6 +11,7 @@ pub mod profile;
 pub mod settings;
 pub mod shell;
 pub mod shell_integration;
+pub mod snapshot;
 pub mod ui_control;
 pub mod widget;
 pub mod workspace;
