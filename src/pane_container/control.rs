@@ -10,11 +10,11 @@ impl PaneContainer {
         let tab = &self.tabs[index];
         let split = tab.split.read(cx);
         let selected = split.active_pane_id();
-        let normalized = split.terminal(selected).and_then(|terminal| {
-            crate::shell_integration::display_title(terminal.read(cx).reported_title())
-        });
-        let from_shell = normalized.as_deref() == Some(tab.title.as_str());
-        json!({"source":if from_shell{"selected_pane"}else if tab.title==tab.default_title{"profile_or_restored_fallback"}else{"retained_tab_title"},"source_pane_id":from_shell.then(||format!("p{}",selected.value())),"fallback_reason":(tab.title==tab.default_title&&!from_shell).then_some("selected pane has no matching normalized title")})
+        let chosen = split
+            .terminal(selected)
+            .and_then(|terminal| terminal.read(cx).tab_title());
+        let from_pane = chosen.as_deref() == Some(tab.title.as_str());
+        json!({"source":if from_pane{"selected_pane"}else if tab.title==tab.default_title{"profile_or_restored_fallback"}else{"retained_tab_title"},"source_pane_id":from_pane.then(||format!("p{}",selected.value())),"fallback_reason":(tab.title==tab.default_title&&!from_pane).then_some("selected pane has no matching display title")})
     }
     pub fn receiving_focus(&self, window: &Window, cx: &gpui::App) -> Value {
         if self.palette_focus.contains_focused(window, cx) {
@@ -131,7 +131,7 @@ impl PaneContainer {
             .retain(|id, _| self.tabs.iter().any(|tab| tab.id.value() == *id));
         if self.sidebar_visible && index == self.active_tab_index && target.is_none() {
             for (index, tab) in self.tabs.iter().enumerate() {
-                labels.push(json!({"tab_id":format!("t{}",tab.id.value()),"chosen_title":tab.title,"fallback_title":tab.default_title,"provenance":self.title_provenance(index,cx),"decorated_label":tab.title,"badge":if tab.bell_pending{format!("{}•",index+1)}else{(index+1).to_string()},"geometry":self.label_geometry.borrow().get(&tab.id.value()),"measured_extents":{"availability":"unavailable"}}));
+                labels.push(json!({"tab_id":format!("t{}",tab.id.value()),"chosen_title":tab.title,"fallback_title":tab.default_title,"provenance":self.title_provenance(index,cx),"decorated_label":tab.title,"badge":if tab.bell_pending{"•"}else{""},"geometry":self.label_geometry.borrow().get(&tab.id.value()),"measured_extents":{"availability":"unavailable"}}));
             }
         }
         std::sync::Arc::new(crate::snapshot::Frame {

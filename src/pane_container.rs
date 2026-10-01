@@ -39,7 +39,7 @@ const WINDOW_CONTROL_WIDTH_PX: f32 = 46.0;
 const SIDEBAR_WIDTH_PX: f32 = 160.0;
 const SIDEBAR_GAP_PX: f32 = 8.0;
 const TAB_RADIUS_PX: f32 = 4.0;
-const TAB_HEIGHT_PX: f32 = 42.0;
+const TAB_HEIGHT_PX: f32 = 28.0;
 const MAX_SELECTABLE_TABS: usize = 9;
 const PALETTE_MAX_RESULTS: usize = 12;
 
@@ -459,10 +459,13 @@ impl PaneContainer {
             split.pane_id_for_entity(terminal.entity_id()) == Some(split.active_pane_id())
         };
         match event {
-            TerminalEvent::TitleChanged(title) if is_active_pane => {
-                self.tabs[tab_index].title =
-                    crate::shell_integration::display_title(title.as_deref())
-                        .unwrap_or_else(|| self.tabs[tab_index].default_title.clone());
+            TerminalEvent::TitleChanged(_) | TerminalEvent::WorkingDirectoryChanged(_)
+                if is_active_pane =>
+            {
+                self.tabs[tab_index].title = terminal
+                    .read(cx)
+                    .tab_title()
+                    .unwrap_or_else(|| self.tabs[tab_index].default_title.clone());
             }
             TerminalEvent::Bell => {
                 if tab_index != self.active_tab_index {
@@ -764,14 +767,14 @@ impl PaneContainer {
         split.update(cx, |split, cx| split.focus_active(window, cx));
     }
 
-    fn refresh_active_tab_title(&mut self, window: &Window, cx: &mut Context<Self>) {
-        let title = self
-            .active_terminal(window, cx)
-            .and_then(|terminal| {
-                crate::shell_integration::display_title(terminal.read(cx).reported_title())
-            })
-            .unwrap_or_else(|| self.tabs[self.active_tab_index].default_title.clone());
-        self.tabs[self.active_tab_index].title = title;
+    fn refresh_tab_titles(&mut self, window: &Window, cx: &mut Context<Self>) {
+        for tab in &mut self.tabs {
+            tab.title = tab
+                .split
+                .update(cx, |split, cx| split.active_terminal(window, cx))
+                .and_then(|terminal| terminal.read(cx).tab_title())
+                .unwrap_or_else(|| tab.default_title.clone());
+        }
     }
 
     fn close_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1253,7 +1256,7 @@ impl Render for PaneContainer {
             self.needs_focus = false;
             self.focus_active_tab(window, cx);
         }
-        self.refresh_active_tab_title(window, cx);
+        self.refresh_tab_titles(window, cx);
         self.deliver_bell_notification(window);
         if self.titlebar_visible && !cfg!(target_os = "macos") && self.app_menu_bar.is_none() {
             self.app_menu_bar = Some(AppMenuBar::new(window, cx));
@@ -1614,12 +1617,8 @@ impl PaneContainer {
             .pt(px(4.0))
             .children(self.tabs.iter().enumerate().map(|(index, tab)| {
                 let is_active = index == self.active_tab_index;
-                let label = if tab.bell_pending {
-                    format!("{}•", index + 1)
-                } else {
-                    (index + 1).to_string()
-                };
                 let title = tab.title.clone();
+                let tooltip = title.clone();
                 let geometry = self.label_geometry.clone();
                 let id = tab.id.value();
 
@@ -1627,14 +1626,14 @@ impl PaneContainer {
                     .id(("tab", index))
                     .h(px(TAB_HEIGHT_PX))
                     .w_full()
-                    .mb(px(4.0))
+                    .mb(px(2.0))
                     .rounded(px(TAB_RADIUS_PX))
                     .overflow_hidden()
                     .flex()
                     .flex_row()
                     .items_center()
-                    .gap(px(8.0))
-                    .px(px(10.0))
+                    .gap(px(6.0))
+                    .px(px(8.0))
                     .text_color(if is_active {
                         gpui::rgb(0xf0f0f0)
                     } else {
@@ -1646,22 +1645,22 @@ impl PaneContainer {
                         gpui::rgb(WINDOW_BACKGROUND)
                     })
                     .hover(|style| style.bg(gpui::rgb(0x202020)))
+                    .tooltip(move |window, cx| {
+                        gpui_component::tooltip::Tooltip::new(tooltip.clone()).build(window, cx)
+                    })
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _event: &MouseDownEvent, _window, cx| {
                             this.activate_tab(index, cx);
                         }),
                     )
-                    .child(
+                    .children(tab.bell_pending.then(|| {
                         div()
-                            .w(px(18.0))
                             .flex_shrink_0()
-                            .text_center()
-                            .text_size(px(13.0))
+                            .text_size(px(12.0))
                             .line_height(px(TAB_HEIGHT_PX))
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .child(label),
-                    )
+                            .child("•")
+                    }))
                     .child(
                         div()
                             .flex_1()

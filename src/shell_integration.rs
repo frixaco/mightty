@@ -47,6 +47,61 @@ pub fn display_title(report: Option<&str>) -> Option<String> {
     (!title.is_empty()).then(|| title.to_string())
 }
 
+/// Prefer intentional shell titles; shorten executable titles to folder + process.
+pub(crate) fn tab_title(
+    report: Option<&str>,
+    directory: Option<&Path>,
+    executable: &Path,
+) -> Option<String> {
+    let reported = display_title(report);
+    let mut process = process_name(executable);
+    if let Some(title) = reported {
+        let path = Path::new(&title);
+        let is_executable = path
+            .extension()
+            .and_then(OsStr::to_str)
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("exe"))
+            || path.file_name().is_some_and(|name| {
+                executable.file_name().is_some_and(|executable| {
+                    name.to_string_lossy()
+                        .eq_ignore_ascii_case(&executable.to_string_lossy())
+                })
+            })
+            || process
+                .as_ref()
+                .is_some_and(|process| title.eq_ignore_ascii_case(process));
+        if !is_executable {
+            return Some(title);
+        }
+        process = process_name(path);
+    }
+    let process = process?;
+    let title = match directory {
+        Some(directory) => format!(
+            "{} · {process}",
+            directory
+                .file_name()
+                .unwrap_or(directory.as_os_str())
+                .to_string_lossy()
+        ),
+        None => process,
+    };
+    display_title(Some(&title))
+}
+
+fn process_name(path: &Path) -> Option<String> {
+    let name = if path
+        .extension()
+        .and_then(OsStr::to_str)
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("exe"))
+    {
+        path.file_stem()
+    } else {
+        path.file_name()
+    }?;
+    display_title(Some(&name.to_string_lossy()))
+}
+
 fn parse_local_working_directory(report: &str, local_hostname: Option<&str>) -> Option<PathBuf> {
     if report.len() > MAX_METADATA_BYTES {
         return None;
@@ -174,6 +229,40 @@ mod tests {
         assert_eq!(title.chars().count(), MAX_TITLE_CHARACTERS);
         assert!(!title.chars().any(char::is_control));
         assert_eq!(display_title(Some("\r\n")), None);
+    }
+
+    #[test]
+    fn tab_titles_use_folder_and_process_without_losing_custom_titles() {
+        let executable = Path::new("pwsh.exe");
+        let directory = Path::new("/work/mightty");
+        for (report, expected) in [
+            (None, "mightty · pwsh"),
+            (Some("pwsh"), "mightty · pwsh"),
+            (Some("pwsh.exe"), "mightty · pwsh"),
+            (Some("/tools/PWSH.EXE"), "mightty · PWSH"),
+        ] {
+            assert_eq!(
+                tab_title(report, Some(directory), executable).as_deref(),
+                Some(expected)
+            );
+        }
+        assert_eq!(tab_title(None, None, executable).as_deref(), Some("pwsh"));
+        assert_eq!(
+            tab_title(Some("nvim.exe"), Some(directory), executable).as_deref(),
+            Some("mightty · nvim")
+        );
+        assert_eq!(
+            tab_title(Some("\nBuild logs\u{7}"), Some(directory), executable).as_deref(),
+            Some("Build logs")
+        );
+        assert_eq!(
+            tab_title(None, Some(Path::new("/")), Path::new("/bin/bash")).as_deref(),
+            Some("/ · bash")
+        );
+        assert_eq!(
+            tab_title(None, None, Path::new("/bin/python3.13")).as_deref(),
+            Some("python3.13")
+        );
     }
 
     #[test]

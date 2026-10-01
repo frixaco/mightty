@@ -183,6 +183,7 @@ Useful runtime shortcuts:
 - `Ctrl+T` (`Cmd+T` on macOS): open a new tab, up to nine tabs.
 - `Ctrl+B` or the panel button before **Terminal**: hide or show the tab sidebar. The button's panel is filled while the sidebar is visible.
 - `Ctrl+1` through `Ctrl+9`: switch to an existing tab.
+- Sidebar tabs use compact rows without numbers. Default titles show the folder and process, such as `mightty · pwsh`; custom shell titles are preserved, and hovering shows the full label.
 - `Alt+Enter`: split the active pane to the right.
 - `Alt+Shift+Enter`: split the active pane downward.
 - `Ctrl+D`: close the active pane, or close the active tab when it has one pane.

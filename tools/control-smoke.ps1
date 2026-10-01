@@ -48,6 +48,27 @@ try {
         $null = Invoke-Control @('ui', 'input', '--window', 'w1', '--file', (Join-Path $caseDirectory 'sidebar-click.json'))
         if (!(Invoke-Control @('state', '--window', 'w1')).sidebar_visible) { throw 'Sidebar button did not follow the keyboard toggle' }
         Write-Output "Sidebar shown: $($shown.image); hidden: $($hidden.image)"
+        $projectDirectory = Join-Path $caseDirectory 'mightty'
+        $otherDirectory = Join-Path $projectDirectory 'docs'
+        New-Item -ItemType Directory -Path $otherDirectory | Out-Null
+        $named = Invoke-Control @('tab', 'new', '--window', 'w1', '--cwd', $projectDirectory, '--exec', 'pwsh.exe', '--', '-NoLogo', '-NoProfile')
+        $null = Invoke-Control @('wait', '--tab', $named.tab_id, '--condition', 'title-equals', '--value', 'mightty · pwsh', '--timeout', '10s')
+        $directoryUri = ([uri]($otherDirectory + [IO.Path]::DirectorySeparatorChar)).AbsoluteUri
+        $command = "Set-Location '$($otherDirectory.Replace("'", "''"))'; [Console]::Write([char]27 + ']7;$directoryUri' + [char]7)"
+        @(@{ type = 'text'; text = $command }, @{ type = 'key'; key = 'enter' }) | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $caseDirectory 'title-input.json') -Encoding utf8NoBOM
+        $null = Invoke-Control @('pane', 'input', '--pane', $named.panes[0].pane_id, '--file', (Join-Path $caseDirectory 'title-input.json'))
+        $null = Invoke-Control @('wait', '--tab', $named.tab_id, '--condition', 'title-equals', '--value', 'docs · pwsh', '--timeout', '10s')
+        $null = Invoke-Control @('tab', 'select', '--tab', $named.tab_id)
+        $compact = Invoke-Control @('snapshot', '--window', 'w1', '--frame', 'next', '--out', $caseDirectory)
+        $labels = (Get-Content -LiteralPath (Join-Path $compact.directory 'frame.json') -Raw -Encoding utf8 | ConvertFrom-Json).labels
+        if (@($labels | Where-Object { $_.badge -ne '' -or $_.geometry.line_height_px -ne 28 }).Count) { throw 'Sidebar retained tab numbers or oversized rows' }
+        $namedLabel = @($labels | Where-Object tab_id -eq $named.tab_id)[0]
+        if ($namedLabel.chosen_title -ne 'docs · pwsh' -or $namedLabel.provenance.source -ne 'selected_pane') { throw 'Friendly title or provenance is incorrect' }
+        Write-Output "Compact sidebar: $($compact.image)"
+        @(@{ type = 'text'; text = "[Console]::Write([char]27 + ']0;Build logs' + [char]7)" }, @{ type = 'key'; key = 'enter' }) | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $caseDirectory 'title-input.json') -Encoding utf8NoBOM
+        $null = Invoke-Control @('pane', 'input', '--pane', $named.panes[0].pane_id, '--file', (Join-Path $caseDirectory 'title-input.json'))
+        $null = Invoke-Control @('wait', '--tab', $named.tab_id, '--condition', 'title-equals', '--value', 'Build logs', '--timeout', '10s')
+        $null = Invoke-Control @('tab', 'close', '--tab', $named.tab_id)
     }
     if ($SnapshotOnly) {
         $null = Invoke-Control @('window', 'focus', '--window', 'w1')

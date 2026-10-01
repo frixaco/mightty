@@ -332,7 +332,7 @@ that ended before observation. Advertise these fixed predicates and availability
 
 | Condition | Evidence |
 | --- | --- |
-| `title-equals` | Chosen normalized tab title equals the supplied string |
+| `title-equals` | Chosen display tab title equals the supplied string |
 | `layout-ready` | Exact token remains current and all affected Ghostty/PTY sizes are applied/acknowledged |
 | `settings-generation` | Window settings store accepted at least that generation; existing panes retain their live-reload policy |
 | `overlay-open` | Named overlay mounted; a next-frame snapshot checks presentation |
@@ -406,8 +406,11 @@ Keep these title stages distinct:
    source limit; this does not preserve unlimited raw OSC bytes.
 2. Normalized title and applied transformations: currently remove controls, limit
    to 128 Unicode scalar values, and trim. Record which rules changed the value.
-3. Chosen tab title, source pane/profile, and fallback reason.
-4. Frame label with index/attention decoration and layout/clipping diagnostics.
+3. Chosen tab title, source pane/profile, and fallback reason. Default/executable
+   titles use the selected pane's folder and process (`mightty · pwsh`); custom
+   shell titles are preserved. Without a known directory, show just the process.
+4. Frame label with attention decoration and layout/clipping diagnostics. Sidebar
+   rows are compact and have no tab-number decoration.
 
 Record each pane's effective configuration, launch settings generation, and
 subsequent live-applied fields. Current settings need not describe older panes.

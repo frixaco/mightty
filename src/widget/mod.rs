@@ -503,6 +503,14 @@ impl TerminalWidget {
         self.reported_title.as_deref()
     }
 
+    pub(crate) fn tab_title(&self) -> Option<String> {
+        crate::shell_integration::tab_title(
+            self.reported_title(),
+            self.workspace_working_directory().as_deref(),
+            &self.config.launch.executable,
+        )
+    }
+
     pub(crate) fn semantic_commands_available(&self) -> bool {
         self.semantic_commands_available
     }

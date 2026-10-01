@@ -82,6 +82,8 @@ requirement because `build.rs` validates the submodule revision.
 - `Ctrl+T` creates a new tab; `Cmd+T` does the same on macOS.
 - The app supports at most nine tabs.
 - Tabs appear in a left sidebar and can be selected with `Ctrl+1` through `Ctrl+9`.
+- Sidebar rows are compact and unnumbered; default titles show folder and process
+  (`mightty · pwsh`), while custom shell titles are preserved.
 - `Ctrl+B` toggles the sidebar.
 - `Alt+Enter` splits the active pane to the right.
 - `Alt+Shift+Enter` splits the active pane downward.
