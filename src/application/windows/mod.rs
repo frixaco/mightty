@@ -10,6 +10,7 @@ pub use default_terminal::{
     show_default_terminal_window,
 };
 pub use hotkey::GlobalHotKey;
+pub use instance::{ControlServer, discover_control_instances, send_control};
 pub use instance::{InstanceClaim, PrimaryInstance, claim_instance, send_activation};
 pub use quick_terminal::{
     hide_quick_terminal, quick_terminal_has_focus, quick_terminal_is_visible,

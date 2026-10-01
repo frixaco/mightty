@@ -279,6 +279,375 @@ fn write_all(pipe: HANDLE, mut bytes: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
+/// Separate request/reply endpoint for every GUI process, including test/COM starts.
+pub struct ControlServer {
+    descriptor: crate::control::Descriptor,
+    stop: Arc<AtomicBool>,
+    threads: Vec<JoinHandle<()>>,
+}
+
+impl ControlServer {
+    pub fn start(sender: flume::Sender<crate::control::Dispatch>) -> io::Result<Self> {
+        let identity = ProcessIdentity::current()?;
+        let creation = process_creation_time(unsafe { GetCurrentProcess() })?;
+        let instance_id = format!("{}-{creation}", std::process::id());
+        let descriptor = crate::control::Descriptor {
+            protocol_version: crate::control::PROTOCOL_VERSION,
+            instance_id: instance_id.clone(),
+            pid: std::process::id(),
+            process_creation_time: creation,
+            endpoint: control_pipe_name(&identity, &instance_id),
+            started_unix_ms: crate::feedback::unix_timestamp_ms().to_string(),
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut server = Self {
+            descriptor,
+            stop,
+            threads: Vec::new(),
+        };
+        for _ in 0..crate::control::MAX_CONNECTIONS {
+            let pipe_name = wide_null(&server.descriptor.endpoint);
+            let security = PipeSecurity::for_user(&identity.sid)?;
+            let pipe = unsafe {
+                CreateNamedPipeW(
+                    pipe_name.as_ptr(),
+                    windows_sys::Win32::Storage::FileSystem::PIPE_ACCESS_DUPLEX,
+                    PIPE_TYPE_BYTE
+                        | PIPE_READMODE_BYTE
+                        | windows_sys::Win32::System::Pipes::PIPE_NOWAIT
+                        | PIPE_REJECT_REMOTE_CLIENTS,
+                    crate::control::MAX_CONNECTIONS as u32,
+                    65536,
+                    65536,
+                    0,
+                    &security.attributes,
+                )
+            };
+            if pipe == INVALID_HANDLE_VALUE {
+                return Err(io::Error::last_os_error());
+            }
+            let pipe = OwnedHandle::new(pipe);
+            let stop = Arc::clone(&server.stop);
+            let sender = sender.clone();
+            let descriptor = server.descriptor.clone();
+            server.threads.push(
+                thread::Builder::new()
+                    .name("mightty-control".into())
+                    .spawn(move || {
+                        while !stop.load(Ordering::Acquire) {
+                            let connected = unsafe { ConnectNamedPipe(pipe.raw(), null_mut()) };
+                            let error = unsafe { GetLastError() };
+                            if connected == 0 && error != ERROR_PIPE_CONNECTED {
+                                thread::sleep(Duration::from_millis(5));
+                                continue;
+                            }
+                            let deadline = Instant::now() + Duration::from_secs(2);
+                            let result =
+                                read_control_frame(pipe.raw(), deadline, &stop).and_then(|bytes| {
+                                    let request: crate::control::Request =
+                                        serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+                                    let deadline = Instant::now()
+                                        + Duration::from_millis(request.timeout_ms.min(60000));
+                                    let response = match crate::control::validate(
+                                        &request,
+                                        &descriptor.instance_id,
+                                    ) {
+                                        Err(error) => {
+                                            crate::control::reply(&request, 0, Err(error))
+                                        }
+                                        Ok(()) if request.op == "handshake" => {
+                                            crate::control::reply(
+                                                &request,
+                                                0,
+                                                Ok(serde_json::to_value(&descriptor).unwrap()),
+                                            )
+                                        }
+                                        Ok(()) => {
+                                            let (reply_tx, reply_rx) = flume::bounded(1);
+                                            let pending = crate::control::Dispatch {
+                                                request: request.clone(),
+                                                reply: reply_tx,
+                                                deadline,
+                                            };
+                                            if sender.try_send(pending).is_err() {
+                                                crate::control::reply(
+                                                    &request,
+                                                    0,
+                                                    Err(crate::control::ControlError::new(
+                                                        "busy",
+                                                        "control queue is full",
+                                                    )),
+                                                )
+                                            } else {
+                                                loop {
+                                                    match reply_rx
+                                                        .recv_timeout(Duration::from_millis(10))
+                                                    {
+                                                        Ok(value) => break value,
+                                                        Err(
+                                                            flume::RecvTimeoutError::Disconnected,
+                                                        ) => {
+                                                            return Err(io::Error::other(
+                                                                "application stopped",
+                                                            ));
+                                                        }
+                                                        Err(_)
+                                                            if Instant::now() >= deadline
+                                                                || stop.load(Ordering::Acquire) =>
+                                                        {
+                                                            return Err(io::Error::new(
+                                                                io::ErrorKind::TimedOut,
+                                                                "control outcome unknown",
+                                                            ));
+                                                        }
+                                                        Err(_) => {}
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    };
+                                    write_control_frame(
+                                        pipe.raw(),
+                                        &serde_json::to_vec(&response).map_err(io::Error::other)?,
+                                        deadline,
+                                        &stop,
+                                    )?;
+                                    // DisconnectNamedPipe discards unread bytes. Wait for the client
+                                    // to confirm receipt without a blocking FlushFileBuffers call.
+                                    let mut received = [0u8; 1];
+                                    control_io(pipe.raw(), &mut received, false, deadline, &stop)
+                                });
+                            let _ = result;
+                            unsafe {
+                                DisconnectNamedPipe(pipe.raw());
+                            }
+                        }
+                    })?,
+            );
+        }
+        let directory = crate::control::directory();
+        std::fs::create_dir_all(&directory)?;
+        let temporary = directory.join(format!("{instance_id}.tmp"));
+        std::fs::write(
+            &temporary,
+            serde_json::to_vec(&server.descriptor).map_err(io::Error::other)?,
+        )?;
+        std::fs::rename(temporary, directory.join(format!("{instance_id}.json")))?;
+        Ok(server)
+    }
+
+    pub fn descriptor(&self) -> &crate::control::Descriptor {
+        &self.descriptor
+    }
+}
+
+impl Drop for ControlServer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        for thread in self.threads.drain(..) {
+            let _ = thread.join();
+        }
+        let _ = std::fs::remove_file(
+            crate::control::directory().join(format!("{}.json", self.descriptor.instance_id)),
+        );
+    }
+}
+
+fn control_pipe_name(identity: &ProcessIdentity, instance_id: &str) -> String {
+    format!(
+        r"\\.\pipe\mightty-control-{}-{}-v1-{instance_id}",
+        identity.session_id, identity.sid
+    )
+}
+
+fn process_creation_time(process: HANDLE) -> io::Result<String> {
+    use windows_sys::Win32::{Foundation::FILETIME, System::Threading::GetProcessTimes};
+    let mut times = [FILETIME::default(); 4];
+    if unsafe {
+        GetProcessTimes(
+            process,
+            &mut times[0],
+            &mut times[1],
+            &mut times[2],
+            &mut times[3],
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(
+        ((u64::from(times[0].dwHighDateTime) << 32) | u64::from(times[0].dwLowDateTime))
+            .to_string(),
+    )
+}
+
+pub fn discover_control_instances() -> io::Result<Vec<crate::control::Descriptor>> {
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    let identity = ProcessIdentity::current()?;
+    let mut descriptors = Vec::new();
+    let entries = match std::fs::read_dir(crate::control::directory()) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(descriptors),
+        Err(error) => return Err(error),
+    };
+    for entry in entries.flatten().take(256) {
+        if entry.path().extension().is_none_or(|v| v != "json") {
+            continue;
+        }
+        if entry.metadata()?.len() > 4096 {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(entry.path()) else {
+            continue;
+        };
+        let Ok(descriptor) = serde_json::from_slice::<crate::control::Descriptor>(&bytes) else {
+            continue;
+        };
+        if descriptor.protocol_version != crate::control::PROTOCOL_VERSION
+            || descriptor.endpoint != control_pipe_name(&identity, &descriptor.instance_id)
+        {
+            continue;
+        }
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, descriptor.pid) };
+        if handle.is_null() {
+            continue;
+        }
+        let handle = OwnedHandle::new(handle);
+        if process_creation_time(handle.raw()).ok().as_ref()
+            != Some(&descriptor.process_creation_time)
+        {
+            continue;
+        }
+        let request = crate::control::request(&descriptor, "handshake");
+        if let Ok(reply) = send_control(&descriptor, &request)
+            && reply["ok"] == true
+            && reply["result"]["instance_id"] == descriptor.instance_id
+        {
+            descriptors.push(descriptor);
+        }
+    }
+    descriptors.sort_by(|a, b| a.started_unix_ms.cmp(&b.started_unix_ms));
+    Ok(descriptors)
+}
+
+pub fn send_control(
+    descriptor: &crate::control::Descriptor,
+    request: &crate::control::Request,
+) -> io::Result<serde_json::Value> {
+    use windows_sys::Win32::{
+        Foundation::GENERIC_READ,
+        System::Pipes::{PIPE_NOWAIT, SetNamedPipeHandleState},
+    };
+    let deadline = Instant::now() + Duration::from_millis(request.timeout_ms);
+    let pipe_name = wide_null(&descriptor.endpoint);
+    let pipe = loop {
+        let handle = unsafe {
+            CreateFileW(
+                pipe_name.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                0,
+                null(),
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                null_mut(),
+            )
+        };
+        if handle != INVALID_HANDLE_VALUE {
+            break OwnedHandle::new(handle);
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::last_os_error());
+        }
+        thread::sleep(Duration::from_millis(5));
+    };
+    let mode = PIPE_READMODE_BYTE | PIPE_NOWAIT;
+    if unsafe { SetNamedPipeHandleState(pipe.raw(), &mode, null(), null()) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let stop = AtomicBool::new(false);
+    write_control_frame(
+        pipe.raw(),
+        &serde_json::to_vec(request).map_err(io::Error::other)?,
+        deadline,
+        &stop,
+    )?;
+    let bytes = read_control_frame(pipe.raw(), deadline, &stop)?;
+    control_io(pipe.raw(), &mut [1u8], true, deadline, &stop)?;
+    serde_json::from_slice(&bytes).map_err(io::Error::other)
+}
+
+fn read_control_frame(pipe: HANDLE, deadline: Instant, stop: &AtomicBool) -> io::Result<Vec<u8>> {
+    let mut header = [0u8; 4];
+    control_io(pipe, &mut header, false, deadline, stop)?;
+    let len = u32::from_le_bytes(header) as usize;
+    if len > crate::control::MAX_FRAME_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "control frame exceeds limit",
+        ));
+    }
+    let mut bytes = vec![0u8; len];
+    control_io(pipe, &mut bytes, false, deadline, stop)?;
+    Ok(bytes)
+}
+
+fn write_control_frame(
+    pipe: HANDLE,
+    bytes: &[u8],
+    deadline: Instant,
+    stop: &AtomicBool,
+) -> io::Result<()> {
+    if bytes.len() > crate::control::MAX_FRAME_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "control frame exceeds limit",
+        ));
+    }
+    let mut header = (bytes.len() as u32).to_le_bytes();
+    control_io(pipe, &mut header, true, deadline, stop)?;
+    let mut bytes = bytes.to_vec();
+    control_io(pipe, &mut bytes, true, deadline, stop)
+}
+
+fn control_io(
+    pipe: HANDLE,
+    mut bytes: &mut [u8],
+    write: bool,
+    deadline: Instant,
+    stop: &AtomicBool,
+) -> io::Result<()> {
+    while !bytes.is_empty() {
+        if stop.load(Ordering::Acquire) || Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "control I/O deadline",
+            ));
+        }
+        let mut count = 0;
+        let length = bytes.len().min(65536) as u32;
+        let ok = unsafe {
+            if write {
+                WriteFile(pipe, bytes.as_ptr(), length, &mut count, null_mut())
+            } else {
+                ReadFile(pipe, bytes.as_mut_ptr(), length, &mut count, null_mut())
+            }
+        };
+        if count > 0 {
+            bytes = &mut bytes[count as usize..];
+            continue;
+        }
+        let error = unsafe { GetLastError() };
+        if ok == 0
+            && error != windows_sys::Win32::Foundation::ERROR_NO_DATA
+            && error != windows_sys::Win32::Foundation::ERROR_PIPE_LISTENING
+        {
+            return Err(io::Error::from_raw_os_error(error as i32));
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+    Ok(())
+}
+
 struct ProcessIdentity {
     session_id: u32,
     sid: String,

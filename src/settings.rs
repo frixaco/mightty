@@ -320,6 +320,9 @@ impl SettingsStore {
 }
 
 pub fn settings_path() -> PathBuf {
+    if let Some(directory) = crate::control::test_directory() {
+        return directory.join(SETTINGS_FILE_NAME);
+    }
     if let Some(path) = std::env::var_os("MIGHTTY_CONFIG_FILE") {
         return PathBuf::from(path);
     }

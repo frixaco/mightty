@@ -75,6 +75,9 @@ impl<'de> Deserialize<'de> for WorkspaceId {
 pub struct TabId(u64);
 
 impl TabId {
+    pub fn value(self) -> u64 {
+        self.0
+    }
     pub fn fresh() -> Self {
         Self(NEXT_TAB_ID.fetch_add(1, Ordering::Relaxed))
     }

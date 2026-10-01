@@ -171,6 +171,7 @@ pub struct TerminalWidget {
     semantic_commands_available: bool,
     theme: TerminalTheme,
     has_exited: bool,
+    output_seq: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -407,6 +408,7 @@ impl TerminalWidget {
             semantic_commands_available: false,
             theme,
             has_exited,
+            output_seq: 0,
         };
 
         if let Some(event_rx) = pty_event_rx {
@@ -713,6 +715,7 @@ impl TerminalWidget {
         match event {
             PtyEvent::Output(data) => {
                 self.terminal.vt_write(&data);
+                self.output_seq = self.output_seq.saturating_add(data.len() as u64);
                 self.schedule_search_step(cx);
                 if !self.semantic_commands_available {
                     self.semantic_commands_available =

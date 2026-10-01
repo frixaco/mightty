@@ -11,35 +11,121 @@ use super::TerminalWidget;
 use super::render::CellWidthExt;
 
 impl TerminalWidget {
-    pub(super) fn build_feedback_capture(&mut self) -> crate::ghostty::Result<TerminalCapture> {
-        let snapshot = self.render_state.update(&self.terminal)?;
+    pub fn control_state(&self) -> serde_json::Value {
+        use serde_json::json;
+        let bounds = self.layout_bounds.map(|b| json!({"x":f32::from(b.origin.x),"y":f32::from(b.origin.y),"width":f32::from(b.size.width),"height":f32::from(b.size.height)}));
+        json!({"title":{"reported":self.reported_title,"normalized":crate::shell_integration::display_title(self.reported_title.as_deref())},
+            "working_directory":{"configured":self.config.launch.working_directory,"reported":self.reported_working_directory},
+            "launch":{"executable":self.config.launch.executable,"argv":self.config.launch.arguments.iter().map(|v|v.to_string_lossy()).collect::<Vec<_>>(),
+                "environment_names":self.config.launch.environment.keys().map(|v|v.to_string_lossy()).collect::<Vec<_>>()},
+            "terminal_size":{"cols":self.size.0,"rows":self.size.1},"computed_bounds":bounds,
+            "output_seq":self.output_seq.to_string(),"output_cursor":format!("{}:{}",crate::control::instance_id(),self.output_seq),
+            "lifecycle":if self.has_exited {"output_ended"} else {"running"},"processes":{"availability":"not_sampled"},
+            "font":{"family":self.config.font_family,"size_px":self.config.font_size_px},
+            "viewport":self.terminal.scrollbar().ok().map(|s|json!({"offset":s.offset,"length":s.len,"total":s.total})),
+            "selection":self.has_selection(),"search_open":self.search.is_some()})
+    }
+
+    pub fn control_read(
+        &mut self,
+        request: &crate::control::Request,
+    ) -> Result<serde_json::Value, crate::control::ControlError> {
+        use crate::control::{ControlError, number_arg, string_arg};
+        let alternate = self.terminal.active_buffer_is_alternate()?;
+        if string_arg(request, "buffer")?
+            .is_some_and(|b| b != "active" && b != if alternate { "alternate" } else { "primary" })
+        {
+            return Err(ControlError::new(
+                "unsupported_buffer",
+                "requested buffer is inactive; switching it would change the terminal",
+            ));
+        }
+        let format = string_arg(request, "format")?.unwrap_or("text");
+        if !matches!(format, "text" | "cells") {
+            return Err(ControlError::new(
+                "invalid_argument",
+                "format must be text or cells",
+            ));
+        }
+        let tail = number_arg(request, "tail", crate::control::MAX_READ_ROWS as f64)?;
+        if tail < 1.0 || tail.fract() != 0.0 {
+            return Err(ControlError::new(
+                "invalid_argument",
+                "tail must be a positive integer",
+            ));
+        }
+        let viewport =
+            crate::control::bool_arg(request, "viewport", !request.args.contains_key("tail"))?;
+        if viewport && request.args.contains_key("tail") {
+            return Err(ControlError::new(
+                "invalid_argument",
+                "choose viewport or tail",
+            ));
+        }
+        let mut state = crate::ghostty::RenderState::new()?;
+        let snapshot = state.update(&self.terminal)?;
+        let colors = snapshot.colors()?;
+        let observation = self.terminal.diagnostic_rows(
+            viewport,
+            (tail as usize).min(crate::control::MAX_READ_ROWS),
+            crate::control::MAX_FRAME_BYTES / 2,
+            &colors,
+        )?;
+        let rows=observation.rows.iter().map(|row| {
+            let mut text=String::new();
+            let cells=row.cells.iter().map(|cell| {
+                let continuation=matches!(cell.width,CellWidth::SpacerTail|CellWidth::SpacerHead);
+                if !continuation {text.push_str(if cell.text.is_empty(){" "}else{&cell.text});}
+                CaptureCell {col:cell.column,width:cell.width.column_advance(),continuation,text:cell.text.clone(),fg:rgb_hex(cell.foreground),bg:cell.background.map(rgb_hex),bold:cell.style.bold,italic:cell.style.italic,underline:underline_name(cell.style.underline).into(),inverse:cell.style.inverse,strikethrough:cell.style.strikethrough}
+            }).collect::<Vec<_>>();
+            serde_json::json!({"index":row.index,"text":text,"wrapped":row.wrapped,"cells":if format == "cells"{serde_json::to_value(cells).unwrap()}else{serde_json::Value::Null}})
+        }).collect::<Vec<_>>();
+        let text = rows
+            .iter()
+            .map(|r| r["text"].as_str().unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let count = rows.len();
+        let start = observation.start;
+        let total = observation.total;
+        Ok(
+            serde_json::json!({"text":text,"rows":rows,"buffer":if alternate {"alternate"}else{"primary"},
+            "output_seq":self.output_seq.to_string(),"row_start":start,"row_end":start+count,"total_rows":total,
+            "source":if viewport {"active_buffer_viewport"}else{"active_buffer_tail"},"truncation":{"omitted_rows":total-count,"reason":if observation.truncated {Some("byte_limit")}else if count<total {Some("requested_range")} else {None}},"terminal_size":{"cols":self.size.0,"rows":self.size.1}}),
+        )
+    }
+    pub fn build_feedback_capture(&mut self) -> crate::ghostty::Result<TerminalCapture> {
+        // Observation must not alter the painter's reusable dirty snapshot.
+        let mut state = crate::ghostty::RenderState::new()?;
+        let mut row_iterator = crate::ghostty::render::RowIterator::new()?;
+        let mut cell_iterator = crate::ghostty::render::CellIterator::new()?;
+        let snapshot = state.update(&self.terminal)?;
         let colors = snapshot.colors()?;
 
         let mut rows = Vec::new();
-        let mut row_it = self.row_iterator.update(&snapshot)?;
+        let mut row_it = row_iterator.update(&snapshot)?;
         let mut row_idx = 0u16;
         while let Some(row) = row_it.next() {
             let mut row_text = String::new();
             let mut cells = Vec::new();
-            let mut cell_it = self.cell_iterator.update(row)?;
+            let mut cell_it = cell_iterator.update(row)?;
             let mut col_idx = 0u16;
             while let Some(cell) = cell_it.next() {
                 let width = cell.width()?;
                 let advance = width.column_advance();
                 let text = cell.text()?;
-                if text.is_empty() || matches!(width, CellWidth::SpacerTail | CellWidth::SpacerHead)
-                {
-                    col_idx += advance;
-                    continue;
+                let continuation = matches!(width, CellWidth::SpacerTail | CellWidth::SpacerHead);
+                if !continuation {
+                    row_text.push_str(if text.is_empty() { " " } else { &text });
                 }
-
-                row_text.push_str(&text);
 
                 let fg = cell.fg_color()?.unwrap_or(colors.foreground);
                 let bg = cell.bg_color()?;
                 let style = cell.style()?;
                 cells.push(CaptureCell {
                     col: col_idx,
+                    width: advance,
+                    continuation,
                     text,
                     fg: rgb_hex(fg),
                     bg: bg.map(rgb_hex),

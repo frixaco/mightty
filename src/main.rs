@@ -26,6 +26,9 @@ use {
 };
 
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("ctl") {
+        std::process::exit(mightty::control::cli(std::env::args().skip(2).collect()));
+    }
     #[cfg(windows)]
     let Some(windows_startup) = windows_startup() else {
         return;
@@ -123,6 +126,7 @@ enum WindowsStartup {
         request: ActivationRequest,
     },
     Embedding,
+    Test,
 }
 
 #[cfg(windows)]
@@ -131,6 +135,7 @@ impl WindowsStartup {
         match self {
             Self::Application { request, .. } => request_shows_normal_window(request),
             Self::Embedding => false,
+            Self::Test => true,
         }
     }
 }
@@ -143,6 +148,25 @@ fn request_shows_normal_window(request: &ActivationRequest) -> bool {
 #[cfg(windows)]
 fn windows_startup() -> Option<WindowsStartup> {
     let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
+    if arguments.first().is_some_and(|v| v == "--test-instance") {
+        if let [_, option, directory] = arguments.as_slice()
+            && option == "--data-dir"
+        {
+            let path = std::path::PathBuf::from(directory);
+            let path = if path.is_absolute() {
+                path
+            } else {
+                std::env::current_dir().ok()?.join(path)
+            };
+            match mightty::control::set_test_directory(path) {
+                Ok(()) => return Some(WindowsStartup::Test),
+                Err(error) => eprintln!("Cannot start isolated instance: {error}"),
+            }
+        } else {
+            eprintln!("use --test-instance --data-dir DIRECTORY");
+        }
+        return None;
+    }
     if is_embedding_arguments(&arguments) {
         return Some(WindowsStartup::Embedding);
     }
@@ -246,6 +270,11 @@ fn parse_profile_id(value: &OsString) -> Result<ProfileId, String> {
 
 #[cfg(windows)]
 fn start_windows_application(startup: WindowsStartup, normal_window: TerminalWindow, cx: &mut App) {
+    let isolated = matches!(startup, WindowsStartup::Test);
+    let (control_tx, control_rx) = flume::bounded(32);
+    let control_server = mightty::application::windows::ControlServer::start(control_tx)
+        .expect("failed to start control endpoint");
+    mightty::control::set_instance_id(control_server.descriptor().instance_id.clone());
     let (activation_tx, activation_rx) = flume::unbounded();
     let (primary_instance, startup_request, embedding) = match startup {
         WindowsStartup::Application {
@@ -258,10 +287,13 @@ fn start_windows_application(startup: WindowsStartup, normal_window: TerminalWin
             (Some(primary_instance), Some(request), false)
         }
         WindowsStartup::Embedding => (None, None, true),
+        WindowsStartup::Test => (None, None, false),
     };
     let (handoff_tx, handoff_rx) = flume::unbounded();
-    let default_terminal_server = DefaultTerminalServer::start(handoff_tx)
-        .expect("failed to start the default-terminal COM server");
+    let default_terminal_server = (!isolated).then(|| {
+        DefaultTerminalServer::start(handoff_tx)
+            .expect("failed to start the default-terminal COM server")
+    });
 
     let controller = Rc::new(RefCell::new(WindowsApplication {
         normal_window,
@@ -271,11 +303,32 @@ fn start_windows_application(startup: WindowsStartup, normal_window: TerminalWin
         activation_tx: (!embedding).then_some(activation_tx),
         primary_instance,
         global_hotkey: None,
-        default_terminal_server: Some(default_terminal_server),
+        default_terminal_server,
+        control_server: Some(control_server),
+        control_revision: 1,
         replace_initial_handoff_tab: embedding,
         shutting_down: false,
     }));
-    controller.borrow_mut().apply_settings(cx);
+    if !isolated {
+        controller.borrow_mut().apply_settings(cx);
+    }
+
+    let control_controller = Rc::clone(&controller);
+    cx.spawn(async move |cx| {
+        while let Ok(dispatch) = control_rx.recv_async().await {
+            let result = cx.update(|cx| {
+                control_controller
+                    .borrow_mut()
+                    .control_dispatch(&dispatch, cx)
+            });
+            if let Ok(value) = result {
+                let _ = dispatch.reply.try_send(value);
+            } else {
+                break;
+            }
+        }
+    })
+    .detach();
     if startup_request
         .as_ref()
         .is_some_and(|request| !request_shows_normal_window(request))
@@ -362,10 +415,98 @@ struct WindowsApplication {
     default_terminal_server: Option<DefaultTerminalServer>,
     replace_initial_handoff_tab: bool,
     shutting_down: bool,
+    control_server: Option<mightty::application::windows::ControlServer>,
+    control_revision: u64,
 }
 
 #[cfg(windows)]
 impl WindowsApplication {
+    fn control_dispatch(
+        &mut self,
+        dispatch: &mightty::control::Dispatch,
+        cx: &mut App,
+    ) -> serde_json::Value {
+        use mightty::control::{ControlError, reply};
+        use serde_json::json;
+        let request = &dispatch.request;
+        if std::time::Instant::now() >= dispatch.deadline {
+            return reply(
+                request,
+                self.control_revision,
+                Err(ControlError::new(
+                    "cancelled",
+                    "request expired before dispatch",
+                )),
+            );
+        }
+        let mut windows = vec![(
+            "w1",
+            self.normal_window.handle,
+            self.normal_window.panes.clone(),
+        )];
+        if let Some(quick) = &self.quick_window {
+            windows.push(("w2", quick.handle, quick.panes.clone()));
+        }
+        windows.retain(|(_, handle, _)| handle.is_active(cx).is_some());
+        if request.op == "state"
+            && request.target.window_id.is_none()
+            && request.target.tab_id.is_none()
+            && request.target.pane_id.is_none()
+        {
+            let mut states = Vec::new();
+            for (id, handle, panes) in windows {
+                if let Ok(mut state) =
+                    handle.update(cx, |_, window, cx| panes.read(cx).control_state(window, cx))
+                {
+                    state["window_id"] = json!(id);
+                    states.push(state);
+                }
+            }
+            return reply(
+                request,
+                self.control_revision,
+                Ok(
+                    json!({"schema_version":1,"instance_id":request.instance_id,"pid":std::process::id(),"observed_unix_ms":mightty::feedback::unix_timestamp_ms().to_string(),"revision":self.control_revision.to_string(),"windows":states}),
+                ),
+            );
+        }
+        let active = windows
+            .iter()
+            .find(|(_, handle, _)| handle.is_active(cx) == Some(true))
+            .map(|(id, _, _)| *id)
+            .unwrap_or("w1");
+        let targets = windows
+            .into_iter()
+            .filter(|(id, _, panes)| {
+                request
+                    .target
+                    .window_id
+                    .as_ref()
+                    .is_none_or(|w| w == *id || (w == "active" && *id == active))
+                    && panes.read(cx).control_contains(&request.target, cx)
+            })
+            .collect::<Vec<_>>();
+        let result = match targets.as_slice() {
+            [(id, handle, panes)] => handle
+                .update(cx, |_, window, cx| {
+                    panes.update(cx, |panes, cx| panes.control_dispatch(request, window, cx))
+                })
+                .map_err(|e| ControlError::new("window_closed", e.to_string()))
+                .and_then(|r| r)
+                .map(|mut value| {
+                    if value.is_object() {
+                        value["window_id"] = json!(id);
+                    }
+                    value
+                }),
+            [] => Err(ControlError::new(
+                "target_unavailable",
+                "stale or conflicting window/tab/pane target",
+            )),
+            _ => Err(ControlError::new("ambiguous_target", "specify a window")),
+        };
+        reply(request, self.control_revision, result)
+    }
     fn dispatch(&mut self, request: ActivationRequest, cx: &mut App) {
         match request {
             ActivationRequest::Activate => self.activate_normal(cx),
@@ -526,6 +667,7 @@ impl WindowsApplication {
 
     fn shutdown(&mut self) {
         self.shutting_down = true;
+        self.control_server = None;
         self.default_terminal_server = None;
         self.global_hotkey = None;
         self.primary_instance = None;

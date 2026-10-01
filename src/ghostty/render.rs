@@ -358,7 +358,7 @@ pub enum CellWidth {
 }
 
 impl CellWidth {
-    fn from_raw(value: ffi::CellWide::Type) -> Result<Self> {
+    pub(crate) fn from_raw(value: ffi::CellWide::Type) -> Result<Self> {
         match value {
             ffi::CellWide::NARROW => Ok(Self::Narrow),
             ffi::CellWide::WIDE => Ok(Self::Wide),

@@ -79,6 +79,108 @@ pub struct PaneContainer {
 }
 
 impl PaneContainer {
+    pub fn control_contains(&self, target: &crate::control::Target, cx: &gpui::App) -> bool {
+        self.tabs.iter().any(|tab| {
+            target
+                .tab_id
+                .as_ref()
+                .is_none_or(|id| id == "active" || *id == format!("t{}", tab.id.value()))
+                && target.pane_id.as_ref().is_none_or(|id| {
+                    id == "active"
+                        || tab
+                            .split
+                            .read(cx)
+                            .pane_entities()
+                            .any(|(pane, _, _)| *id == format!("p{}", pane.value()))
+                })
+        })
+    }
+
+    fn control_target(
+        &self,
+        target: &crate::control::Target,
+        cx: &gpui::App,
+    ) -> Result<(usize, crate::split::PaneId, Entity<TerminalWidget>), crate::control::ControlError>
+    {
+        use crate::control::ControlError;
+        let mut matches = Vec::new();
+        for (index, tab) in self.tabs.iter().enumerate() {
+            if target.tab_id.as_ref().is_some_and(|id| {
+                if id == "active" {
+                    index != self.active_tab_index
+                } else {
+                    *id != format!("t{}", tab.id.value())
+                }
+            }) {
+                continue;
+            }
+            let split = tab.split.read(cx);
+            for (pane, _, terminal) in split.pane_entities() {
+                if target.pane_id.as_ref().is_some_and(|id| {
+                    if id == "active" {
+                        (target.tab_id.is_none() && index != self.active_tab_index)
+                            || pane != split.active_pane_id()
+                    } else {
+                        *id != format!("p{}", pane.value())
+                    }
+                }) {
+                    continue;
+                }
+                if target.pane_id.is_none()
+                    && target.tab_id.is_some()
+                    && pane != split.active_pane_id()
+                {
+                    continue;
+                }
+                matches.push((index, pane, terminal));
+            }
+        }
+        match matches.len() {
+            1 => Ok(matches.remove(0)),
+            0 => Err(ControlError::new(
+                "target_unavailable",
+                "stale or conflicting tab/pane target",
+            )),
+            _ => Err(ControlError::new(
+                "ambiguous_target",
+                "specify a tab or pane ID, or active",
+            )),
+        }
+    }
+
+    pub fn control_state(&self, window: &Window, cx: &gpui::App) -> serde_json::Value {
+        use serde_json::json;
+        json!({"bounds":{"width":f32::from(window.viewport_size().width),"height":f32::from(window.viewport_size().height)},
+            "dpi_scale":window.scale_factor(),"os_focused":window.is_window_active(),
+            "active_tab_id":format!("t{}",self.tabs[self.active_tab_index].id.value()),
+            "sidebar_visible":self.sidebar_visible,"palette_open":self.palette.is_some(),"settings_generation":self.settings.generation().to_string(),
+            "tabs":self.tabs.iter().map(|tab| {let split=tab.split.read(cx);json!({"tab_id":format!("t{}",tab.id.value()),"title":tab.title,"fallback_title":tab.default_title,
+                "selected_pane_id":format!("p{}",split.active_pane_id().value()),"topology":split.topology(),
+                "panes":split.pane_entities().map(|(id,profile,terminal)|{let mut state=terminal.read(cx).control_state();state["pane_id"]=json!(format!("p{}",id.value()));state["profile_id"]=json!(profile.as_str());state}).collect::<Vec<_>>()})}).collect::<Vec<_>>()})
+    }
+
+    pub fn control_dispatch(
+        &mut self,
+        request: &crate::control::Request,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<serde_json::Value, crate::control::ControlError> {
+        use serde_json::json;
+        match request.op.as_str() {
+            "capabilities" => Ok(crate::control::capabilities()),
+            "profiles" => Ok(json!(self.settings.current().profiles.iter().map(|(id,profile)|json!({"profile_id":id.as_str(),"label":profile.label,"executable":profile.launch.executable,"argv":profile.launch.arguments.iter().map(|v|v.to_string_lossy()).collect::<Vec<_>>(),"working_directory":profile.launch.working_directory})).collect::<Vec<_>>())),
+            "state" => {
+                if request.target.tab_id.is_none() && request.target.pane_id.is_none() {return Ok(self.control_state(window,cx));}
+                let (index,pane,terminal)=self.control_target(&request.target,cx)?;
+                if request.target.pane_id.is_none() {return Ok(self.control_state(window,cx)["tabs"][index].clone());}
+                let mut result=terminal.read(cx).control_state();result["tab_id"]=json!(format!("t{}",self.tabs[index].id.value()));result["pane_id"]=json!(format!("p{}",pane.value()));Ok(result)
+            }
+            "pane.read" => {let (index,pane,terminal)=self.control_target(&request.target,cx)?;let mut result=terminal.update(cx,|terminal,_|terminal.control_read(request))?;
+                result["tab_id"]=json!(format!("t{}",self.tabs[index].id.value()));result["pane_id"]=json!(format!("p{}",pane.value()));Ok(result)}
+            _ => Err(crate::control::ControlError::new("unsupported_operation","unsupported operation")),
+        }
+    }
+
     pub fn new(settings: SettingsStore, cx: &mut Context<Self>) -> Self {
         Self::with_titlebar(settings, true, cx)
     }

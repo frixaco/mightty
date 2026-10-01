@@ -3,6 +3,7 @@
 //! The raw C interface is generated from the pinned Ghostty submodule and kept
 //! private. Callers use terminal concepts and never handle C pointers.
 
+pub mod diagnostics;
 mod error;
 mod search;
 mod selection;

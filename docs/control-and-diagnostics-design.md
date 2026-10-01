@@ -1,6 +1,10 @@
 # CLI control and diagnostics design
 
-Status: Proposed. These commands and interfaces are not yet implemented.
+Status: Implementation in progress. Instance discovery, capabilities, profiles,
+live state, bounded active-buffer viewport/tail reads, and isolated GUI startup
+are implemented. The remaining commands and capture contracts below are the
+implementation target. Run `pwsh -NoProfile -File tools/control-smoke.ps1` against
+the debug build for a disposable real-GUI inspection check.
 
 Add a local control and diagnostics API, exposed through `mightty ctl`, so users
 and AI agents can control the running application, inspect persisted state, and

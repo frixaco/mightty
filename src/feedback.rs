@@ -65,6 +65,8 @@ pub struct CaptureRow {
 #[derive(Debug, Serialize)]
 pub struct CaptureCell {
     pub col: u16,
+    pub width: u16,
+    pub continuation: bool,
     pub text: String,
     pub fg: RgbHex,
     pub bg: Option<RgbHex>,
