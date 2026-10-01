@@ -75,6 +75,7 @@ pub struct Sequence {
     position: gpui::Point<gpui::Pixels>,
     completed: usize,
     focus_before: String,
+    pub receiving_targets: Vec<Value>,
     focus_after: String,
 }
 impl Drop for Sequence {
@@ -193,6 +194,7 @@ pub fn prepare(
         pressed: None,
         position: point(px(0.), px(0.)),
         completed: 0,
+        receiving_targets: Vec::new(),
         focus_before: format!("{:?}", window.focused(cx)),
         focus_after: String::new(),
     })
@@ -327,7 +329,7 @@ impl Sequence {
         Ok(self.steps.is_empty())
     }
     pub fn result(&self) -> Value {
-        json!({"completed_steps":self.completed,"dispatch_finished":true,"focus_before":self.focus_before,"focus_after":self.focus_after,"pty_acknowledged":false})
+        json!({"completed_steps":self.completed,"dispatch_finished":true,"focus_before":self.focus_before,"focus_after":self.focus_after,"pty_acknowledged":false,"receiving_targets":self.receiving_targets})
     }
     pub fn cancel(&mut self, window: &mut Window, cx: &mut App) -> ControlError {
         for (_, keystroke) in std::mem::take(&mut self.keys) {

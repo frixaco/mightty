@@ -20,7 +20,10 @@ try {
     } while ([datetime]::UtcNow -lt $deadline)
     if ($instance.Count -ne 1) { throw 'Isolated instance was not discovered' }
     function Invoke-Control([string[]]$Command) {
-        $response = & $Executable ctl @Command --instance $instance[0].instance_id --json | ConvertFrom-Json
+        $separator = [Array]::IndexOf($Command, '--')
+        $selectors = @('--instance', $instance[0].instance_id, '--json')
+        $controlArguments = if ($separator -ge 1) { $Command[0..($separator - 1)] + $selectors + $Command[$separator..($Command.Length - 1)] } else { $Command + $selectors }
+        $response = & $Executable ctl @controlArguments | ConvertFrom-Json
         if (!$response.ok) { throw ("Command: $($Command -join ' '); " + ($response.error | ConvertTo-Json -Depth 8) + "; logs: $caseDirectory") }
         $response.result
     }
@@ -34,15 +37,32 @@ try {
         $next = Invoke-Control @('snapshot', '--window', 'w1', '--frame', 'next', '--out', $caseDirectory)
         $first = Get-Content -LiteralPath $presented.manifest -Raw | ConvertFrom-Json
         $second = Get-Content -LiteralPath $next.manifest -Raw | ConvertFrom-Json
-        if ([long]$second.frame_id -le [long]$first.frame_id) { throw 'Next frame did not advance presentation' }
+        if ([long]$second.frame_id -le [long]$first.frame_id -or [long]$second.frame_revision -le [long]$first.frame_revision) { throw 'Next frame did not advance the presented scene' }
         if (!(Test-Path -LiteralPath $presented.image) -or !(Test-Path -LiteralPath $next.image)) { throw 'Renderer capture image missing' }
-        $background = Invoke-Control @('tab', 'new', '--window', 'w1', '--profile', 'fixture')
+        $fixtureTitle = 'Inactive title wider than the sidebar: wrapping and clipping must stay visible in the window capture'
+        $marker = 'raster-' + [guid]::NewGuid().ToString('N')
+        $fixture = "[Console]::OutputEncoding = [Text.UTF8Encoding]::new(`$false); `$PSStyle.OutputRendering = 'Ansi'; Clear-Host; [Console]::Write([char]27 + ']0;$fixtureTitle' + [char]7); [Console]::WriteLine([char]27 + '[31mflower ' + [char]0x2740 + ' nerd ' + [char]0xf17c + ' wide ' + [char]0x754c + ' combining e' + [char]0x301 + ' => !=' + [char]27 + '[0m'); [Console]::WriteLine([char]27 + '[48;2;12;34;56m     ' + [char]27 + '[0m'); Write-Host ('wrapped-' + ('w' * 160)); Write-Host '$marker'"
+        $background = Invoke-Control @('tab', 'new', '--window', 'w1', '--cwd', $caseDirectory, '--exec', 'pwsh.exe', '--', '-NoLogo', '-NoProfile', '-NoExit', '-Command', $fixture)
+        $backgroundPane = $background.panes[0].pane_id
+        $null = Invoke-Control @('wait', '--pane', $backgroundPane, '--text', $marker, '--timeout', '10s')
         $before = Invoke-Control @('state')
         $offscreen = Invoke-Control @('snapshot', '--tab', $background.tab_id, '--layout', $background.layout_token, '--out', $caseDirectory)
-        $paneCapture = Invoke-Control @('snapshot', '--pane', $background.panes[0].pane_id, '--out', $caseDirectory)
+        $paneCapture = Invoke-Control @('snapshot', '--pane', $backgroundPane, '--out', $caseDirectory)
+        $source = (Get-Content -LiteralPath (Join-Path $paneCapture.directory 'frame.json') -Raw | ConvertFrom-Json).panes[0].source
+        if (!(($source.rows.text -join "`n").Contains([char]0x2740)) -or !($source.rows | Where-Object wrapped)) { throw 'Capture lost Unicode or soft wrapping' }
+        $cells = Invoke-Control @('pane', 'read', '--pane', $backgroundPane, '--viewport', '--format', 'cells')
+        if (!($cells.rows.cells | Where-Object { $_.bg.hex -eq 0x0c2238 })) { throw 'Diagnostic read lost blank background color' }
         $after = Invoke-Control @('state')
         if ($before.windows[0].active_tab_id -ne $after.windows[0].active_tab_id -or $before.windows[0].tabs[1].panes[0].pty_size.cols -ne $after.windows[0].tabs[1].panes[0].pty_size.cols) { throw 'Offscreen capture changed selection or PTY geometry' }
         if (!(Test-Path -LiteralPath $offscreen.image) -or !(Test-Path -LiteralPath $paneCapture.image)) { throw 'Background image missing' }
+        $titles = Invoke-Control @('snapshot', '--window', 'w1', '--frame', 'next', '--out', $caseDirectory)
+        $labels = (Get-Content -LiteralPath (Join-Path $titles.directory 'frame.json') -Raw | ConvertFrom-Json).labels
+        $label = @($labels | Where-Object tab_id -eq $background.tab_id)[0]
+        if ($label.chosen_title -ne $fixtureTitle -or $label.geometry.overflow -ne 'ellipsis' -or $label.geometry.bounds.y -lt 20) { throw 'Inactive title geometry missing or incorrect' }
+        $crop = Invoke-Control @('snapshot', '--pane', $pane, '--frame', 'presented', '--out', $caseDirectory)
+        $absent = & $Executable ctl snapshot --tab $background.tab_id --frame presented --out $caseDirectory --instance $instance[0].instance_id --json | ConvertFrom-Json
+        if ($absent.ok -or $absent.error.code -ne 'target_not_in_frame') { throw 'Presented capture accepted an invisible tab' }
+        Write-Output "Inactive titles: $($titles.image); visible crop: $($crop.image)"
         Write-Output "Offscreen tab: $($offscreen.image); pane: $($paneCapture.image)"
         Write-Output "Renderer readback passed; presented: $($presented.image); next: $($next.image)"; return
     }
@@ -73,7 +93,8 @@ try {
     if ($dragged.layout_token -eq $split.layout_token) { throw 'Real divider drag did not change layout' }
     $null = Invoke-Control @('pane', 'close', '--pane', $split.new_pane_id)
     if ($UiOnly) { Write-Output "UI control passed; artifacts: $caseDirectory"; return }
-    $null = Invoke-Control @('capabilities')
+    $capabilities = Invoke-Control @('capabilities')
+    if (!$capabilities.'$defs'.terminal_step -or !$capabilities.operations[0].argument_schema) { throw 'Published protocol schema missing' }
     $null = Invoke-Control @('profiles')
     $text = Invoke-Control @('pane', 'read', '--pane', $pane, '--tail', '100')
     if ($text.source -ne 'active_buffer_tail') { throw 'Read source mislabeled' }
@@ -82,6 +103,9 @@ try {
     $originalTab = $state.windows[0].active_tab_id
     $windowResize = Invoke-Control @('window', 'resize', '--window', 'w1', '--width', '1000', '--height', '700')
     if ($windowResize.bounds.width -ne 1000 -or $windowResize.bounds.height -ne 700) { throw 'Window resize did not report client dimensions' }
+    $null = Invoke-Control @('wait', '--window', 'w1', '--condition', 'layout-ready', '--layout', $windowResize.layout_token)
+    $windowRead = Invoke-Control @('pane', 'read', '--window', 'w1', '--tail', '100')
+    if ($windowRead.pane_id -ne $pane) { throw 'Window read did not resolve the selected pane' }
     $background = Invoke-Control @('tab', 'new', '--window', 'w1', '--profile', 'fixture', '--cwd', $caseDirectory, '--env', 'FIXTURE_VALUE=hello world')
     $backgroundPane = $background.panes[0].pane_id
     if ($background.panes[0].computed_bounds.width -le 0 -or !$background.completion.pty_acknowledged) { throw 'Background layout was not acknowledged' }
@@ -121,6 +145,10 @@ try {
     if ($events[0].type -ne 'state' -or $events[-1].type -ne 'end') { throw 'Event subscription did not deliver initial state and clean end' }
     $saved = & $Executable ctl state --saved --data-dir $caseDirectory --instance $instance[0].instance_id --json | ConvertFrom-Json
     if (!$saved.ok -or $saved.result.source -ne 'saved') { throw 'Saved state unavailable' }
+    $null = Invoke-Control @('tab', 'close', '--tab', $originalTab)
+    if (!$application.WaitForExit(10000)) { throw 'Final tab close did not exit the instance' }
+    $saved = & $Executable ctl state --saved --data-dir $caseDirectory --instance $instance[0].instance_id --json | ConvertFrom-Json
+    if (!$saved.ok -or !$saved.result.orderly_shutdown -or $saved.result.windows.Count -ne 0) { throw 'Final state did not record orderly shutdown and closed windows' }
     Write-Output "Control inspection passed: $($instance[0].instance_id); artifacts: $caseDirectory"
 } finally {
     if (!$application.HasExited) { Stop-Process -Id $application.Id }

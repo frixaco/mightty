@@ -11,6 +11,24 @@ pub struct ControlWait {
     pub last: Value,
 }
 impl ControlWait {
+    pub fn probe_removed_window(&mut self) -> Result<Option<Value>, ControlError> {
+        if string_arg(&self.request, "condition")? != Some("process-exited") {
+            return Err(ControlError::new(
+                "window_closed",
+                "wait target window was closed",
+            ));
+        }
+        self.last = crate::diagnostics::outcome(&self.request.target)
+            .ok_or_else(|| ControlError::new("outcome_expired", "removed pane outcome expired"))?;
+        if self.last["processes"]["availability"] == "unavailable" {
+            return Err(ControlError::new(
+                "unavailable",
+                "root process observation unavailable",
+            ));
+        }
+        Ok((self.last["processes"]["lifecycle"] == "exited")
+            .then(|| json!({"condition":"process-exited","observation":self.last})))
+    }
     pub fn release(&mut self, cx: &mut App) {
         if let (Some(terminal), Some(id)) = (
             self.terminal
@@ -84,8 +102,14 @@ impl PaneContainer {
             }
             terminal = Some(entity.downgrade());
         } else if matches!(condition, "title-equals" | "layout-ready") {
-            let index = self.control_tab(&request, cx)?;
-            request.target.tab_id = Some(format!("t{}", self.tabs[index].id.value()));
+            if condition == "title-equals"
+                || request.target.tab_id.is_some()
+                || request.target.pane_id.is_some()
+                || request.target.window_id.is_none()
+            {
+                let index = self.control_tab(&request, cx)?;
+                request.target.tab_id = Some(format!("t{}", self.tabs[index].id.value()));
+            }
             if string_arg(
                 &request,
                 if condition == "title-equals" {
@@ -139,6 +163,12 @@ impl PaneContainer {
                     wait.last = outcome.ok_or_else(|| {
                         ControlError::new("outcome_expired", "removed pane outcome expired")
                     })?;
+                    if wait.last["processes"]["availability"] == "unavailable" {
+                        return Err(ControlError::new(
+                            "unavailable",
+                            "root process observation unavailable",
+                        ));
+                    }
                     return Ok((wait.last["processes"]["lifecycle"] == "exited")
                         .then(|| json!({"condition":condition,"observation":wait.last})));
                 }
@@ -198,13 +228,17 @@ impl PaneContainer {
                     if string_arg(request, "overlay")? == Some("palette") {
                         self.palette.is_some()
                     } else {
-                        let split = self.tabs[self.active_tab_index].split.read(cx);
-                        split
-                            .terminal(split.active_pane_id())
-                            .is_some_and(|terminal| {
-                                terminal.read(cx).control_state()["search_open"] == true
-                            })
+                        self.targeted_terminal(request, cx)?
+                            .2
+                            .read(cx)
+                            .control_state()["search_open"]
+                            == true
                     }
+                }
+                "layout-ready"
+                    if request.target.tab_id.is_none() && request.target.pane_id.is_none() =>
+                {
+                    self.snapshot_layout_ready(request, window, cx)?
                 }
                 _ => {
                     let index = self.control_tab(request, cx)?;

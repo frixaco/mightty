@@ -50,6 +50,21 @@ impl TerminalWidget {
                 "input requires 1..1024 steps",
             ));
         }
+        let source_bytes = steps
+            .iter()
+            .map(|step| match step {
+                InputStep::Text { text } => text.len(),
+                InputStep::Key { key, modifiers, .. } => {
+                    key.len() + modifiers.iter().map(String::len).sum::<usize>()
+                }
+            })
+            .sum::<usize>();
+        if source_bytes > control::MAX_INPUT_BYTES {
+            return Err(ControlError::new(
+                "input_limit",
+                "source input exceeds 256 KiB",
+            ));
+        }
         let mut held = std::collections::BTreeSet::new();
         let mut encoded = Vec::new();
         let mut ends = Vec::new();
@@ -110,13 +125,13 @@ impl TerminalWidget {
                         }
                     };
                     for action in actions {
-                        if let Some(bytes) = input::encode_key_event(
+                        if let Some(bytes) = input::encode_key_event_checked(
                             &mut self.key_encoder,
                             &mut self.key_event,
                             &self.terminal,
                             *action,
                             &stroke,
-                        ) {
+                        )? {
                             encoded.extend(bytes);
                         }
                     }

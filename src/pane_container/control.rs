@@ -6,6 +6,20 @@ use crate::{
 use serde_json::{Value, json};
 
 impl PaneContainer {
+    pub fn receiving_focus(&self, window: &Window, cx: &gpui::App) -> Value {
+        if self.palette_focus.contains_focused(window, cx) {
+            return json!({"kind":"palette","window_id":self.window_id});
+        }
+        for tab in &self.tabs {
+            for (id, _, terminal) in tab.split.read(cx).pane_entities() {
+                let terminal = terminal.read(cx);
+                if terminal.focus_handle().contains_focused(window, cx) {
+                    return json!({"kind":if terminal.control_state()["search_open"]==true{"search"}else{"terminal"},"window_id":self.window_id,"tab_id":format!("t{}",tab.id.value()),"pane_id":format!("p{}",id.value())});
+                }
+            }
+        }
+        json!({"kind":"other","focus_handle":format!("{:?}",window.focused(cx)),"window_id":self.window_id})
+    }
     pub fn snapshot_layout_ready(
         &self,
         request: &Request,

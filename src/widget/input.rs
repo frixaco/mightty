@@ -10,6 +10,18 @@ pub(super) fn encode_key_event(
     action: Action,
     keystroke: &gpui::Keystroke,
 ) -> Option<Vec<u8>> {
+    encode_key_event_checked(key_encoder, key_event, terminal, action, keystroke)
+        .ok()
+        .flatten()
+}
+
+pub(super) fn encode_key_event_checked(
+    key_encoder: &mut Encoder,
+    key_event: &mut Event,
+    terminal: &Terminal,
+    action: Action,
+    keystroke: &gpui::Keystroke,
+) -> crate::ghostty::Result<Option<Vec<u8>>> {
     let ghostty_key = convert_to_ghostty_key(keystroke);
     let ghostty_mods = convert_modifiers(&keystroke.modifiers);
     let printable_text = printable_text(keystroke, action);
@@ -33,8 +45,8 @@ pub(super) fn encode_key_event(
     key_encoder.set_options_from_terminal(terminal);
 
     let mut response = Vec::with_capacity(64);
-    key_encoder.encode_to_vec(key_event, &mut response).ok()?;
-    (!response.is_empty()).then_some(response)
+    key_encoder.encode_to_vec(key_event, &mut response)?;
+    Ok((!response.is_empty()).then_some(response))
 }
 
 fn printable_text(keystroke: &gpui::Keystroke, action: Action) -> Option<&str> {

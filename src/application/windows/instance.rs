@@ -6,7 +6,7 @@ use std::mem::size_of;
 use std::os::windows::ffi::OsStrExt;
 use std::ptr::{null, null_mut};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -283,7 +283,14 @@ fn write_all(pipe: HANDLE, mut bytes: &[u8]) -> io::Result<()> {
 pub struct ControlServer {
     descriptor: crate::control::Descriptor,
     stop: Arc<AtomicBool>,
+    active: Arc<AtomicUsize>,
     threads: Vec<JoinHandle<()>>,
+}
+struct ConnectionCount(Arc<AtomicUsize>);
+impl Drop for ConnectionCount {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl ControlServer {
@@ -303,6 +310,7 @@ impl ControlServer {
         let mut server = Self {
             descriptor,
             stop,
+            active: Arc::new(AtomicUsize::new(0)),
             threads: Vec::new(),
         };
         for _ in 0..crate::control::MAX_CONNECTIONS {
@@ -328,6 +336,7 @@ impl ControlServer {
             }
             let pipe = OwnedHandle::new(pipe);
             let stop = Arc::clone(&server.stop);
+            let active = Arc::clone(&server.active);
             let sender = sender.clone();
             let descriptor = server.descriptor.clone();
             server.threads.push(
@@ -342,10 +351,19 @@ impl ControlServer {
                                 continue;
                             }
                             let deadline = Instant::now() + Duration::from_secs(2);
+                            active.fetch_add(1,Ordering::AcqRel);
+                            let _connection = ConnectionCount(active.clone());
                             let result =
                                 read_control_frame(pipe.raw(), deadline, &stop).and_then(|bytes| {
-                                    let request: crate::control::Request =
-                                        serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+                                    let request: crate::control::Request = match serde_json::from_slice(&bytes) {
+                                        Ok(request)=>request,
+                                        Err(error)=>{
+                                            let value=serde_json::json!({"protocol_version":1,"request_id":null,"instance_id":descriptor.instance_id,"revision":null,"ok":false,"error":{"code":"invalid_request","message":error.to_string(),"effect":"none","details":{}}});
+                                            write_control_frame(pipe.raw(), &serde_json::to_vec(&value).map_err(io::Error::other)?, deadline, &stop)?;
+                                            let mut receipt=[0];
+                                            return control_io(pipe.raw(),&mut receipt,false,deadline,&stop);
+                                        }
+                                    };
                                     let deadline = Instant::now()
                                         + Duration::from_millis(request.timeout_ms.min(60000));
                                     let response = match crate::control::validate(
@@ -377,9 +395,14 @@ impl ControlServer {
                                                             Err(_)=>continue,
                                                         };
                                                         if value["type"] == "resync_required" {value["last_delivered_revision"]=last_revision.clone();}
+                                                        let mut bytes=serde_json::to_vec(&value).map_err(io::Error::other)?;
+                                                        if bytes.len()>crate::control::MAX_FRAME_BYTES {
+                                                            value=serde_json::json!({"protocol_version":crate::control::PROTOCOL_VERSION,"instance_id":descriptor.instance_id,"type":"resync_required","reason":"response_limit","last_delivered_revision":last_revision,"revision":value["revision"]});
+                                                            bytes=serde_json::to_vec(&value).map_err(io::Error::other)?;
+                                                        }
                                                         let terminal = value["type"] == "resync_required" || value["type"] == "end" || value["ok"] == false;
                                                         let io_deadline=Instant::now()+Duration::from_secs(2);
-                                                        write_control_frame(pipe.raw(), &serde_json::to_vec(&value).map_err(io::Error::other)?, io_deadline,&stop)?;
+                                                        write_control_frame(pipe.raw(), &bytes, io_deadline,&stop)?;
                                                         control_io(pipe.raw(), &mut [0u8],false,io_deadline,&stop)?;
                                                         last_revision=value["revision"].clone();
                                                         if terminal {return Ok(());}
@@ -429,9 +452,17 @@ impl ControlServer {
                                             }
                                         }
                                     };
+                                    let mut bytes=serde_json::to_vec(&response).map_err(io::Error::other)?;
+                                    if bytes.len()>crate::control::MAX_FRAME_BYTES {
+                                        let mut error=crate::control::ControlError::new("response_limit","response exceeds 2 MiB; request a smaller state subtree");
+                                        if !matches!(request.op.as_str(),"handshake"|"capabilities"|"profiles"|"state"|"pane.read"|"wait"|"snapshot") {error.effect="committed";}
+                                        error.details=Box::new(serde_json::json!({"limit":crate::control::MAX_FRAME_BYTES,"bytes":bytes.len(),"target":request.target}));
+                                        let mut failure=crate::control::reply(&request,0,Err(error));failure["revision"]=response["revision"].clone();
+                                        bytes=serde_json::to_vec(&failure).map_err(io::Error::other)?;
+                                    }
                                     write_control_frame(
                                         pipe.raw(),
-                                        &serde_json::to_vec(&response).map_err(io::Error::other)?,
+                                        &bytes,
                                         deadline + Duration::from_millis(250),
                                         &stop,
                                     )?;
@@ -466,6 +497,11 @@ impl ControlServer {
 
 impl Drop for ControlServer {
     fn drop(&mut self) {
+        // Let an already committed final-window close reply reach its client.
+        let deadline = Instant::now() + Duration::from_millis(250);
+        while self.active.load(Ordering::Acquire) > 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(2));
+        }
         self.stop.store(true, Ordering::Release);
         for thread in self.threads.drain(..) {
             let _ = thread.join();
@@ -504,7 +540,9 @@ fn process_creation_time(process: HANDLE) -> io::Result<String> {
     )
 }
 
-pub fn discover_control_instances() -> io::Result<Vec<crate::control::Descriptor>> {
+pub fn discover_control_instances(
+    instance: Option<&str>,
+) -> io::Result<Vec<crate::control::Descriptor>> {
     use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
     let identity = ProcessIdentity::current()?;
     let mut descriptors = Vec::new();
@@ -514,6 +552,9 @@ pub fn discover_control_instances() -> io::Result<Vec<crate::control::Descriptor
         Err(error) => return Err(error),
     };
     for entry in entries.flatten().take(256) {
+        if instance.is_some_and(|id| entry.file_name() != format!("{id}.json").as_str()) {
+            continue;
+        }
         if entry.path().extension().is_none_or(|v| v != "json") {
             continue;
         }
@@ -530,6 +571,7 @@ pub fn discover_control_instances() -> io::Result<Vec<crate::control::Descriptor
             continue;
         };
         if descriptor.protocol_version != crate::control::PROTOCOL_VERSION
+            || instance.is_some_and(|id| descriptor.instance_id != id)
             || descriptor.endpoint != control_pipe_name(&identity, &descriptor.instance_id)
         {
             continue;

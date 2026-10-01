@@ -188,7 +188,41 @@ impl Terminal {
                 let style = Style::from_raw(raw_style)?;
                 let foreground =
                     resolve_color(raw_style.fg_color, colors)?.unwrap_or(colors.foreground);
-                let background = resolve_color(raw_style.bg_color, colors)?;
+                let mut background = resolve_color(raw_style.bg_color, colors)?;
+                let mut content = ffi::CellContentTag::CODEPOINT;
+                from_result(unsafe {
+                    ffi::ghostty_cell_get(
+                        raw_cell,
+                        ffi::CellData::CONTENT_TAG,
+                        std::ptr::from_mut(&mut content).cast(),
+                    )
+                })?;
+                // Erased blank cells store their background in the cell, outside Style.
+                match content {
+                    ffi::CellContentTag::BG_COLOR_PALETTE => {
+                        let mut index = 0_u8;
+                        from_result(unsafe {
+                            ffi::ghostty_cell_get(
+                                raw_cell,
+                                ffi::CellData::COLOR_PALETTE,
+                                std::ptr::from_mut(&mut index).cast(),
+                            )
+                        })?;
+                        background = Some(colors.palette[index as usize]);
+                    }
+                    ffi::CellContentTag::BG_COLOR_RGB => {
+                        let mut rgb = ffi::ColorRgb::default();
+                        from_result(unsafe {
+                            ffi::ghostty_cell_get(
+                                raw_cell,
+                                ffi::CellData::COLOR_RGB,
+                                std::ptr::from_mut(&mut rgb).cast(),
+                            )
+                        })?;
+                        background = Some(rgb.into());
+                    }
+                    _ => {}
+                }
                 cells.push(DiagnosticCell {
                     column,
                     text,
@@ -259,5 +293,16 @@ mod tests {
         let limited = terminal.diagnostic_rows(false, 100, 1, &colors).unwrap();
         assert!(limited.truncated);
         assert!(limited.rows.is_empty());
+        terminal.vt_write(b"\x1b[48;2;12;34;56m\x1b[2J\x1b[H");
+        let colors = state.update(&terminal).unwrap().colors().unwrap();
+        let blanks = terminal.diagnostic_rows(true, 2, 65536, &colors).unwrap();
+        assert_eq!(
+            blanks.rows[0].cells[0].background,
+            Some(RgbColor {
+                r: 12,
+                g: 34,
+                b: 56
+            })
+        );
     }
 }

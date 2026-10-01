@@ -335,7 +335,7 @@ pub fn read_saved(instance: Option<&str>, directory: Option<&str>) -> Result<Val
     let root = directory.map_or_else(root_directory, |path| {
         PathBuf::from(path).join("diagnostics")
     });
-    let mut states = Vec::new();
+    let mut latest: Option<Value> = None;
     for entry in std::fs::read_dir(&root)
         .map_err(|e| e.to_string())?
         .flatten()
@@ -345,18 +345,20 @@ pub fn read_saved(instance: Option<&str>, directory: Option<&str>) -> Result<Val
             continue;
         }
         let path = entry.path().join("state.json");
-        if std::fs::metadata(&path).is_ok_and(|m| m.len() > crate::control::MAX_FRAME_BYTES as u64)
-        {
+        if std::fs::metadata(&path).is_ok_and(|m| m.len() > 32 * 1024 * 1024) {
             continue;
         }
         if let Ok(bytes) = std::fs::read(path)
             && let Ok(value) = serde_json::from_slice::<Value>(&bytes)
+            && value["schema_version"] == 1
+            && latest
+                .as_ref()
+                .is_none_or(|old| value["started_at"].as_str() > old["started_at"].as_str())
         {
-            states.push(value);
+            latest = Some(value);
         }
     }
-    states.sort_by(|a, b| a["started_at"].as_str().cmp(&b["started_at"].as_str()));
-    let mut state = states.pop().ok_or("no saved instance state")?;
+    let mut state = latest.ok_or("no compatible saved instance state")?;
     state["source"] = json!("saved");
     Ok(state)
 }

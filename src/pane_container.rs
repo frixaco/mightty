@@ -253,7 +253,7 @@ impl PaneContainer {
                 if request.target.pane_id.is_none() {return Ok(self.control_state(window,cx)["tabs"][index].clone());}
                 let mut result=terminal.read(cx).control_state();result["tab_id"]=json!(format!("t{}",self.tabs[index].id.value()));result["pane_id"]=json!(format!("p{}",pane.value()));result["output_cursor"]=json!(format!("{}:p{}:{}",crate::control::instance_id(),pane.value(),result["output_seq"].as_str().unwrap()));Ok(result)
             }
-            "pane.read" => {let (index,pane,terminal)=self.control_target(&request.target,cx)?;let mut result=terminal.update(cx,|terminal,_|terminal.control_read(request))?;
+            "pane.read" => {let (index,pane,terminal)=self.targeted_terminal(request,cx)?;let mut result=terminal.update(cx,|terminal,_|terminal.control_read(request))?;
                 result["tab_id"]=json!(format!("t{}",self.tabs[index].id.value()));result["pane_id"]=json!(format!("p{}",pane.value()));result["output_cursor"]=json!(format!("{}:p{}:{}",crate::control::instance_id(),pane.value(),result["output_seq"].as_str().unwrap()));Ok(result)}
             _ => self.control_mutation(request,window,cx),
         }
@@ -825,7 +825,12 @@ impl PaneContainer {
                             cx.notify();
                         }
                         ReloadOutcome::Rejected(diagnostic) => {
-                            eprintln!("Settings reload failed: {diagnostic}");
+                            crate::diagnostics::record(
+                                "settings",
+                                "reload_rejected",
+                                &diagnostic.to_string(),
+                                serde_json::json!({"window_id":this.window_id}),
+                            );
                             cx.notify();
                         }
                     })

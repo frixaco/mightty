@@ -457,8 +457,10 @@ fn start_windows_application(
     .detach();
 
     let shutdown_controller = Rc::clone(&controller);
-    cx.on_app_quit(move |_| {
-        shutdown_controller.borrow_mut().shutdown();
+    cx.on_app_quit(move |cx| {
+        let mut controller = shutdown_controller.borrow_mut();
+        controller.publish_diagnostics(cx, true);
+        controller.shutdown();
         async {}
     })
     .detach();
@@ -569,6 +571,14 @@ impl WindowsApplication {
                 cx.spawn(async move |_| {
                     loop {
                         let result = match mightty::diagnostics::outcome(&request.target) {
+                            Some(outcome)
+                                if outcome["processes"]["availability"] == "unavailable" =>
+                            {
+                                Some(Err(ControlError::new(
+                                    "unavailable",
+                                    "root process observation unavailable",
+                                )))
+                            }
                             Some(outcome) if outcome["processes"]["lifecycle"] == "exited" => Some(
                                 Ok(json!({"condition":"process-exited","observation":outcome})),
                             ),
@@ -647,6 +657,9 @@ impl WindowsApplication {
             self.subscribers.push(dispatch.reply.clone());
             return None;
         }
+        if request.op == "profiles" {
+            return Some(reply(request,self.control_revision,Ok(json!(self.settings.current().profiles.iter().map(|(id,profile)|json!({"profile_id":id.as_str(),"label":profile.label,"executable":profile.launch.executable,"argv":profile.launch.arguments.iter().map(|v|v.to_string_lossy()).collect::<Vec<_>>(),"working_directory":profile.launch.working_directory})).collect::<Vec<_>>()))));
+        }
         if request.op == "capabilities" {
             return Some(reply(
                 request,
@@ -720,9 +733,6 @@ impl WindowsApplication {
                 ));
             }
             let handle = gpui::AnyWindowHandle::from(*handle);
-            let baseline = handle
-                .update(cx, |_, window, _| window.presented_frame_id())
-                .unwrap_or(0);
             if mode == "next" {
                 let ready = handle
                     .update(cx, |_, window, cx| {
@@ -762,7 +772,7 @@ impl WindowsApplication {
             };
             let panes = panes.clone();
             cx.spawn(async move |cx| {
-                let mut baseline = baseline;
+                let mut baseline = 0;
                 let mut requested = false;
                 let prepared = loop {
                     if let Some(prepared) = immediate.take() {
@@ -780,12 +790,21 @@ impl WindowsApplication {
                             );
                         }
                         if !requested {
-                            baseline = window.presented_frame_id();
+                            baseline = window
+                                .prepared_metadata()
+                                .and_then(|data| data.downcast::<mightty::snapshot::Frame>().ok())
+                                .and_then(|frame| frame.scene_revision.parse::<u64>().ok())
+                                .unwrap_or(0);
                             window.refresh();
                             requested = true;
                             return None;
                         }
-                        if !next || window.presented_frame_id() > baseline {
+                        let fresh_scene = window
+                            .presented_metadata()
+                            .and_then(|data| data.downcast::<mightty::snapshot::Frame>().ok())
+                            .and_then(|frame| frame.scene_revision.parse::<u64>().ok())
+                            .is_some_and(|revision| revision > baseline);
+                        if !next || fresh_scene {
                             Some(mightty::snapshot::acquire_presented(&request, window))
                         } else {
                             None
@@ -875,6 +894,7 @@ impl WindowsApplication {
                 Ok(sequence) => sequence,
                 Err(error) => return Some(reply(request, self.control_revision, Err(error))),
             };
+            let panes = panes.clone();
             let request = request.clone();
             let deadline = dispatch.deadline;
             let sender = dispatch.reply.clone();
@@ -888,6 +908,9 @@ impl WindowsApplication {
                             if cancelled {
                                 Err(sequence.cancel(window, cx))
                             } else {
+                                sequence
+                                    .receiving_targets
+                                    .push(panes.read(cx).receiving_focus(window, cx));
                                 sequence.next(window, cx)
                             }
                         })
@@ -952,14 +975,15 @@ impl WindowsApplication {
                         break;
                     }
                     Timer::after(Duration::from_millis(15)).await;
-                    let result = handle
-                        .update(cx, |_, window, cx| {
-                            panes.update(cx, |panes, cx| {
-                                panes.probe_control_wait(&mut wait, window, cx)
-                            })
+                    let observed = handle.update(cx, |_, window, cx| {
+                        panes.update(cx, |panes, cx| {
+                            panes.probe_control_wait(&mut wait, window, cx)
                         })
-                        .map_err(|e| ControlError::new("window_closed", e.to_string()))
-                        .and_then(|r| r);
+                    });
+                    let result = match observed {
+                        Ok(result) => result,
+                        Err(_) => wait.probe_removed_window(),
+                    };
                     let completion = match result {
                         Ok(Some(value)) => Some(Ok(value)),
                         Err(error) => Some(Err(error)),
@@ -1043,6 +1067,7 @@ impl WindowsApplication {
                                 deadline,
                             )
                             .await;
+                            mightty::diagnostics::record_control(&request, &response);
                             let _ = sender.try_send(response);
                             break;
                         }
@@ -1148,7 +1173,12 @@ impl WindowsApplication {
         match self.settings.reload_if_changed() {
             ReloadOutcome::Applied { .. } => self.apply_settings(cx),
             ReloadOutcome::Rejected(diagnostic) => {
-                eprintln!("Application settings reload failed: {diagnostic}");
+                mightty::diagnostics::record(
+                    "settings",
+                    "reload_rejected",
+                    &diagnostic.to_string(),
+                    serde_json::json!({"instance_id":mightty::control::instance_id()}),
+                );
             }
             ReloadOutcome::Unchanged => {}
         }

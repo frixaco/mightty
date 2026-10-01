@@ -953,6 +953,17 @@ impl Window {
     pub fn presented_frame_id(&self) -> u64 {
         self.platform_window.presented_frame_id()
     }
+    /// Metadata for the latest prepared scene, which may not yet be presented.
+    pub fn prepared_metadata(&self) -> Option<Arc<dyn Any + Send + Sync>> {
+        self.capture_metadata.clone()
+    }
+    /// Metadata for the latest successful presentation, without acquiring pixels.
+    pub fn presented_metadata(&self) -> Option<Arc<dyn Any + Send + Sync>> {
+        self.presented_metadata
+            .borrow()
+            .as_ref()
+            .map(|(_, metadata)| metadata.clone())
+    }
     /// Paint an owned element tree on a private scratch window, without presentation.
     /// The caller must not use a live application window for this operation.
     pub fn capture_element(

@@ -391,7 +391,13 @@ pub fn write(
             Ok(()) => {
                 statuses.insert("diagnostics.ndjson".into(), json!({"status":"complete"}));
             }
-            Err(error) => errors.push(error.to_string()),
+            Err(error) => {
+                errors.push(error.to_string());
+                statuses.insert(
+                    "diagnostics.ndjson".into(),
+                    json!({"status":"error","message":error.to_string()}),
+                );
+            }
         }
         if let Err(error) = std::fs::create_dir(temporary.join("panes")) {
             errors.push(error.to_string());
@@ -409,8 +415,14 @@ pub fn write(
                     Ok(()) => {
                         statuses.insert(name, json!({"status":"complete"}));
                     }
-                    Err(error) => errors.push(error.to_string()),
+                    Err(error) => {
+                        errors.push(error.to_string());
+                        statuses
+                            .insert(name, json!({"status":"error","message":error.to_string()}));
+                    }
                 }
+            } else if let Some(id) = pane.state["pane_id"].as_str() {
+                statuses.insert(format!("panes/{id}.txt"), json!({"status":"unavailable","reason":"source cells unavailable or over budget"}));
             }
         }
         let status = if errors.is_empty() {

@@ -1,7 +1,7 @@
 //! One sampler owns duplicate root handles, so exit remains observable after pane removal.
 use super::*;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     os::windows::io::{AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle},
     sync::{OnceLock, Weak},
     time::{Duration, Instant},
@@ -15,7 +15,7 @@ use windows_sys::Win32::{
         },
         Threading::{
             GetExitCodeProcess, GetProcessId, GetProcessTimes, OpenProcess,
-            PROCESS_QUERY_LIMITED_INFORMATION, WaitForSingleObject,
+            PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW, WaitForSingleObject,
         },
     },
 };
@@ -24,6 +24,7 @@ struct Watch {
     handle: OwnedHandle,
     pid: u32,
     creation: String,
+    executable: Option<String>,
     observation: Weak<Mutex<Value>>,
 }
 struct Sampler {
@@ -41,9 +42,10 @@ pub fn watch_process(handle: BorrowedHandle<'_>) -> Result<RootProcess, String> 
         return Err(std::io::Error::last_os_error().to_string());
     }
     let creation = creation_time(raw).map_err(|e| e.to_string())?;
+    let executable = executable_path(raw);
     let identity = json!({"pid":pid,"creation_time":creation});
     let observation = Arc::new(Mutex::new(
-        json!({"identity":identity,"availability":"pending","lifecycle":"unknown","sampled_at":null,"descendants":[]}),
+        json!({"identity":identity,"executable":executable,"availability":"pending","lifecycle":"unknown","sampled_at":null,"descendants":[]}),
     ));
     let sampler=SAMPLER.get_or_init(|| {
         let (sender,receiver)=flume::bounded(256);let stop=Arc::new(AtomicBool::new(false));let worker_stop=Arc::clone(&stop);
@@ -62,21 +64,24 @@ pub fn watch_process(handle: BorrowedHandle<'_>) -> Result<RootProcess, String> 
                     let known_exit=exited&&unsafe {GetExitCodeProcess(raw,&mut exit_code)}!=0;
                     let mut descendants=Vec::new();let mut covered=true;
                     if let Ok(entries)=&processes && !exited {
-                        let mut selected=vec![watch.pid];
+                        let mut selected=BTreeMap::from([(watch.pid, watch.creation.parse::<u64>().unwrap_or(0))]);
+                        let mut visited=BTreeSet::from([watch.pid]);
                         for _ in 0..entries.len().min(512){
-                            let children=entries.iter().filter(|(pid,(parent,_))|!selected.contains(pid)&&selected.contains(parent)).map(|(pid,_)|*pid).collect::<Vec<_>>();
+                            let children=entries.iter().filter(|(pid,(parent,_))|!visited.contains(pid)&&selected.contains_key(parent)).map(|(pid,_)|*pid).collect::<Vec<_>>();
                             if children.is_empty(){break;}
                             for pid in children.into_iter().take(child_budget.min(128usize.saturating_sub(descendants.len()))) {
-                                selected.push(pid);let (parent,executable)=&entries[&pid];
+                                visited.insert(pid);
+                                let (parent,executable)=&entries[&pid];
                                 let raw=unsafe {OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,0,pid)};
                                 let birth=if raw.is_null(){None}else{let handle=unsafe {OwnedHandle::from_raw_handle(raw.cast())};creation_time(handle.as_raw_handle() as HANDLE).ok()};
-                                if birth.as_ref().is_some_and(|birth|birth.parse::<u64>().unwrap_or(0)<watch.creation.parse::<u64>().unwrap_or(0)){continue;}
+                                if birth.as_ref().is_some_and(|birth|birth.parse::<u64>().unwrap_or(0)<selected[parent]){continue;}
+                                if let Some(birth)=&birth {selected.insert(pid,birth.parse::<u64>().unwrap_or(0));}else{covered=false;}
                                 descendants.push(json!({"pid":pid,"parent_pid":parent,"executable":executable,"creation_time":birth,"identity_verified":birth.is_some()}));child_budget-=1;
                             }
                             if descendants.len()>=128||child_budget==0{covered=false;break;}
                         }
                     }else{covered=false;}
-                    *observation.lock().unwrap_or_else(|p|p.into_inner())=json!({"identity":{"pid":watch.pid,"creation_time":watch.creation},"availability":"observed","sampled_at":time,"lifecycle":if exited{"exited"}else{"running"},"exit_code":if known_exit{Some(exit_code)}else{None},"descendants":descendants,"coverage":{"local_windows_only":true,"complete":false,"truncated_or_unavailable":!covered,"enumeration_error":processes.as_ref().err().map(ToString::to_string)}});
+                    *observation.lock().unwrap_or_else(|p|p.into_inner())=json!({"identity":{"pid":watch.pid,"creation_time":watch.creation},"executable":watch.executable,"executable_availability":if watch.executable.is_some(){"observed"}else{"unavailable"},"availability":"observed","sampled_at":time,"lifecycle":if exited{"exited"}else{"running"},"exit_code":if known_exit{Some(exit_code)}else{None},"descendants":descendants,"coverage":{"local_windows_only":true,"complete":false,"truncated_or_unavailable":!covered,"enumeration_error":processes.as_ref().err().map(ToString::to_string)}});
                 }
                 mark_dirty();
             }
@@ -89,6 +94,7 @@ pub fn watch_process(handle: BorrowedHandle<'_>) -> Result<RootProcess, String> 
             handle,
             pid,
             creation,
+            executable,
             observation: Arc::downgrade(&observation),
         })
         .map_err(|_| "process sampler queue full".to_string())?;
@@ -111,6 +117,12 @@ pub fn stop_sampler() {
     }
 }
 
+fn executable_path(handle: HANDLE) -> Option<String> {
+    let mut buffer = vec![0_u16; 4096];
+    let mut length = buffer.len() as u32;
+    (unsafe { QueryFullProcessImageNameW(handle, 0, buffer.as_mut_ptr(), &mut length) } != 0)
+        .then(|| String::from_utf16_lossy(&buffer[..length as usize]))
+}
 fn creation_time(handle: HANDLE) -> std::io::Result<String> {
     let mut times = [FILETIME::default(); 4];
     if unsafe {

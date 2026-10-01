@@ -90,6 +90,10 @@ pub enum TerminalClipboardPolicy {
 }
 
 /// Terminal widget configuration
+fn launch_context(launch: &LaunchSpec) -> serde_json::Value {
+    serde_json::json!({"instance_id":crate::control::instance_id(),"window_id":launch.environment.get(std::ffi::OsStr::new("MIGHTTY_WINDOW_ID")).map(|v|v.to_string_lossy()),"tab_id":launch.environment.get(std::ffi::OsStr::new("MIGHTTY_TAB_ID")).map(|v|v.to_string_lossy()),"pane_id":launch.environment.get(std::ffi::OsStr::new("MIGHTTY_PANE_ID")).map(|v|v.to_string_lossy())})
+}
+
 #[derive(Debug, Clone)]
 pub struct TerminalConfig {
     pub launch: LaunchSpec,
@@ -241,7 +245,12 @@ impl TerminalWidget {
             let launch = match crate::shell_integration::prepare_launch(&config.launch) {
                 Ok(launch) => launch,
                 Err(error) => {
-                    eprintln!("Failed to prepare shell integration: {error}");
+                    crate::diagnostics::record(
+                        "startup",
+                        "shell_integration_failed",
+                        &error.to_string(),
+                        launch_context(&config.launch),
+                    );
                     config.launch.clone()
                 }
             };
@@ -256,12 +265,11 @@ impl TerminalWidget {
                     (Some(worker), Some(event_rx), Some(command_tx))
                 }
                 Err(err) => {
-                    eprintln!("Failed to spawn shell: {err}");
                     crate::diagnostics::record(
-                        "pty",
+                        "startup",
                         "launch_failed",
                         &err.to_string(),
-                        serde_json::json!({"executable":config.launch.executable}),
+                        launch_context(&config.launch),
                     );
                     exit_flag.store(true, Ordering::Relaxed);
                     (None, None, None)
@@ -756,7 +764,12 @@ impl TerminalWidget {
                 self.mark_exited();
             }
             PtyEvent::IoFailed(error) => {
-                crate::diagnostics::record("pty", "io_failed", &error, serde_json::json!({}));
+                crate::diagnostics::record(
+                    "pty",
+                    "io_failed",
+                    &error,
+                    launch_context(&self.config.launch),
+                );
                 self.io_error = Some(error);
                 self.mark_exited();
             }
@@ -771,7 +784,12 @@ impl TerminalWidget {
                     self.reported_title = title.clone();
                     cx.emit(TerminalEvent::TitleChanged(title));
                 }
-                Err(error) => eprintln!("Ignored invalid terminal title: {error}"),
+                Err(error) => crate::diagnostics::record(
+                    "terminal",
+                    "invalid_title",
+                    &error.to_string(),
+                    launch_context(&self.config.launch),
+                ),
             }
         }
         if let Some(working_directory) = effects.working_directory {
@@ -780,7 +798,12 @@ impl TerminalWidget {
                     self.reported_working_directory = Some(working_directory.clone());
                     cx.emit(TerminalEvent::WorkingDirectoryChanged(working_directory));
                 }
-                Err(error) => eprintln!("Ignored invalid terminal working directory: {error}"),
+                Err(error) => crate::diagnostics::record(
+                    "terminal",
+                    "invalid_working_directory",
+                    &error.to_string(),
+                    launch_context(&self.config.launch),
+                ),
             }
         }
         if effects.bell {
@@ -792,7 +815,12 @@ impl TerminalWidget {
         if let Some(tx) = &self.pty_tx
             && let Err(error) = tx.send(command)
         {
-            eprintln!("Cannot enqueue PTY command: {error}");
+            crate::diagnostics::record(
+                "pty",
+                "command_failed",
+                error,
+                launch_context(&self.config.launch),
+            );
         }
     }
 
@@ -831,14 +859,33 @@ impl TerminalWidget {
         if self.geometry_dirty || cols != self.size.0 || rows != self.size.1 {
             let cell_width: f32 = self.cell_size.0.into();
             let cell_height: f32 = self.cell_size.1.into();
-            if self
-                .terminal
-                .resize(cols, rows, cell_width as u32, cell_height as u32)
-                .is_ok()
+            let (reply, ack) = flume::bounded(1);
+            if let Err(error) =
+                self.terminal
+                    .resize(cols, rows, cell_width as u32, cell_height as u32)
+            {
+                self.geometry_dirty = true;
+                crate::diagnostics::record(
+                    "layout",
+                    "terminal_resize_failed",
+                    &error.to_string(),
+                    serde_json::json!({"cols":cols,"rows":rows}),
+                );
+                let _ = reply.try_send(crate::control::Acknowledgement {
+                    written_bytes: 0,
+                    error: Some(error.to_string()),
+                });
+                return Some(ack);
+            }
             {
                 self.size = (cols, rows);
                 self.geometry_dirty = false;
-                let (reply, ack) = flume::bounded(1);
+                if self.pty_tx.is_none() {
+                    let _ = reply.try_send(crate::control::Acknowledgement {
+                        written_bytes: 0,
+                        error: Some("PTY unavailable".into()),
+                    });
+                }
                 if let Some(tx) = &self.pty_tx
                     && let Err(error) = tx.send(PtyCommand::ResizeAck(
                         PtySize::new(rows, cols),

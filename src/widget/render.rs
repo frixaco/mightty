@@ -125,17 +125,20 @@ impl TerminalWidget {
             let _ = self.resize_to_size(layout_size, cx);
         }
 
-        let mut observation = offscreen
-            .then(crate::ghostty::RenderState::new)
-            .transpose()
-            .expect("render snapshot allocation");
-        let snapshot = match if let Some(state) = &mut observation {
-            state.observe(&self.terminal)
-        } else {
-            self.render_state.update(&self.terminal)
+        let mut observation = offscreen.then(crate::ghostty::RenderState::new).transpose();
+        let snapshot = match match &mut observation {
+            Ok(Some(state)) => state.observe(&self.terminal),
+            Ok(None) => self.render_state.update(&self.terminal),
+            Err(error) => Err(*error),
         } {
             Ok(s) => s,
-            Err(_) => {
+            Err(error) => {
+                crate::diagnostics::record(
+                    "render",
+                    "state_failed",
+                    &error.to_string(),
+                    super::launch_context(&self.config.launch),
+                );
                 return div()
                     .size_full()
                     .bg(self.theme.background)
@@ -162,7 +165,12 @@ impl TerminalWidget {
         let graphics = match self.graphics_renderer.frame(&self.terminal, cell_size) {
             Ok(frame) => frame,
             Err(error) => {
-                eprintln!("Failed to update terminal graphics: {error}");
+                crate::diagnostics::record(
+                    "render",
+                    "graphics_failed",
+                    &error.to_string(),
+                    super::launch_context(&self.config.launch),
+                );
                 Default::default()
             }
         };
