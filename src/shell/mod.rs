@@ -41,12 +41,20 @@ pub(crate) fn cancel_io(thread: &std::thread::JoinHandle<()>) {
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
+#[cfg(not(feature = "portable-pty-experiment"))]
 pub use windows::{PtyControl, PtyError, PtyInput, PtyOutput, PtyParts, is_conpty_available};
 
 #[cfg(unix)]
 mod unix;
 #[cfg(unix)]
 pub use unix::{PtyControl, PtyError, PtyInput, PtyOutput, PtyParts, is_conpty_available};
+
+#[cfg(all(feature = "portable-pty-experiment", windows))]
+mod experiment;
+#[cfg(all(feature = "portable-pty-experiment", windows))]
+pub use experiment::{PtyControl, PtyInput, PtyOutput, PtyParts};
+#[cfg(all(feature = "portable-pty-experiment", windows))]
+pub use windows::{PtyError, is_conpty_available};
 
 #[cfg(not(any(windows, unix)))]
 compile_error!("mightty shell bridge supports Windows and Unix targets only");

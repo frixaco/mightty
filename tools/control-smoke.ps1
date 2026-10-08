@@ -1,11 +1,17 @@
-param([string]$Executable = "$PSScriptRoot/../target/debug/mightty.exe", [switch]$UiOnly, [switch]$SnapshotOnly, [switch]$OutputStress, [switch]$Amp, [switch]$PresentationOnly, [ValidateRange(1,3)][int]$AmpPanes = 1)
+param([string]$Executable = "$PSScriptRoot/../target/debug/mightty.exe", [switch]$UiOnly, [switch]$SnapshotOnly, [switch]$OutputStress, [switch]$Amp, [switch]$PresentationOnly, [switch]$ExplicitTitle, [ValidateRange(1,3)][int]$AmpPanes = 1)
 $ErrorActionPreference = 'Stop'
 $Executable = (Resolve-Path -LiteralPath $Executable).Path
 $caseDirectory = Join-Path ([System.IO.Path]::GetTempPath()) ('mightty-control-' + [guid]::NewGuid())
 New-Item -ItemType Directory -Path $caseDirectory | Out-Null
+$fixtureArguments = @('-NoLogo', '-NoProfile')
+if ($ExplicitTitle) {
+    # A newer ConPTY engine need not synthesize a title for the shell. Exercise
+    # title provenance using an actual OSC title supplied by the fixture.
+    $fixtureArguments += @('-NoExit', '-Command', "[Console]::Write([char]27 + ']0;Control fixture' + [char]7)")
+}
 @{
     default_profile = 'fixture'
-    profiles = @(@{ id = 'fixture'; label = 'Control fixture'; executable = 'pwsh.exe'; arguments = @('-NoLogo', '-NoProfile') })
+    profiles = @(@{ id = 'fixture'; label = 'Control fixture'; executable = 'pwsh.exe'; arguments = $fixtureArguments })
     terminal = @{ cursor_blink = $false }
     app = @{ quick_terminal = @{ enabled = $true; hide_on_focus_loss = $false } }
     key_bindings = @(@{ chord = 'ctrl-alt-q'; action = @{ type = 'toggle_quick_terminal' } })
@@ -404,7 +410,8 @@ $stream.Flush()
     $settings | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $caseDirectory 'settings.json') -Encoding utf8NoBOM
     $null = Invoke-Control @('wait', '--window', 'w1', '--condition', 'settings-generation', '--at-least', '2', '--timeout', '10s')
     $provenance = Invoke-Control @('state', '--pane', $pane)
-    if ($provenance.launch.settings_generation -ne '1' -or $provenance.effective_settings.font_size_px -ne 16 -or $provenance.effective_settings.bindings_generation -ne '2' -or !$provenance.title.observed_at -or !$provenance.terminal_status.value.cursor_visible) { throw 'State lost effective settings, title provenance, or terminal status' }
+    $provenance | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath (Join-Path $caseDirectory 'provenance.json') -Encoding utf8NoBOM
+    if ($provenance.launch.settings_generation -ne '1' -or $provenance.effective_settings.font_size_px -ne 16 -or $provenance.effective_settings.bindings_generation -ne '2' -or !$provenance.title.observed_at -or !$provenance.terminal_status.value.cursor_visible) { throw "State lost effective settings, title provenance, or terminal status; artifacts: $caseDirectory/provenance.json" }
     $text = Invoke-Control @('pane', 'read', '--pane', $pane, '--tail', '100')
     if ($text.source -ne 'active_buffer_tail') { throw 'Read source mislabeled' }
     $bad = & $Executable ctl pane read --pane p999999 --instance $instance[0].instance_id --json | ConvertFrom-Json

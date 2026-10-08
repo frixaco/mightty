@@ -172,6 +172,14 @@ impl PtyParts {
     /// # }
     /// ```
     pub fn spawn(launch: &LaunchSpec, size: PtySize) -> Result<Self, PtyError> {
+        Self::spawn_with_flags(launch, size, 0)
+    }
+
+    pub(crate) fn spawn_with_flags(
+        launch: &LaunchSpec,
+        size: PtySize,
+        flags: u32,
+    ) -> Result<Self, PtyError> {
         if !size.is_valid() {
             return Err(PtyError::InvalidDimensions);
         }
@@ -190,7 +198,7 @@ impl PtyParts {
                 coord,
                 pty_input.read.raw(),
                 pty_output.write.raw(),
-                0,
+                flags,
                 &mut pty_handle,
             );
 

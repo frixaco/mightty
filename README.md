@@ -281,7 +281,12 @@ packaging/windows/       # MSIX, AppInstaller, and COM proxy inputs
 shell-integration/       # PowerShell and Bash integration resources
 ```
 
+An optional [portable-pty experiment](docs/pty-experiment.md) compares the existing
+bridge with WezTerm's library using real shells, the GUI, protocol probes, and
+shutdown stress tests. Native remains the default.
+
 ## License
+
 
 Project code is MIT-licensed. Adapted code and third-party attribution are
 recorded in [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).

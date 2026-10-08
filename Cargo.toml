@@ -10,6 +10,8 @@ path = "src/lib.rs"
 [features]
 # Opt into Ghostty's expensive page integrity audits when debugging its core.
 ghostty-debug = []
+# Research backend; native remains the default even when this feature is built.
+portable-pty-experiment = ["dep:portable-pty", "windows-sys/Win32_System_LibraryLoader"]
 
 [[bin]]
 name = "mightty"
@@ -24,6 +26,7 @@ raw-window-handle = "0.6"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 url = "2"
+portable-pty = { version = "=0.9.0", optional = true }
 
 [patch.crates-io]
 gpui = { path = "vendor/gpui" }
