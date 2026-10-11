@@ -84,6 +84,8 @@ pub struct PaneContainer {
     active_tab_index: usize,
     sidebar_visible: bool,
     label_geometry: std::rc::Rc<std::cell::RefCell<BTreeMap<u64, serde_json::Value>>>,
+    /// Adapter description for frame metadata. Querying it can load vendor driver libraries.
+    gpu_specs: std::cell::OnceCell<serde_json::Value>,
     /// Sidebar row under the pointer, by tab id; it shows a close button.
     hovered_tab: Option<u64>,
     needs_focus: bool,
@@ -334,6 +336,7 @@ impl PaneContainer {
             active_tab_index: 0,
             sidebar_visible,
             label_geometry: Default::default(),
+            gpu_specs: Default::default(),
             hovered_tab: None,
             needs_focus: true,
             titlebar_visible,

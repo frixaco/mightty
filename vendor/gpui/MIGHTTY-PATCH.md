@@ -19,6 +19,11 @@ through the same scene renderer without presentation. Other backends report
 unsupported capture. Window hooks associate immutable application metadata with
 the prepared scene and the exact successful presentation identity.
 
+The Windows vsync thread invalidates only visible, non-minimized windows. A
+minimized window parks its frame callback, so each invalidation fell through to
+an iconic `DefWindowProcW` paint 60 times a second; Windows repaints a window
+when it is restored or shown.
+
 Cheap metadata getters let `next` wait for a newly prepared scene's successful
 presentation. A repeated native present can increment the frame ID without
 preparing new application content, so frame ID alone is not a redraw barrier.

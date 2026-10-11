@@ -163,7 +163,7 @@ impl PaneContainer {
             scene_revision: revision.to_string(),
             prepared_at: crate::diagnostics::timestamp(),
             dpi_scale: window.scale_factor(),
-            window: json!({"bounds":{"width":f32::from(window.viewport_size().width),"height":f32::from(window.viewport_size().height)},"layout_token":self.window_layout_token(window,cx),"active_tab_id":format!("t{}",tab.id.value()),"tab_layout_token":tab.split.read(cx).layout_token(tab.id),"content_bounds":self.content_bounds.map(crate::snapshot::rect),"sidebar_visible":self.sidebar_visible,"palette":self.palette.as_ref().map(|palette|json!({"query":palette.query,"selected":palette.selected})),"gpu":window.gpu_specs(),"settings_generation":self.settings.generation().to_string(),"settings":{"app":self.settings.current().app,"key_bindings":self.settings.current().key_bindings}}),
+            window: json!({"bounds":{"width":f32::from(window.viewport_size().width),"height":f32::from(window.viewport_size().height)},"layout_token":self.window_layout_token(window,cx),"active_tab_id":format!("t{}",tab.id.value()),"tab_layout_token":tab.split.read(cx).layout_token(tab.id),"content_bounds":self.content_bounds.map(crate::snapshot::rect),"sidebar_visible":self.sidebar_visible,"palette":self.palette.as_ref().map(|palette|json!({"query":palette.query,"selected":palette.selected})),"gpu":self.gpu_specs.get_or_init(|| json!(window.gpu_specs())),"settings_generation":self.settings.generation().to_string(),"settings":{"app":self.settings.current().app,"key_bindings":self.settings.current().key_bindings}}),
             panes,
             labels,
         })

@@ -320,10 +320,7 @@ impl ControlServer {
                 CreateNamedPipeW(
                     pipe_name.as_ptr(),
                     windows_sys::Win32::Storage::FileSystem::PIPE_ACCESS_DUPLEX,
-                    PIPE_TYPE_BYTE
-                        | PIPE_READMODE_BYTE
-                        | windows_sys::Win32::System::Pipes::PIPE_NOWAIT
-                        | PIPE_REJECT_REMOTE_CLIENTS,
+                    PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
                     crate::control::MAX_CONNECTIONS as u32,
                     65536,
                     65536,
@@ -344,12 +341,20 @@ impl ControlServer {
                     .name("mightty-control".into())
                     .spawn(move || {
                         while !stop.load(Ordering::Acquire) {
+                            // Block until a client connects; `Drop` connects to wake listeners.
                             let connected = unsafe { ConnectNamedPipe(pipe.raw(), null_mut()) };
                             let error = unsafe { GetLastError() };
                             if connected == 0 && error != ERROR_PIPE_CONNECTED {
+                                unsafe { DisconnectNamedPipe(pipe.raw()) };
                                 thread::sleep(Duration::from_millis(5));
                                 continue;
                             }
+                            if stop.load(Ordering::Acquire) {
+                                unsafe { DisconnectNamedPipe(pipe.raw()) };
+                                break;
+                            }
+                            // Control I/O polls against deadlines, so the connection is non-blocking.
+                            set_pipe_mode(pipe.raw(), windows_sys::Win32::System::Pipes::PIPE_NOWAIT);
                             let deadline = Instant::now() + Duration::from_secs(2);
                             active.fetch_add(1,Ordering::AcqRel);
                             let _connection = ConnectionCount(active.clone());
@@ -475,6 +480,7 @@ impl ControlServer {
                             unsafe {
                                 DisconnectNamedPipe(pipe.raw());
                             }
+                            set_pipe_mode(pipe.raw(), PIPE_WAIT);
                         }
                     })?,
             );
@@ -503,7 +509,26 @@ impl Drop for ControlServer {
             thread::sleep(Duration::from_millis(2));
         }
         self.stop.store(true, Ordering::Release);
+        let pipe_name = wide_null(&self.descriptor.endpoint);
         for thread in self.threads.drain(..) {
+            // Each client connection wakes one listener blocked in `ConnectNamedPipe`.
+            while !thread.is_finished() {
+                let handle = unsafe {
+                    CreateFileW(
+                        pipe_name.as_ptr(),
+                        GENERIC_WRITE,
+                        0,
+                        null(),
+                        OPEN_EXISTING,
+                        FILE_ATTRIBUTE_NORMAL,
+                        null_mut(),
+                    )
+                };
+                if handle != INVALID_HANDLE_VALUE {
+                    drop(OwnedHandle::new(handle));
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
             let _ = thread.join();
         }
         let _ = std::fs::remove_file(
@@ -669,6 +694,13 @@ pub fn send_control(
             return Ok(value);
         }
     }
+}
+
+fn set_pipe_mode(pipe: HANDLE, wait: u32) {
+    let mode = PIPE_READMODE_BYTE | wait;
+    unsafe {
+        windows_sys::Win32::System::Pipes::SetNamedPipeHandleState(pipe, &mode, null(), null())
+    };
 }
 
 fn read_control_frame(pipe: HANDLE, deadline: Instant, stop: &AtomicBool) -> io::Result<Vec<u8>> {

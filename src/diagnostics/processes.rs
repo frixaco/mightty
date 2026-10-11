@@ -56,7 +56,7 @@ pub fn watch_process(handle: BorrowedHandle<'_>) -> Result<RootProcess, String> 
                 while let Ok(watch)=receiver.try_recv(){watches.push(watch);}
                 watches.retain(|watch|watch.observation.strong_count()>0);
                 if sampled.elapsed()<Duration::from_secs(1){continue;}
-                sampled=Instant::now();let processes=enumerate();let time=timestamp();let mut child_budget=512usize;
+                sampled=Instant::now();let processes=enumerate();let time=timestamp();let mut child_budget=512usize;let mut changed=false;
                 for watch in &watches {
                     let Some(observation)=watch.observation.upgrade()else{continue;};
                     let raw=watch.handle.as_raw_handle() as HANDLE;
@@ -81,9 +81,13 @@ pub fn watch_process(handle: BorrowedHandle<'_>) -> Result<RootProcess, String> 
                             if descendants.len()>=128||child_budget==0{covered=false;break;}
                         }
                     }else{covered=false;}
-                    *observation.lock().unwrap_or_else(|p|p.into_inner())=json!({"identity":{"pid":watch.pid,"creation_time":watch.creation},"executable":watch.executable,"executable_availability":if watch.executable.is_some(){"observed"}else{"unavailable"},"availability":"observed","sampled_at":time,"lifecycle":if exited{"exited"}else{"running"},"exit_code":if known_exit{Some(exit_code)}else{None},"descendants":descendants,"coverage":{"local_windows_only":true,"complete":false,"truncated_or_unavailable":!covered,"enumeration_error":processes.as_ref().err().map(ToString::to_string)}});
+                    let next=json!({"identity":{"pid":watch.pid,"creation_time":watch.creation},"executable":watch.executable,"executable_availability":if watch.executable.is_some(){"observed"}else{"unavailable"},"availability":"observed","sampled_at":time,"lifecycle":if exited{"exited"}else{"running"},"exit_code":if known_exit{Some(exit_code)}else{None},"descendants":descendants,"coverage":{"local_windows_only":true,"complete":false,"truncated_or_unavailable":!covered,"enumeration_error":processes.as_ref().err().map(ToString::to_string)}});
+                    // A new sample time alone does not change the observation; publishing it would rewrite persisted state every second.
+                    let mut current=observation.lock().unwrap_or_else(|p|p.into_inner());
+                    let mut previous=current.clone();previous["sampled_at"]=next["sampled_at"].clone();changed|=previous!=next;
+                    *current=next;
                 }
-                mark_dirty();
+                if changed {mark_dirty();}
             }
         }).expect("process sampler thread");
         Sampler{sender,stop,thread:Mutex::new(Some(thread))}

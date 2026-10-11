@@ -1335,7 +1335,7 @@ impl WindowsWindowInner {
             // Validate the region so a nested message pump doesn't keep
             // re-dispatching WM_PAINT for the still-invalid region in a busy
             // loop until the in-progress draw unwinds. The vsync thread
-            // re-invalidates every window on each vsync (see
+            // re-invalidates every presented window on each vsync (see
             // `begin_vsync_thread`), so the deferred frame still gets drawn,
             // at most one vsync late.
             unsafe { ValidateRect(Some(handle), None).ok().log_err() };

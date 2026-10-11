@@ -474,15 +474,18 @@ impl WindowsPlatform {
                     };
                     for hwnd in all_windows.read().iter() {
                         unsafe {
+                            // Only presented windows draw. A minimized window still receives
+                            // WM_PAINT for each invalidation, and with its frame callback parked
+                            // that falls through to a costly iconic `DefWindowProcW` paint.
+                            // Windows invalidates a window when it is restored or shown.
+                            if !IsWindowVisible(hwnd.as_raw()).as_bool()
+                                || IsIconic(hwnd.as_raw()).as_bool()
+                            {
+                                hwnd.frame_signal.take();
+                                continue;
+                            }
                             if let Some(signal_at) = signal_at {
-                                if IsWindowVisible(hwnd.as_raw()).as_bool()
-                                    && !IsIconic(hwnd.as_raw()).as_bool()
-                                {
-                                    hwnd.frame_signal.record(signal_at, signal_source);
-                                } else {
-                                    // Hidden windows may not consume WM_PAINT until shown again.
-                                    hwnd.frame_signal.take();
-                                }
+                                hwnd.frame_signal.record(signal_at, signal_source);
                             }
                             RedrawWindow(Some(hwnd.as_raw()), None, None, RDW_INVALIDATE)
                                 .ok()
