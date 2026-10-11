@@ -81,8 +81,22 @@ fn rust_layouts_match_the_compiled_ghostty_library() {
     assert_layout!(layouts, checked, "GhosttyClipboardContent" => ffi::ClipboardContent {
         mime => "mime", data => "data"
     });
+    assert_layout!(layouts, checked, "GhosttyClipboardRead" => ffi::ClipboardRead {
+        size => "size", location => "location", mimes => "mimes", mimes_len => "mimes_len",
+        list => "list", name => "name", granted => "granted", can_remember => "can_remember",
+        ctx => "ctx", reply => "reply"
+    });
+    assert_layout!(layouts, checked, "GhosttyClipboardReadReply" => ffi::ClipboardReadReply {
+        size => "size", result => "result", contents => "contents", contents_len => "contents_len",
+        available => "available", available_len => "available_len", remember => "remember"
+    });
     assert_layout!(layouts, checked, "GhosttyClipboardWrite" => ffi::ClipboardWrite {
-        size => "size", location => "location", contents => "contents", contents_len => "contents_len"
+        size => "size", location => "location", contents => "contents", contents_len => "contents_len",
+        name => "name", granted => "granted", can_remember => "can_remember",
+        ctx => "ctx", reply => "reply"
+    });
+    assert_layout!(layouts, checked, "GhosttyClipboardWriteReply" => ffi::ClipboardWriteReply {
+        size => "size", result => "result", remember => "remember"
     });
     assert_layout!(layouts, checked, "GhosttyCodepoints" => ffi::Codepoints {
         ptr => "ptr", len => "len"
@@ -131,6 +145,9 @@ fn rust_layouts_match_the_compiled_ghostty_library() {
     assert_layout!(layouts, checked, "GhosttyGridRef" => ffi::GridRef {
         size => "size", node => "node", x => "x", y => "y"
     });
+    assert_layout!(layouts, checked, "GhosttyMimeReader" => ffi::MimeReader {
+        read => "read", userdata => "userdata"
+    });
     assert_layout!(layouts, checked, "GhosttyMouseEncoderSize" => ffi::MouseEncoderSize {
         size => "size", screen_width => "screen_width", screen_height => "screen_height",
         cell_width => "cell_width", cell_height => "cell_height",
@@ -139,6 +156,10 @@ fn rust_layouts_match_the_compiled_ghostty_library() {
     });
     assert_layout!(layouts, checked, "GhosttyMousePosition" => ffi::MousePosition {
         x => "x", y => "y"
+    });
+    assert_layout!(layouts, checked, "GhosttyPaste" => ffi::Paste {
+        size => "size", location => "location", source => "source", mimes => "mimes",
+        mimes_len => "mimes_len", reader => "reader", allow_unsafe => "allow_unsafe"
     });
     assert_layout!(layouts, checked, "GhosttyPoint" => ffi::Point {
         tag => "tag", value => "value"
@@ -159,11 +180,20 @@ fn rust_layouts_match_the_compiled_ghostty_library() {
         visible => "visible", blinking => "blinking", password_input => "password_input",
         visual_style => "visual_style"
     });
+    assert_layout!(layouts, checked, "GhosttyRenderStateOverscan" => ffi::RenderStateOverscan {
+        above => "above", below => "below"
+    });
+    assert_layout!(layouts, checked, "GhosttyRenderStateRowId" => ffi::RenderStateRowId {
+        bits => "bits"
+    });
     assert_layout!(layouts, checked, "GhosttyRenderStateRowSelection" => ffi::RenderStateRowSelection {
         size => "size", start_x => "start_x", end_x => "end_x"
     });
     assert_layout!(layouts, checked, "GhosttySelection" => ffi::Selection {
         size => "size", start => "start", end => "end", rectangle => "rectangle"
+    });
+    assert_layout!(layouts, checked, "GhosttySelectionBuffer" => ffi::SelectionBuffer {
+        ptr => "ptr", cap => "cap", len => "len"
     });
     assert_layout!(layouts, checked, "GhosttySelectionGestureBehaviors" => ffi::SelectionGestureBehaviors {
         single_click => "single_click", double_click => "double_click", triple_click => "triple_click"
@@ -204,8 +234,25 @@ fn rust_layouts_match_the_compiled_ghostty_library() {
     assert_layout!(layouts, checked, "GhosttyTerminalDesktopNotification" => ffi::TerminalDesktopNotification {
         size => "size", title => "title", body => "body"
     });
+    assert_layout!(layouts, checked, "GhosttyTerminalMemoryUsage" => ffi::TerminalMemoryUsage {
+        size => "size", compression_supported => "compression_supported",
+        primary_pages => "primary_pages", primary_virtual_bytes => "primary_virtual_bytes",
+        primary_resident_bytes => "primary_resident_bytes",
+        primary_compressed_pages => "primary_compressed_pages",
+        primary_compressed_bytes => "primary_compressed_bytes",
+        primary_image_bytes => "primary_image_bytes",
+        alternate_pages => "alternate_pages", alternate_virtual_bytes => "alternate_virtual_bytes",
+        alternate_resident_bytes => "alternate_resident_bytes",
+        alternate_compressed_pages => "alternate_compressed_pages",
+        alternate_compressed_bytes => "alternate_compressed_bytes",
+        alternate_image_bytes => "alternate_image_bytes"
+    });
     assert_layout!(layouts, checked, "GhosttyTerminalModeConfig" => ffi::TerminalModeConfig {
         mode => "mode", value => "value"
+    });
+    assert_layout!(layouts, checked, "GhosttyTerminalProgramStatus" => ffi::TerminalProgramStatus {
+        size => "size", state => "state", kind => "kind", progress => "progress",
+        id => "id", app => "app", title => "title", message => "message"
     });
     assert_layout!(layouts, checked, "GhosttyTerminalProgressReport" => ffi::TerminalProgressReport {
         size => "size", state => "state", progress => "progress"
@@ -215,6 +262,11 @@ fn rust_layouts_match_the_compiled_ghostty_library() {
     });
     assert_layout!(layouts, checked, "GhosttyTerminalScrollbar" => ffi::TerminalScrollbar {
         total => "total", offset => "offset", len => "len"
+    });
+    assert_layout!(layouts, checked, "GhosttyTerminalSemanticPrompt" => ffi::TerminalSemanticPrompt {
+        size => "size", kind => "kind", prompt_kind => "prompt_kind",
+        has_exit_code => "has_exit_code", exit_code => "exit_code",
+        command => "command", error => "error"
     });
     assert_layout!(layouts, checked, "GhosttyTerminalSelectionFormatOptions" => ffi::TerminalSelectionFormatOptions {
         size => "size", emit => "emit", unwrap => "unwrap", trim => "trim", selection => "selection"
@@ -234,6 +286,9 @@ fn rust_layouts_match_the_compiled_ghostty_library() {
     });
     assert_layout!(layouts, checked, "GhosttyTerminalUnknownSequence" => ffi::TerminalUnknownSequence {
         tag => "tag", value => "value"
+    });
+    assert_layout!(layouts, checked, "GhosttyTerminalUnknownOscSequence" => ffi::TerminalUnknownOscSequence {
+        truncated => "truncated", content => "content", terminator => "terminator"
     });
     assert_layout!(layouts, checked, "GhosttyTerminalUnknownStringSequence" => ffi::TerminalUnknownStringSequence {
         truncated => "truncated", content => "content"

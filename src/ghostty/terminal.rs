@@ -679,19 +679,32 @@ unsafe extern "C" fn working_directory_changed_trampoline(
 unsafe extern "C" fn clipboard_write_trampoline(
     _terminal: ffi::Terminal,
     userdata: *mut c_void,
-    write: *const ffi::ClipboardWrite,
-) -> ffi::ClipboardWriteResult::Type {
-    let Ok(write) = clipboard_write(write) else {
-        return ffi::ClipboardWriteResult::INVALID_DATA;
+    raw: *const ffi::ClipboardWrite,
+) {
+    // Ghostty borrows the request only for this call and requires the reply
+    // before returning; returning without one denies the write.
+    let Some(reply) = (unsafe { raw.as_ref() })
+        .filter(|write| write.size >= size_of::<ffi::ClipboardWrite>())
+        .and_then(|write| write.reply)
+    else {
+        return;
     };
-    invoke_callback(userdata, |callbacks| {
-        callbacks
-            .clipboard_write
-            .as_deref_mut()
-            .map_or(ClipboardWriteResult::Denied, |callback| callback(write))
-    })
-    .unwrap_or(ClipboardWriteResult::Denied)
-    .as_raw()
+    let result = match clipboard_write(raw) {
+        Ok(write) => invoke_callback(userdata, |callbacks| {
+            callbacks
+                .clipboard_write
+                .as_deref_mut()
+                .map_or(ClipboardWriteResult::Denied, |callback| callback(write))
+        })
+        .unwrap_or(ClipboardWriteResult::Denied),
+        Err(_) => ClipboardWriteResult::InvalidData,
+    };
+    let reply_value = ffi::ClipboardWriteReply {
+        size: size_of::<ffi::ClipboardWriteReply>(),
+        result: result.as_raw(),
+        remember: false,
+    };
+    unsafe { reply(raw, &raw const reply_value) };
 }
 
 fn invoke_callback<R>(
