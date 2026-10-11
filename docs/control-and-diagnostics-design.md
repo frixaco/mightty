@@ -551,8 +551,8 @@ prepares owned data without consuming the live renderer's dirty state. Offscreen
 captures paint that data through the same terminal painter in a hidden scratch
 window, without presenting or changing the live tab.
 
-The [local GPUI 0.2.2 patch](../vendor/gpui/MIGHTTY-PATCH.md) exposes normal UI
-dispatch/text commit and immutable scene metadata, retains Direct3D 11 surfaces
+The [local GPUI Kit backend patches](../vendor/gpui/MIGHTTY-PATCH.md) add text
+commit and immutable scene metadata to Kit's GPUI 0.3.8 snapshot, retain Direct3D 11 surfaces
 only after successful presentation, and latches worker readback. It reports
 copy-submission/readback time; GPU execution time is unavailable.
 

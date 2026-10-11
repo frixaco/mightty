@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use gpui::{
+use gpui_kit::{
     AnyElement, Bounds, Context, DragMoveEvent, Empty, Entity, EntityId, IntoElement, Pixels,
     Render, Window, canvas, div, prelude::*, px,
 };
@@ -261,8 +261,8 @@ impl Split {
                 pane_layout.bounds
             };
             let absolute = Bounds {
-                origin: gpui::point(bounds.origin.x + px(rect.x), bounds.origin.y + px(rect.y)),
-                size: gpui::size(px(rect.width), px(rect.height)),
+                origin: gpui_kit::point(bounds.origin.x + px(rect.x), bounds.origin.y + px(rect.y)),
+                size: gpui_kit::size(px(rect.width), px(rect.height)),
             };
             let terminal = &self.panes[&pane_layout.pane_id].terminal;
             if let Some(ack) = terminal.update(cx, |terminal, cx| {
@@ -379,7 +379,7 @@ impl Split {
         self.active_pane_id
     }
 
-    pub fn exited_terminal_ids(&self, cx: &gpui::App) -> Vec<EntityId> {
+    pub fn exited_terminal_ids(&self, cx: &gpui_kit::App) -> Vec<EntityId> {
         self.panes
             .values()
             .filter(|pane| pane.terminal.read(cx).has_exited())
@@ -457,7 +457,7 @@ impl Split {
 
     pub fn focus_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(terminal) = self.terminal(self.active_pane_id) {
-            terminal.update(cx, |terminal, _cx| terminal.request_focus(window));
+            terminal.update(cx, |terminal, cx| terminal.request_focus(window, cx));
         }
     }
 
@@ -555,7 +555,7 @@ impl Split {
         &self,
         target: Option<PaneId>,
         window: &mut Window,
-        cx: &mut gpui::App,
+        cx: &mut gpui_kit::App,
     ) -> AnyElement {
         if let Some(id) = target {
             return self.panes[&id]
@@ -588,7 +588,7 @@ impl Split {
                     .min_h_0()
                     .rounded(px(4.))
                     .overflow_hidden()
-                    .bg(gpui::rgb(theme::BG))
+                    .bg(gpui_kit::rgb(theme::BG))
                     .child(terminal)
                     .into_any_element(),
             );
@@ -601,7 +601,7 @@ impl Split {
                     .top(px(divider.bounds.y))
                     .w(px(divider.bounds.width))
                     .h(px(divider.bounds.height))
-                    .bg(gpui::rgb(SEPARATOR_COLOR))
+                    .bg(gpui_kit::rgb(SEPARATOR_COLOR))
                     .into_any_element()
             }));
         }
@@ -609,7 +609,7 @@ impl Split {
             .size_full()
             .relative()
             .overflow_hidden()
-            .bg(gpui::rgb(theme::BG))
+            .bg(gpui_kit::rgb(theme::BG))
             .children(elements)
             .into_any_element()
     }
@@ -625,7 +625,7 @@ impl Split {
     fn drag_divider(
         &mut self,
         path: &NodePath,
-        position: gpui::Point<Pixels>,
+        position: gpui_kit::Point<Pixels>,
         cx: &mut Context<Self>,
     ) {
         let Some(root_bounds) = self.layout_bounds else {
@@ -706,7 +706,7 @@ impl Split {
                     .min_h_0()
                     .rounded(px(4.0))
                     .overflow_hidden()
-                    .bg(gpui::rgb(theme::BG))
+                    .bg(gpui_kit::rgb(theme::BG))
                     .child(pane.terminal.clone())
                     .into_any_element(),
             );
@@ -732,7 +732,7 @@ impl Split {
                         .when(is_horizontal, |divider| divider.cursor_col_resize())
                         .when(!is_horizontal, |divider| divider.cursor_row_resize())
                         .on_drag(drag, |drag, _, _, cx| cx.new(|_| drag.clone()))
-                        .child(div().size_full().bg(gpui::rgb(SEPARATOR_COLOR)))
+                        .child(div().size_full().bg(gpui_kit::rgb(SEPARATOR_COLOR)))
                         .into_any_element(),
                 );
             }
@@ -1219,7 +1219,7 @@ impl Render for Split {
             .size_full()
             .relative()
             .overflow_hidden()
-            .bg(gpui::rgb(theme::BG))
+            .bg(gpui_kit::rgb(theme::BG))
             .on_drag_move(cx.listener(Self::on_divider_drag_move))
             .children(elements)
             .child(

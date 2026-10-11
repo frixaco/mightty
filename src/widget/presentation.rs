@@ -242,9 +242,9 @@ impl TerminalWidget {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::TestAppContext;
+    use gpui_kit::TestAppContext;
 
-    fn widget(cx: &mut TestAppContext) -> gpui::Entity<TerminalWidget> {
+    fn widget(cx: &mut TestAppContext) -> gpui_kit::Entity<TerminalWidget> {
         cx.new(|cx| {
             TerminalWidget::with_pty(
                 TerminalConfig {
@@ -261,7 +261,7 @@ mod tests {
             )
         })
     }
-    fn write(widget: &gpui::Entity<TerminalWidget>, bytes: &[u8], cx: &mut TestAppContext) {
+    fn write(widget: &gpui_kit::Entity<TerminalWidget>, bytes: &[u8], cx: &mut TestAppContext) {
         widget.update(cx, |widget, cx| {
             widget.apply_pty_event(PtyEvent::Output(bytes.to_vec()), cx);
             widget.publish_terminal(cx);
@@ -284,7 +284,7 @@ mod tests {
             "alternate":frame.alternate,"viewport":(frame.scrollbar.offset,frame.scrollbar.len,frame.scrollbar.total)})
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn every_split_and_random_chunking_retains_complete_frames(cx: &mut TestAppContext) {
         let small = b"\x1b[?2026h\r\x1b[2Knew\x1b[?25l\x1b[3;8H\x1b[?2026l";
         let widget = widget(cx);
@@ -353,7 +353,7 @@ mod tests {
         }
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn timeout_obsolete_timers_resize_reset_and_eof(cx: &mut TestAppContext) {
         let widget = widget(cx);
         write(&widget, b"old", cx);
@@ -381,7 +381,7 @@ mod tests {
         });
         write(&widget, b"\x1b[?2026hresize", cx);
         widget.update(cx, |widget, cx| {
-            widget.resize_to_size(gpui::size(px(200.), px(100.)), cx);
+            widget.resize_to_size(gpui_kit::size(px(200.), px(100.)), cx);
             let frame = widget.committed.as_ref().unwrap();
             assert!(!widget.terminal.synchronized_output().unwrap());
             assert_eq!(frame.size, widget.size);
@@ -399,7 +399,7 @@ mod tests {
         });
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn replies_input_graphics_and_capture_remain_coherent_during_hold(cx: &mut TestAppContext) {
         let (tx, rx) = pty::test_channel();
         let widget = cx.new(|cx| {
@@ -416,7 +416,7 @@ mod tests {
             )
         });
         widget.update(cx, |widget, cx| {
-            widget.resize_to_size(gpui::size(px(600.), px(400.)), cx);
+            widget.resize_to_size(gpui_kit::size(px(600.), px(400.)), cx);
         });
         write(&widget, b"base", cx);
         widget.update(cx, |widget, cx| {
@@ -510,7 +510,7 @@ mod tests {
         });
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn recovery_recopies_rows_after_dirty_flags_were_consumed(cx: &mut TestAppContext) {
         let widget = widget(cx);
         write(&widget, b"before", cx);
@@ -530,7 +530,7 @@ mod tests {
         });
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn pending_resize_retains_matching_rows_and_metrics(cx: &mut TestAppContext) {
         let widget = widget(cx);
         write(&widget, b"before", cx);
@@ -542,7 +542,7 @@ mod tests {
             widget.apply_pty_event(PtyEvent::Output(b"\r\x1b[2Kafter".to_vec()), cx);
             widget.publish_terminal(cx);
             assert!(Rc::ptr_eq(&before, widget.committed.as_ref().unwrap()));
-            widget.resize_to_size(gpui::size(px(240.), px(120.)), cx);
+            widget.resize_to_size(gpui_kit::size(px(240.), px(120.)), cx);
             let frame = widget.committed.as_ref().unwrap();
             assert!(text(frame).starts_with("after"));
             assert_eq!(frame.cell_size, (px(12.), px(24.)));
@@ -551,11 +551,11 @@ mod tests {
         });
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn exhausted_image_budget_retains_frame_and_retries_without_output(cx: &mut TestAppContext) {
         let widget = widget(cx);
         widget.update(cx, |widget, cx| {
-            widget.resize_to_size(gpui::size(px(600.), px(400.)), cx);
+            widget.resize_to_size(gpui_kit::size(px(600.), px(400.)), cx);
         });
         write(&widget, b"before", cx);
         let before = widget.read_with(cx, |widget, _| widget.committed.clone().unwrap());

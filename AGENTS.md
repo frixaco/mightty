@@ -7,7 +7,7 @@ a complete terminal product. The current tabs and panes are a foundation, not
 the product boundary.
 
 Core pieces:
-- **GPUI** and **gpui-component** for the application shell and rendering.
+- **GPUI Kit** (`gpui-kit` 0.7.1) for the application shell and rendering.
 - **Ghostty's libghostty-vt**, built from the source submodule, for terminal
   state, escape sequence handling, rendering snapshots, and key encoding.
 - A project-owned safe Rust module over Ghostty's private generated C bindings.
@@ -59,8 +59,9 @@ Important non-source paths:
 - `fonts/JetBrainsMono/`: ignored local font files embedded by `src/main.rs`;
   the regular, bold, italic, and bold-italic mono faces are required.
 - `captures/`: generated at runtime by feedback capture and intentionally not part of source.
-- `vendor/gpui/`: GPUI 0.2.2 Cargo patch for normal input dispatch and bounded
-  Direct3D capture; see `MIGHTTY-PATCH.md` before changing it.
+- `vendor/gpui/` and `vendor/gpui-windows/`: Kit's pinned GPUI 0.3.8 snapshot
+  patches for text commit and bounded Direct3D capture; see
+  `vendor/gpui/MIGHTTY-PATCH.md` before changing either.
 
 ## Build System
 

@@ -4,8 +4,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 #[cfg(test)]
-use gpui::InteractiveElement;
-use gpui::{
+use gpui_kit::InteractiveElement;
+use gpui_kit::{
     AnyElement, IntoElement, ObjectFit, ParentElement, Pixels, RenderImage, Styled, StyledImage,
     div, img, px,
 };
@@ -284,17 +284,17 @@ fn texture_from_image(image: ImageData<'_>) -> Result<CachedTexture> {
     let mut bgra = Vec::with_capacity(byte_len);
     match image.format {
         PixelFormat::Rgb => {
-            for pixel in image.pixels.chunks_exact(3) {
+            for pixel in image.pixels.as_chunks::<3>().0 {
                 bgra.extend_from_slice(&[pixel[2], pixel[1], pixel[0], u8::MAX]);
             }
         }
         PixelFormat::Rgba => {
-            for pixel in image.pixels.chunks_exact(4) {
+            for pixel in image.pixels.as_chunks::<4>().0 {
                 bgra.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
             }
         }
         PixelFormat::GrayAlpha => {
-            for pixel in image.pixels.chunks_exact(2) {
+            for pixel in image.pixels.as_chunks::<2>().0 {
                 bgra.extend_from_slice(&[pixel[0], pixel[0], pixel[0], pixel[1]]);
             }
         }
@@ -391,7 +391,7 @@ fn source_fits_image(source: SourceRect, image_width: u32, image_height: u32) ->
 mod tests {
     use std::sync::Arc;
 
-    use gpui::px;
+    use gpui_kit::px;
 
     use super::*;
     use crate::ghostty::TerminalOptions;

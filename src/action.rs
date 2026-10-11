@@ -1,4 +1,4 @@
-use gpui::{Menu, MenuItem};
+use gpui_kit::{Menu, MenuItem};
 use serde::{Deserialize, Serialize};
 
 pub use crate::ghostty::PromptDirection;
@@ -405,7 +405,7 @@ pub struct ActionBinding {
 }
 
 /// Thin GPUI adapter for the domain action model.
-#[derive(Clone, gpui::Action, PartialEq, Eq, Deserialize)]
+#[derive(Clone, gpui_kit::Action, PartialEq, Eq, Deserialize)]
 #[action(namespace = mightty, no_json)]
 pub struct DispatchAppAction {
     pub action: AppAction,
@@ -421,6 +421,7 @@ pub fn app_menus() -> Vec<Menu> {
     ]
     .into_iter()
     .map(|category| Menu {
+        disabled: false,
         name: category.title().into(),
         items: AppAction::catalog()
             .into_iter()
@@ -454,11 +455,11 @@ pub fn default_action_bindings() -> Vec<ActionBinding> {
 }
 
 pub fn normalize_chord(chord: &str) -> Result<String, String> {
-    let keystroke = gpui::Keystroke::parse(chord.trim()).map_err(|error| error.to_string())?;
+    let keystroke = gpui_kit::Keystroke::parse(chord.trim()).map_err(|error| error.to_string())?;
     Ok(chord_for_keystroke(&keystroke))
 }
 
-pub fn chord_for_keystroke(keystroke: &gpui::Keystroke) -> String {
+pub fn chord_for_keystroke(keystroke: &gpui_kit::Keystroke) -> String {
     let mut parts = Vec::new();
     if keystroke.modifiers.control {
         parts.push("ctrl".to_string());
@@ -570,7 +571,7 @@ mod tests {
     #[test]
     fn chord_normalization_matches_runtime_keystrokes() {
         let chord = normalize_chord("SHIFT-CTRL-P").unwrap();
-        let keystroke = gpui::Keystroke::parse("ctrl-shift-p").unwrap();
+        let keystroke = gpui_kit::Keystroke::parse("ctrl-shift-p").unwrap();
 
         assert_eq!(chord, "ctrl-shift-p");
         assert_eq!(chord_for_keystroke(&keystroke), chord);

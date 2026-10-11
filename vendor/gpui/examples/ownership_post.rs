@@ -1,4 +1,10 @@
-use gpui::{App, Application, Context, Entity, EventEmitter, prelude::*};
+#![cfg_attr(target_family = "wasm", no_main)]
+
+#[path = "example_support/fonts.rs"]
+mod example_support;
+
+use gpui::{App, Context, Entity, EventEmitter, prelude::*};
+use gpui_platform::application;
 
 struct Counter {
     count: usize,
@@ -10,8 +16,11 @@ struct Change {
 
 impl EventEmitter<Change> for Counter {}
 
-fn main() {
-    Application::new().run(|cx: &mut App| {
+fn run_example() {
+    application().run(|cx: &mut App| {
+        if !example_support::load_fonts(cx) {
+            return;
+        }
         let counter: Entity<Counter> = cx.new(|_cx| Counter { count: 0 });
         let subscriber = cx.new(|cx: &mut Context<Counter>| {
             cx.subscribe(&counter, |subscriber, _emitter, event, _cx| {
@@ -32,4 +41,16 @@ fn main() {
 
         assert_eq!(subscriber.read(cx).count, 4);
     });
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn main() {
+    run_example();
+}
+
+#[cfg(target_family = "wasm")]
+#[wasm_bindgen::prelude::wasm_bindgen(start)]
+pub fn start() {
+    gpui_platform::web_init();
+    run_example();
 }

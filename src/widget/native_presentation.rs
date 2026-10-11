@@ -1,6 +1,6 @@
 //! Explicit native GPU test; never launches a shell or uses global app storage.
 use super::*;
-use gpui::{Application, AsyncApp, WindowBounds, WindowHandle, WindowOptions, size};
+use gpui_kit::{AsyncApp, WindowBounds, WindowHandle, WindowOptions, size};
 
 async fn raster(handle: WindowHandle<TerminalWidget>, cx: &mut AsyncApp) -> image::RgbaImage {
     let baseline = handle
@@ -27,7 +27,9 @@ async fn raster(handle: WindowHandle<TerminalWidget>, cx: &mut AsyncApp) -> imag
             break;
         }
         assert!(Instant::now() < deadline, "native frame not presented");
-        Timer::after(Duration::from_millis(10)).await;
+        cx.background_executor()
+            .timer(Duration::from_millis(10))
+            .await;
     }
     let (capture, _) = handle
         .update(cx, |_, window, _| window.capture_presented().unwrap())
@@ -58,7 +60,7 @@ fn differences(a: &image::RgbaImage, b: &image::RgbaImage) -> usize {
 #[test]
 #[ignore = "requires an interactive Windows GPU desktop; cargo test native_terminal_presentation -- --ignored --test-threads=1"]
 fn native_terminal_presentation() {
-    Application::new().run(|cx| {
+    gpui_kit::application().run(|cx| {
         widget_init(cx);
         let fonts = [
             include_bytes!("../../fonts/JetBrainsMono/JetBrainsMonoNerdFontMono-Regular.ttf")
@@ -78,7 +80,7 @@ fn native_terminal_presentation() {
             .open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(Bounds::new(
-                        gpui::point(px(100.), px(100.)),
+                        gpui_kit::point(px(100.), px(100.)),
                         size(px(600.), px(400.)),
                     ))),
                     ..Default::default()
@@ -92,8 +94,8 @@ fn native_terminal_presentation() {
                                 // Raster checks set blink phases explicitly, without a wall-clock race.
                                 blink_interval: Duration::from_secs(60),
                                 theme: TerminalTheme {
-                                    cursor: gpui::rgb(0x00ff00),
-                                    foreground: gpui::white().into(),
+                                    cursor: gpui_kit::rgb(0x00ff00),
+                                    foreground: gpui_kit::white().into(),
                                     ..Default::default()
                                 },
                                 ..Default::default()
@@ -104,7 +106,7 @@ fn native_terminal_presentation() {
                             None,
                             cx,
                         );
-                        widget.focus_handle.focus(window);
+                        widget.focus_handle.focus(window, cx);
                         widget
                     })
                 },
@@ -157,9 +159,9 @@ fn native_terminal_presentation() {
             );
             write(handle, b"\x1b[6 q", cx);
             let bar = raster(handle, cx).await;
-            handle.update(cx, |_,window,cx| { window.blur(); cx.notify(); }).unwrap();
+            handle.update(cx, |_,window,cx| { window.blur(cx); cx.notify(); }).unwrap();
             assert_eq!(differences(&hidden,&raster(handle,cx).await),0,"unfocused cursor painted");
-            handle.update(cx, |widget,window,cx| { widget.request_focus(window); cx.notify(); }).unwrap();
+            handle.update(cx, |widget,window,cx| { widget.request_focus(window, cx); cx.notify(); }).unwrap();
             assert_eq!(differences(&bar,&raster(handle,cx).await),0);
             write(handle,b"\x1b[5 q",cx);
             handle.update(cx, |widget,_,cx| {widget.cursor_blink_phase=false;cx.notify();}).unwrap();
@@ -196,7 +198,7 @@ fn native_terminal_presentation() {
                 .update(cx, |widget, window, cx| {
                     widget.cursor_blink_phase = false;
                     assert_eq!(widget.input_cursor_bounds().unwrap(), anchor);
-                    window.blur();
+                    window.blur(cx);
                     let _ = widget.offscreen_element(window, cx);
                     assert!(
                         widget.build_feedback_capture(true).unwrap().rows[0]
@@ -215,7 +217,7 @@ fn native_terminal_presentation() {
             assert!(differences(&hidden, &raster(handle, cx).await) > 20);
             // Wide-cell block geometry is twice the normal character width.
             handle
-                .update(cx, |widget, window, _| widget.request_focus(window))
+                .update(cx, |widget, window, cx| widget.request_focus(window, cx))
                 .unwrap();
             write(handle, "\x1bc\x1b[H界\x1b[H\x1b[2 q".as_bytes(), cx);
             let wide = raster(handle, cx).await;
@@ -267,13 +269,13 @@ fn native_terminal_presentation() {
                 "Native terminal presentation raster passed: {}",
                 directory.display()
             );
-            cx.update(|cx| cx.quit()).unwrap();
+            cx.update(|cx| cx.quit());
         })
         .detach();
     });
 }
 
 fn widget_init(cx: &mut App) {
-    gpui_component::init(cx);
+    gpui_kit::init(cx);
     super::init(cx);
 }

@@ -35,10 +35,10 @@ use crate::profile::LaunchSpec;
 use crate::shell::PtyParts;
 use crate::shell::PtySize;
 use crate::theme;
-use gpui::{
+use gpui_kit::{
     App, AppContext, Bounds, ClipboardItem, Context, EventEmitter, FocusHandle, KeyBinding,
     KeyDownEvent, KeyUpEvent, Keystroke, Modifiers, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    Pixels, Point, ScrollWheelEvent, Size, Task, Timer, Window, px,
+    Pixels, Point, ScrollWheelEvent, Size, Task, Window, px,
 };
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
@@ -62,7 +62,7 @@ const SCROLLBAR_MIN_THUMB_PX: f32 = 24.0;
 const MAX_TERMINAL_CLIPBOARD_BYTES: usize = 1024 * 1024;
 const TERMINAL_KEY_CONTEXT: &str = "Terminal";
 
-gpui::actions!(terminal, [ForwardTab, ForwardTabPrev]);
+gpui_kit::actions!(terminal, [ForwardTab, ForwardTabPrev]);
 
 /// Register terminal Tab actions before creating terminal widgets.
 ///
@@ -155,7 +155,7 @@ pub struct TerminalWidget {
     presentation_snapshot_invalid: bool,
     presentation_resize_failed: bool,
     search: Option<search::SearchOverlay>,
-    search_restore_focus: Option<gpui::WeakFocusHandle>,
+    search_restore_focus: Option<gpui_kit::WeakFocusHandle>,
     search_task: Task<()>,
     config: TerminalConfig,
     pty_tx: Option<pty::PtySender>,
@@ -170,9 +170,9 @@ pub struct TerminalWidget {
     preedit_selection: std::ops::Range<usize>,
     pending_text_key: Option<(Action, Keystroke)>,
     pressed_keys: std::collections::HashSet<String>,
-    search_input: Option<gpui::Entity<gpui_component::input::InputState>>,
-    search_input_subscription: Option<gpui::Subscription>,
-    blur_subscription: Option<gpui::Subscription>,
+    search_input: Option<gpui_kit::Entity<gpui_kit::component::input::InputState>>,
+    search_input_subscription: Option<gpui_kit::Subscription>,
+    blur_subscription: Option<gpui_kit::Subscription>,
     cursor_blink_phase: bool,
     size: (u16, u16),
     layout_bounds: Option<Bounds<Pixels>>,
@@ -218,21 +218,21 @@ struct PendingTerminalEffects {
 
 #[derive(Debug, Clone)]
 pub struct TerminalTheme {
-    pub foreground: gpui::Rgba,
-    pub background: gpui::Rgba,
-    pub cursor: gpui::Rgba,
-    pub selection: gpui::Rgba,
-    pub palette: [gpui::Rgba; 16],
+    pub foreground: gpui_kit::Rgba,
+    pub background: gpui_kit::Rgba,
+    pub cursor: gpui_kit::Rgba,
+    pub selection: gpui_kit::Rgba,
+    pub palette: [gpui_kit::Rgba; 16],
 }
 
 impl Default for TerminalTheme {
     fn default() -> Self {
         Self {
-            foreground: gpui::rgb(theme::FG),
-            background: gpui::rgb(theme::BG),
-            cursor: gpui::rgb(theme::FG),
-            selection: gpui::rgb(theme::BG_HIGHLIGHT),
-            palette: theme::ANSI.map(gpui::rgb),
+            foreground: gpui_kit::rgb(theme::FG),
+            background: gpui_kit::rgb(theme::BG),
+            cursor: gpui_kit::rgb(theme::FG),
+            selection: gpui_kit::rgb(theme::BG_HIGHLIGHT),
+            palette: theme::ANSI.map(gpui_kit::rgb),
         }
     }
 }
@@ -485,8 +485,8 @@ impl TerminalWidget {
         }
     }
 
-    pub fn request_focus(&self, window: &mut Window) {
-        self.focus_handle.focus(window);
+    pub fn request_focus(&self, window: &mut Window, cx: &mut gpui_kit::App) {
+        self.focus_handle.focus(window, cx);
     }
 
     pub fn focus_handle(&self) -> &FocusHandle {
@@ -575,14 +575,14 @@ impl TerminalWidget {
         if self.search.is_none() {
             self.search = Some(search::SearchOverlay::default());
             let input = cx.new(|cx| {
-                gpui_component::input::InputState::new(window, cx)
+                gpui_kit::component::input::InputState::new(window, cx)
                     .placeholder("Type to search")
                     .validate(|text, _| text.len() <= search::MAX_SEARCH_QUERY_BYTES)
             });
             self.search_input_subscription =
                 Some(
                     cx.subscribe_in(&input, window, |this, input, event, _window, cx| {
-                        if let gpui_component::input::InputEvent::Change = event
+                        if let gpui_kit::component::input::InputEvent::Change = event
                             && let Some(search) = this.search.as_mut()
                         {
                             search.query = input.read(cx).value().to_string();
@@ -612,7 +612,7 @@ impl TerminalWidget {
             .take()
             .and_then(|focus| focus.upgrade())
             .unwrap_or_else(|| self.focus_handle.clone())
-            .focus(window);
+            .focus(window, cx);
         self.presentation_dirty = true;
         cx.notify();
     }
@@ -659,7 +659,9 @@ impl TerminalWidget {
         search.step_scheduled = true;
         let revision = search.revision;
         self.search_task = cx.spawn(async move |this, cx| {
-            Timer::after(Duration::from_millis(1)).await;
+            cx.background_executor()
+                .timer(Duration::from_millis(1))
+                .await;
             let Some(this) = this.upgrade() else {
                 return;
             };
@@ -701,8 +703,7 @@ impl TerminalWidget {
                         cx.notify();
                     }
                 }
-            })
-            .ok();
+            });
         });
     }
 
@@ -746,7 +747,7 @@ impl TerminalWidget {
 
         let interval = self.config.blink_interval;
         self.cursor_blink_task = cx.spawn(async move |this, cx| {
-            Timer::after(interval).await;
+            cx.background_executor().timer(interval).await;
             if let Some(this) = this.upgrade() {
                 this.update(cx, |this, cx| {
                     if !this.committed.as_ref().is_some_and(|frame| {
@@ -763,8 +764,7 @@ impl TerminalWidget {
                     this.cursor_blink_phase = !this.cursor_blink_phase;
                     cx.notify();
                     this.schedule_cursor_blink(cx);
-                })
-                .ok();
+                });
             }
         });
     }
@@ -816,7 +816,7 @@ impl TerminalWidget {
                     this.output_eof
                 });
                 drop(widget);
-                if !matches!(completed, Ok(false)) {
+                if completed {
                     return;
                 }
                 // A ready receiver never yields. A nonzero timer also lets Windows
@@ -1032,7 +1032,7 @@ impl TerminalWidget {
         if self.font_metrics_key.as_ref() == Some(&key) {
             return;
         }
-        let font = gpui::font(self.config.font_family.clone());
+        let font = gpui_kit::font(self.config.font_family.clone());
         let text = window.text_system();
         let id = text.resolve_font(&font);
         let size = px(self.config.font_size_px);
@@ -1184,7 +1184,7 @@ impl TerminalWidget {
 
     fn dispatch_app_shortcut(
         &mut self,
-        keystroke: &gpui::Keystroke,
+        keystroke: &gpui_kit::Keystroke,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
@@ -1198,7 +1198,7 @@ impl TerminalWidget {
         true
     }
 
-    fn app_action_for_keystroke(&self, keystroke: &gpui::Keystroke) -> Option<&AppAction> {
+    fn app_action_for_keystroke(&self, keystroke: &gpui_kit::Keystroke) -> Option<&AppAction> {
         let chord = chord_for_keystroke(keystroke);
         self.config
             .action_bindings
@@ -1210,7 +1210,7 @@ impl TerminalWidget {
     fn send_encoded_key(
         &mut self,
         action: Action,
-        keystroke: &gpui::Keystroke,
+        keystroke: &gpui_kit::Keystroke,
         cx: &mut Context<Self>,
     ) {
         if action != Action::Release {
@@ -1254,7 +1254,7 @@ impl TerminalWidget {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.focus_handle.focus(window);
+        self.focus_handle.focus(window, cx);
         if self.try_open_hyperlink(event, window, cx) {
             return;
         }
@@ -1270,7 +1270,7 @@ impl TerminalWidget {
             cx.stop_propagation();
             return;
         }
-        if event.button != gpui::MouseButton::Left {
+        if event.button != gpui_kit::MouseButton::Left {
             return;
         }
         let Some(point) = self.selection_point(event.position) else {
@@ -1477,7 +1477,7 @@ impl TerminalWidget {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        if event.button != gpui::MouseButton::Left || !hyperlink_modifier(&event.modifiers) {
+        if event.button != gpui_kit::MouseButton::Left || !hyperlink_modifier(&event.modifiers) {
             return false;
         }
         let Some(point) = self.selection_point(event.position) else {
@@ -1644,11 +1644,11 @@ impl Drop for TerminalWidget {
     }
 }
 
-pub(super) fn rgb_to_rgba(rgb: RgbColor) -> gpui::Rgba {
-    gpui::rgb((rgb.r as u32) << 16 | (rgb.g as u32) << 8 | rgb.b as u32)
+pub(super) fn rgb_to_rgba(rgb: RgbColor) -> gpui_kit::Rgba {
+    gpui_kit::rgb((rgb.r as u32) << 16 | (rgb.g as u32) << 8 | rgb.b as u32)
 }
 
-fn rgba_to_rgb(rgba: gpui::Rgba) -> RgbColor {
+fn rgba_to_rgb(rgba: gpui_kit::Rgba) -> RgbColor {
     RgbColor {
         r: (rgba.r * 255.0).round().clamp(0.0, 255.0) as u8,
         g: (rgba.g * 255.0).round().clamp(0.0, 255.0) as u8,
@@ -1656,7 +1656,7 @@ fn rgba_to_rgb(rgba: gpui::Rgba) -> RgbColor {
     }
 }
 
-fn terminal_palette(theme_palette: [gpui::Rgba; 16]) -> Palette {
+fn terminal_palette(theme_palette: [gpui_kit::Rgba; 16]) -> Palette {
     let mut palette = [RgbColor { r: 0, g: 0, b: 0 }; 256];
     for (index, color) in theme_palette.into_iter().enumerate() {
         palette[index] = rgba_to_rgb(color);
@@ -1720,13 +1720,17 @@ fn scrollbar_row_at(scrollbar: Scrollbar, track_height: f32, pointer_y: f32) -> 
     usize::try_from(row).ok()
 }
 
-fn ghostty_mouse_button(button: gpui::MouseButton) -> Option<MouseButton> {
+fn ghostty_mouse_button(button: gpui_kit::MouseButton) -> Option<MouseButton> {
     match button {
-        gpui::MouseButton::Left => Some(MouseButton::Left),
-        gpui::MouseButton::Right => Some(MouseButton::Right),
-        gpui::MouseButton::Middle => Some(MouseButton::Middle),
-        gpui::MouseButton::Navigate(gpui::NavigationDirection::Back) => Some(MouseButton::Four),
-        gpui::MouseButton::Navigate(gpui::NavigationDirection::Forward) => Some(MouseButton::Five),
+        gpui_kit::MouseButton::Left => Some(MouseButton::Left),
+        gpui_kit::MouseButton::Right => Some(MouseButton::Right),
+        gpui_kit::MouseButton::Middle => Some(MouseButton::Middle),
+        gpui_kit::MouseButton::Navigate(gpui_kit::NavigationDirection::Back) => {
+            Some(MouseButton::Four)
+        }
+        gpui_kit::MouseButton::Navigate(gpui_kit::NavigationDirection::Forward) => {
+            Some(MouseButton::Five)
+        }
     }
 }
 
@@ -1872,20 +1876,22 @@ fn rectangle_selection(modifiers: &Modifiers) -> bool {
 
 #[cfg(test)]
 mod interaction_tests {
-    use gpui::{point, size};
+    use gpui_kit::{point, size};
 
     use super::*;
 
-    #[gpui::test]
-    fn cyberdream_colors_reach_terminal_snapshots(cx: &mut gpui::TestAppContext) {
+    #[gpui_kit::test]
+    fn cyberdream_colors_reach_terminal_snapshots(cx: &mut gpui_kit::TestAppContext) {
         cx.update(|cx| {
-            gpui_component::init(cx);
+            gpui_kit::init(cx);
             theme::init(cx);
-            let ui = gpui_component::Theme::global(cx);
+            let ui = gpui_kit::component::Theme::global(cx);
             assert!(ui.is_dark());
-            assert_eq!(ui.background, gpui::rgb(0x16181a).into());
-            assert_eq!(ui.primary, gpui::rgb(0x5ea1ff).into());
-            assert_eq!(ui.selection, gpui::rgb(0x3c4048).into());
+            assert_eq!(ui.background, gpui_kit::rgb(0x16181a).into());
+            assert_eq!(ui.primary, gpui_kit::rgb(0x5ea1ff).into());
+            assert_eq!(ui.selection, gpui_kit::rgb(0x3c4048).into());
+            assert_eq!(ui.tokens.background.color, ui.background);
+            assert_eq!(ui.tokens.button_primary.color, ui.primary);
         });
         cx.new(|cx| {
             let mut widget = TerminalWidget::with_pty(
@@ -1898,14 +1904,17 @@ mod interaction_tests {
             );
             let snapshot = widget.render_state.update(&widget.terminal).unwrap();
             let colors = snapshot.colors().unwrap();
-            assert_eq!(rgb_to_rgba(colors.background), gpui::rgb(0x16181a));
-            assert_eq!(rgb_to_rgba(colors.foreground), gpui::rgb(0xffffff));
-            assert_eq!(colors.cursor.map(rgb_to_rgba), Some(gpui::rgb(0xffffff)));
+            assert_eq!(rgb_to_rgba(colors.background), gpui_kit::rgb(0x16181a));
+            assert_eq!(rgb_to_rgba(colors.foreground), gpui_kit::rgb(0xffffff));
+            assert_eq!(
+                colors.cursor.map(rgb_to_rgba),
+                Some(gpui_kit::rgb(0xffffff))
+            );
             let expected = [
                 0x16181a, 0xff6e5e, 0x5eff6c, 0xf1ff5e, 0x5ea1ff, 0xbd5eff, 0x5ef1ff, 0xffffff,
                 0x3c4048, 0xff6e5e, 0x5eff6c, 0xf1ff5e, 0x5ea1ff, 0xbd5eff, 0x5ef1ff, 0xffffff,
             ]
-            .map(gpui::rgb);
+            .map(gpui_kit::rgb);
             assert_eq!(
                 colors.palette[..16]
                     .iter()
@@ -1914,13 +1923,13 @@ mod interaction_tests {
                     .collect::<Vec<_>>(),
                 expected
             );
-            assert_eq!(widget.theme.selection, gpui::rgb(0x3c4048));
+            assert_eq!(widget.theme.selection, gpui_kit::rgb(0x3c4048));
             widget
         });
     }
 
-    #[gpui::test]
-    fn output_task_yields_and_finishes_before_signalling_exit(cx: &mut gpui::TestAppContext) {
+    #[gpui_kit::test]
+    fn output_task_yields_and_finishes_before_signalling_exit(cx: &mut gpui_kit::TestAppContext) {
         let (tx, rx) = flume::bounded(64);
         // An already-finished reader must not make queued output removable.
         let flag = Arc::new(AtomicBool::new(true));
@@ -1988,8 +1997,8 @@ mod interaction_tests {
         cx.run_until_parked();
     }
 
-    #[gpui::test]
-    fn output_task_does_not_retain_widget_while_waiting(cx: &mut gpui::TestAppContext) {
+    #[gpui_kit::test]
+    fn output_task_does_not_retain_widget_while_waiting(cx: &mut gpui_kit::TestAppContext) {
         let (_tx, rx) = flume::bounded(1);
         let pending = rx.clone();
         let widget = cx.new(|cx| {

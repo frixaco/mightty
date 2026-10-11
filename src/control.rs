@@ -87,6 +87,7 @@ pub async fn complete_acknowledgements(
     mut response: Value,
     acknowledgements: Vec<flume::Receiver<Acknowledgement>>,
     deadline: std::time::Instant,
+    executor: &gpui_kit::BackgroundExecutor,
 ) -> Value {
     let mut written = 0usize;
     for ack in acknowledgements {
@@ -103,7 +104,7 @@ pub async fn complete_acknowledgements(
                     break;
                 }
                 Err(flume::TryRecvError::Empty) if std::time::Instant::now() < deadline => {
-                    gpui::Timer::after(std::time::Duration::from_millis(5)).await;
+                    executor.timer(std::time::Duration::from_millis(5)).await;
                 }
                 _ => {
                     response["ok"] = json!(false);
@@ -153,7 +154,7 @@ pub enum KeyEvent {
     Release,
 }
 
-pub fn keystroke(key: &str, modifiers: &[String]) -> Result<gpui::Keystroke, ControlError> {
+pub fn keystroke(key: &str, modifiers: &[String]) -> Result<gpui_kit::Keystroke, ControlError> {
     let canonical = if key.chars().count() == 1 {
         key.to_string()
     } else {
@@ -196,7 +197,7 @@ pub fn keystroke(key: &str, modifiers: &[String]) -> Result<gpui::Keystroke, Con
             format!("unknown key {key}"),
         ));
     }
-    let mut mods = gpui::Modifiers::default();
+    let mut mods = gpui_kit::Modifiers::default();
     for modifier in modifiers {
         match modifier.as_str() {
             "ctrl" => mods.control = true,
@@ -211,7 +212,7 @@ pub fn keystroke(key: &str, modifiers: &[String]) -> Result<gpui::Keystroke, Con
             }
         }
     }
-    Ok(gpui::Keystroke {
+    Ok(gpui_kit::Keystroke {
         modifiers: mods,
         key: canonical,
         key_char: None,
@@ -581,7 +582,7 @@ pub fn capabilities() -> Value {
         },
         "capture":{"backend":if cfg!(windows){"Direct3D11"}else{"unsupported"},"modes":["presented","next","offscreen"],"offscreen_targets":["tab","pane"],"optional_shaping":"unavailable"},
         "terminal_presentation":{"synchronized_output":{"mode":2026,"host_support":true,"maximum_hold_ms":1000,"recovery":["timeout","resize","reset","eof"]},"cursor":{"visibility":true,"application_shape_and_blink":true,"wide_cells":true},"graphics":{"direct_pixel_placements":true,"virtual_placements":false}},
-        "limits":{"frame_bytes":MAX_FRAME_BYTES,"input_bytes":MAX_INPUT_BYTES,"input_steps":1024,"ui_sequences":1,"capture_requests":4,"capture_surface_bytes":gpui::MAX_CAPTURE_RGBA_BYTES,"capture_retention_bytes_per_window":2*gpui::MAX_CAPTURE_RGBA_BYTES,"capture_source_cells_per_frame":40000,"capture_source_cells_per_pane":20000,"read_rows":MAX_READ_ROWS,"connections":MAX_CONNECTIONS,"request_queue":32,"timeout_ms":60000,"event_queue":32,"removed_panes":64,"removed_pane_retention_seconds":300,"journal_bytes":4*1024*1024,"journal_files":2,"inactive_metadata_instances":32,"launch_list_items":256,"launch_list_bytes":65536},
+        "limits":{"frame_bytes":MAX_FRAME_BYTES,"input_bytes":MAX_INPUT_BYTES,"input_steps":1024,"ui_sequences":1,"capture_requests":4,"capture_surface_bytes":gpui_kit::MAX_CAPTURE_RGBA_BYTES,"capture_retention_bytes_per_window":2*gpui_kit::MAX_CAPTURE_RGBA_BYTES,"capture_source_cells_per_frame":40000,"capture_source_cells_per_pane":20000,"read_rows":MAX_READ_ROWS,"connections":MAX_CONNECTIONS,"request_queue":32,"timeout_ms":60000,"event_queue":32,"removed_panes":64,"removed_pane_retention_seconds":300,"journal_bytes":4*1024*1024,"journal_files":2,"inactive_metadata_instances":32,"launch_list_items":256,"launch_list_bytes":65536},
         "constraints":{"input":"Entire sequences must balance held keys/buttons; cancellation releases only synthetic held state.","ui_pointer":"Single pointer commands support move/wheel; use ui.input for presses and drags.","paste":"Unsafe paste requires confirmation and is rejected by unattended input.","read":"Only the active terminal buffer is observable; inactive buffers are never switched.","text_wait":"after_output gates progress, not text freshness; use unique composed markers.","events":"Initial full state followed by atomic replacement changes; overflow requires resubscription.","snapshot":"Presented never redraws. Tab/pane default offscreen; OS popups are excluded."}})
 }
 

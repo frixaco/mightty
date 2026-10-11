@@ -3,7 +3,7 @@ use crate::ghostty::{
     style::{RgbColor, Underline},
 };
 use crate::theme;
-use gpui::{
+use gpui_kit::{
     Bounds, ContentMask, Context, FontFallbacks, FontFeatures, FontStyle, FontWeight, IntoElement,
     KeyDownEvent, KeyUpEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
     Render, ScrollWheelEvent, StrikethroughStyle, Styled, TextRun, TextStyle, UnderlineStyle,
@@ -90,7 +90,7 @@ impl TerminalWidget {
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
+    ) -> gpui_kit::AnyElement {
         self.publish_terminal(cx);
         self.paint_terminal(window, cx, true).into_any_element()
     }
@@ -100,7 +100,7 @@ impl TerminalWidget {
         window: &mut Window,
         cx: &mut Context<Self>,
         offscreen: bool,
-    ) -> gpui::Div {
+    ) -> gpui_kit::Div {
         #[cfg(test)]
         reset_render_stage_trace();
 
@@ -148,7 +148,7 @@ impl TerminalWidget {
                 .map(|placement| placement.z())
                 .collect::<Vec<_>>()
         ));
-        let mut elements: Vec<gpui::AnyElement> = graphics
+        let mut elements: Vec<gpui_kit::AnyElement> = graphics
             .below_background
             .into_iter()
             .map(|placement| placement.into_element())
@@ -255,9 +255,9 @@ impl TerminalWidget {
         ));
         elements.extend(search_highlights.into_iter().map(|highlight| {
             let color = if highlight.active {
-                gpui::rgba((theme::ORANGE << 8) | 0x33)
+                gpui_kit::rgba((theme::ORANGE << 8) | 0x33)
             } else {
-                gpui::rgba((theme::YELLOW << 8) | 0x1a)
+                gpui_kit::rgba((theme::YELLOW << 8) | 0x1a)
             };
             div()
                 .absolute()
@@ -319,9 +319,14 @@ impl TerminalWidget {
                                 bounds: segment_bounds,
                             }),
                             |window| {
-                                if let Err(error) =
-                                    line.paint(segment_bounds.origin, cell_size.1, window, cx)
-                                {
+                                if let Err(error) = line.paint(
+                                    segment_bounds.origin,
+                                    cell_size.1,
+                                    gpui_kit::TextAlign::Left,
+                                    None,
+                                    window,
+                                    cx,
+                                ) {
                                     crate::diagnostics::record(
                                         "render",
                                         "text_paint_failed",
@@ -442,7 +447,14 @@ impl TerminalWidget {
                                 window.scale_factor(),
                             );
                             window.with_content_mask(Some(ContentMask { bounds }), |window| {
-                                let _ = line.paint(bounds.origin, cell_size.1, window, cx);
+                                let _ = line.paint(
+                                    bounds.origin,
+                                    cell_size.1,
+                                    gpui_kit::TextAlign::Left,
+                                    None,
+                                    window,
+                                    cx,
+                                );
                             });
                         },
                     )
@@ -516,7 +528,7 @@ impl TerminalWidget {
                             .w(px(6.0))
                             .h(px(layout.height))
                             .rounded(px(3.0))
-                            .bg(gpui::rgba((theme::GREY << 8) | 0x99)),
+                            .bg(gpui_kit::rgba((theme::GREY << 8) | 0x99)),
                     )
             });
         let paste_confirmation = self.pending_paste.as_ref().map(|text| {
@@ -528,7 +540,7 @@ impl TerminalWidget {
                 .flex()
                 .items_center()
                 .justify_center()
-                .bg(gpui::rgba((theme::BG << 8) | 0xaa))
+                .bg(gpui_kit::rgba((theme::BG << 8) | 0xaa))
                 .occlude()
                 .on_mouse_down(
                     MouseButton::Left,
@@ -542,8 +554,8 @@ impl TerminalWidget {
                         .w(px(420.0))
                         .p(px(20.0))
                         .rounded(px(8.0))
-                        .bg(gpui::rgb(theme::BG_ALT))
-                        .text_color(gpui::rgb(theme::FG))
+                        .bg(gpui_kit::rgb(theme::BG_ALT))
+                        .text_color(gpui_kit::rgb(theme::FG))
                         .flex()
                         .flex_col()
                         .gap(px(12.0))
@@ -559,7 +571,7 @@ impl TerminalWidget {
                         .child(
                             div()
                                 .text_size(px(12.0))
-                                .text_color(gpui::rgb(theme::GREY))
+                                .text_color(gpui_kit::rgb(theme::GREY))
                                 .child(detail),
                         )
                         .child(
@@ -573,11 +585,11 @@ impl TerminalWidget {
                                         .px(px(14.0))
                                         .py(px(8.0))
                                         .rounded(px(4.0))
-                                        .bg(gpui::rgb(theme::BG_HIGHLIGHT))
+                                        .bg(gpui_kit::rgb(theme::BG_HIGHLIGHT))
                                         .hover(|style| {
                                             style
-                                                .bg(gpui::rgb(theme::GREY))
-                                                .text_color(gpui::rgb(theme::BG))
+                                                .bg(gpui_kit::rgb(theme::GREY))
+                                                .text_color(gpui_kit::rgb(theme::BG))
                                         })
                                         .on_mouse_down(
                                             MouseButton::Left,
@@ -597,9 +609,9 @@ impl TerminalWidget {
                                         .px(px(14.0))
                                         .py(px(8.0))
                                         .rounded(px(4.0))
-                                        .bg(gpui::rgb(theme::BLUE))
-                                        .text_color(gpui::rgb(theme::BG))
-                                        .hover(|style| style.bg(gpui::rgb(theme::CYAN)))
+                                        .bg(gpui_kit::rgb(theme::BLUE))
+                                        .text_color(gpui_kit::rgb(theme::BG))
+                                        .hover(|style| style.bg(gpui_kit::rgb(theme::CYAN)))
                                         .on_mouse_down(
                                             MouseButton::Left,
                                             cx.listener(
@@ -620,7 +632,7 @@ impl TerminalWidget {
         let search_input = if offscreen {
             self.search.as_ref().map(|search| {
                 cx.new(|cx| {
-                    let mut input = gpui_component::input::InputState::new(window, cx);
+                    let mut input = gpui_kit::component::input::InputState::new(window, cx);
                     input.set_value(search.query.clone(), window, cx);
                     input
                 })
@@ -632,7 +644,7 @@ impl TerminalWidget {
             let diagnostic = search.diagnostic.as_ref().map(|diagnostic| {
                 div()
                     .text_size(px(11.0))
-                    .text_color(gpui::rgb(theme::RED))
+                    .text_color(gpui_kit::rgb(theme::RED))
                     .child(diagnostic.clone())
             });
             div()
@@ -642,10 +654,10 @@ impl TerminalWidget {
                 .w(px(420.0))
                 .p(px(10.0))
                 .rounded(px(6.0))
-                .bg(gpui::rgba((theme::BG_ALT << 8) | 0xee))
+                .bg(gpui_kit::rgba((theme::BG_ALT << 8) | 0xee))
                 .border_1()
-                .border_color(gpui::rgb(theme::BG_HIGHLIGHT))
-                .text_color(gpui::rgb(theme::FG))
+                .border_color(gpui_kit::rgb(theme::BG_HIGHLIGHT))
+                .text_color(gpui_kit::rgb(theme::FG))
                 .occlude()
                 .flex()
                 .flex_col()
@@ -655,11 +667,15 @@ impl TerminalWidget {
                         .flex()
                         .items_center()
                         .justify_between()
-                        .children(search_input.as_ref().map(gpui_component::input::Input::new))
+                        .children(
+                            search_input
+                                .as_ref()
+                                .map(gpui_kit::component::input::Input::new),
+                        )
                         .child(
                             div()
                                 .text_size(px(11.0))
-                                .text_color(gpui::rgb(theme::GREY))
+                                .text_color(gpui_kit::rgb(theme::GREY))
                                 .child(search.result_label()),
                         ),
                 )
@@ -667,7 +683,7 @@ impl TerminalWidget {
                 .child(
                     div()
                         .text_size(px(10.0))
-                        .text_color(gpui::rgb(theme::GREY))
+                        .text_color(gpui_kit::rgb(theme::GREY))
                         .child("Enter: next · Shift+Enter: previous · Esc: close"),
                 )
         });
@@ -691,7 +707,7 @@ impl TerminalWidget {
             .key_context(TERMINAL_KEY_CONTEXT)
             .track_focus(&self.focus_handle)
             .capture_action(cx.listener(
-                |this, event: &gpui_component::input::Enter, _window, cx| {
+                |this, event: &gpui_kit::component::input::Enter, _window, cx| {
                     if this.search.is_some() {
                         this.navigate_search(
                             if event.secondary {
@@ -787,7 +803,7 @@ impl TerminalWidget {
                     move |bounds, _, window, cx| {
                         window.handle_input(
                             &input_focus,
-                            gpui::ElementInputHandler::new(bounds, input_entity.clone()),
+                            gpui_kit::ElementInputHandler::new(bounds, input_entity.clone()),
                             cx,
                         );
                     },
@@ -951,7 +967,7 @@ fn cursor_text_color(cursor: RgbColor, background: RgbColor) -> RgbColor {
 // Match GPUI's layout rounding for the positioned spans replaced by the canvases.
 fn pixel_aligned_bounds(
     bounds: Bounds<Pixels>,
-    origin: gpui::Point<Pixels>,
+    origin: gpui_kit::Point<Pixels>,
     scale: f32,
 ) -> Bounds<Pixels> {
     let start = bounds.origin + origin;
@@ -971,8 +987,8 @@ mod tests {
         TerminalOptions, render::RowIterator,
     };
     use crate::widget::{PtyCommand, TerminalConfig};
-    use gpui::{AppContext, Bounds, Entity, FocusHandle, TestAppContext, size};
-    use gpui_component::Root;
+    use gpui_kit::component::Root;
+    use gpui_kit::{AppContext, Bounds, Entity, FocusHandle, TestAppContext, size};
     use std::{cell::RefCell, rc::Rc};
 
     #[test]
@@ -1025,8 +1041,8 @@ mod tests {
     fn bold_preserves_palette_and_program_colors() {
         for color in theme::ANSI.into_iter().chain([0x123456]) {
             let style = RowTextStyle {
-                fg: super::super::rgba_to_rgb(gpui::rgb(color)),
-                bg: Some(super::super::rgba_to_rgb(gpui::rgb(theme::BG))),
+                fg: super::super::rgba_to_rgb(gpui_kit::rgb(color)),
+                bg: Some(super::super::rgba_to_rgb(gpui_kit::rgb(theme::BG))),
                 bold: true,
                 italic: false,
                 underline: Underline::None,
@@ -1196,10 +1212,10 @@ mod tests {
         assert_eq!(selected_background(selection, 5, 1, None, selected), None);
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn tab_is_forwarded_without_leaving_terminal_focus(cx: &mut TestAppContext) {
         cx.update(|cx| {
-            gpui_component::init(cx);
+            gpui_kit::init(cx);
             crate::widget::init(cx);
         });
 
@@ -1235,8 +1251,8 @@ mod tests {
             .expect("test terminal was created");
 
         cx.refresh().expect("refresh tab focus fixture");
-        cx.update_window_entity(&terminal, |terminal, window, _cx| {
-            terminal.request_focus(window);
+        cx.update_window_entity(&terminal, |terminal, window, cx| {
+            terminal.request_focus(window, cx);
         });
         while pty_rx.try_recv().is_ok() {}
 
@@ -1252,7 +1268,7 @@ mod tests {
         ));
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn kitty_graphics_fixture_reaches_the_final_widget_render(cx: &mut TestAppContext) {
         let mut config = TerminalConfig {
             initial_cols: 20,
@@ -1260,7 +1276,7 @@ mod tests {
             cursor_blink: false,
             ..Default::default()
         };
-        config.theme.background = gpui::rgb(0x101010);
+        config.theme.background = gpui_kit::rgb(0x101010);
 
         let (widget, cx) = cx.add_window_view(|_window, cx| {
             TerminalWidget::with_pty(
@@ -1276,7 +1292,7 @@ mod tests {
         cx.refresh().expect("refresh resized test window");
         cx.run_until_parked();
         cx.update_window_entity(&widget, |widget, window, cx| {
-            widget.request_focus(window);
+            widget.request_focus(window, cx);
             widget.terminal.vt_write(
                 concat!(
                     "\x1b[41mX\x1b[0m\x1b[H",
@@ -1345,11 +1361,11 @@ mod tests {
         );
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn native_text_commits_once_and_preedit_never_reaches_the_pty(cx: &mut TestAppContext) {
-        use gpui::EntityInputHandler;
+        use gpui_kit::EntityInputHandler;
         cx.update(|cx| {
-            gpui_component::init(cx);
+            gpui_kit::init(cx);
             crate::widget::init(cx);
         });
         let (pty_tx, pty_rx) = crate::widget::pty::test_channel();
@@ -1377,9 +1393,9 @@ mod tests {
             Root::new(fixture, window, cx)
         });
         let widget = slot.borrow().clone().unwrap();
-        cx.update_window_entity(&widget, |widget, window, _| {
+        cx.update_window_entity(&widget, |widget, window, cx| {
             window.activate_window();
-            widget.request_focus(window);
+            widget.request_focus(window, cx);
         });
         cx.refresh().unwrap();
         while pty_rx.try_recv().is_ok() {}
@@ -1414,11 +1430,12 @@ mod tests {
 
         cx.update_window_entity(&widget, |widget, window, cx| {
             widget.terminal.vt_write(b"\x1b[>11u");
-            let key = gpui::Keystroke::parse("a").unwrap();
+            let key = gpui_kit::Keystroke::parse("a").unwrap();
             widget.handle_key_down(
                 &KeyDownEvent {
                     keystroke: key.clone(),
                     is_held: false,
+                    prefer_character_input: false,
                 },
                 window,
                 cx,
@@ -1439,14 +1456,14 @@ mod tests {
             widget.replace_and_mark_text_in_range(None, "", Some(0..0), window, cx);
             assert_eq!(widget.marked_text_range(window, cx), Some(0..0));
             widget.replace_and_mark_text_in_range(None, "日本", None, window, cx);
-            window.blur();
+            window.blur(cx);
         });
         cx.refresh().unwrap();
         cx.run_until_parked();
-        cx.update_window_entity(&widget, |widget, window, _| {
+        cx.update_window_entity(&widget, |widget, window, cx| {
             assert!(!widget.composing);
             assert!(widget.preedit.is_empty());
-            widget.request_focus(window);
+            widget.request_focus(window, cx);
         });
         assert!(pty_rx.try_recv().is_err());
 
@@ -1466,7 +1483,7 @@ mod tests {
         cx.update_window_entity(&widget, |widget, _, _| assert!(widget.search.is_none()));
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn configured_font_size_changes_grid_and_candidate_geometry(cx: &mut TestAppContext) {
         let (widget, cx) = cx.add_window_view(|_, cx| {
             TerminalWidget::with_pty(
@@ -1524,9 +1541,9 @@ mod tests {
 mod presentation_tests {
     use super::*;
     use crate::widget::{CursorStyle, PtyEvent, TerminalConfig};
-    use gpui::TestAppContext;
+    use gpui_kit::TestAppContext;
     use std::rc::Rc;
-    #[gpui::test]
+    #[gpui_kit::test]
     fn capture_keeps_the_painted_revision_after_a_new_commit(cx: &mut TestAppContext) {
         let (widget, cx) = cx.add_window_view(|_, cx| {
             TerminalWidget::with_pty(
@@ -1595,13 +1612,13 @@ mod presentation_tests {
             );
         });
     }
-    #[gpui::test]
+    #[gpui_kit::test]
     fn explicit_pane_focus_does_not_reselect_the_old_focus(cx: &mut TestAppContext) {
         use crate::split::{PaneId, Split, SplitAxis, SplitNode};
         let first = PaneId::allocate();
         let second = PaneId::allocate();
         let (split, cx) = cx.add_window_view(|window, cx| {
-            let make = |cx: &mut gpui::App| {
+            let make = |cx: &mut gpui_kit::App| {
                 cx.new(|cx| {
                     TerminalWidget::with_pty(
                         TerminalConfig {
@@ -1618,7 +1635,7 @@ mod presentation_tests {
             };
             let first_widget = make(cx);
             let second_widget = make(cx);
-            first_widget.update(cx, |widget, _| widget.request_focus(window));
+            first_widget.update(cx, |widget, cx| widget.request_focus(window, cx));
             Split::from_restored(
                 SplitNode::Branch {
                     axis: SplitAxis::Horizontal,
@@ -1657,10 +1674,10 @@ mod presentation_tests {
             );
         });
     }
-    #[gpui::test]
+    #[gpui_kit::test]
     fn protocol_cursor_and_synchronized_repaints_use_the_committed_frame(cx: &mut TestAppContext) {
         cx.update(|cx| {
-            gpui_component::init(cx);
+            gpui_kit::init(cx);
             crate::widget::init(cx);
         });
         let (widget, cx) = cx.add_window_view(|_, cx| {
@@ -1737,7 +1754,7 @@ mod presentation_tests {
             ),
         ] {
             cx.update_window_entity(&widget, |widget, window, cx| {
-                widget.request_focus(window);
+                widget.request_focus(window, cx);
                 widget.cursor_blink_phase = true;
                 widget.apply_pty_event(PtyEvent::Output(bytes.to_vec()), cx);
                 cx.notify();
@@ -1774,7 +1791,7 @@ mod presentation_tests {
             let anchor = widget.input_cursor_bounds().unwrap();
             widget.preedit = "日本".into();
             widget.composing = true;
-            window.blur();
+            window.blur(cx);
             let _ = widget.offscreen_element(window, cx);
             assert!(Rc::ptr_eq(&before, widget.committed.as_ref().unwrap()));
             assert_eq!(anchor, widget.input_cursor_bounds().unwrap());

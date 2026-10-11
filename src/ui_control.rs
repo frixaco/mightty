@@ -1,6 +1,6 @@
 //! Inject through GPUI's normal focus, shortcut, text and hit-testing paths.
 use crate::control::{self, ControlError, KeyEvent, Request};
-use gpui::{App, Keystroke, MouseButton, PlatformInput, Window, point, px};
+use gpui_kit::{App, Keystroke, MouseButton, PlatformInput, Window, point, px};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -72,7 +72,7 @@ pub struct Sequence {
     steps: std::collections::VecDeque<Step>,
     keys: BTreeMap<String, Keystroke>,
     pressed: Option<MouseButton>,
-    position: gpui::Point<gpui::Pixels>,
+    position: gpui_kit::Point<gpui_kit::Pixels>,
     completed: usize,
     focus_before: String,
     pub receiving_targets: Vec<Value>,
@@ -210,7 +210,7 @@ impl Sequence {
         let completed = self.completed;
         if completed > 0 {
             window.refresh();
-            window.draw(cx).clear();
+            window.draw(cx).clear(cx);
         }
         let result = match step {
             Step::Text { text } => {
@@ -232,9 +232,10 @@ impl Sequence {
                 transition(&mut keys, stroke.clone(), event)?;
                 if matches!(event, KeyEvent::Repeat) {
                     let result = window.dispatch_event(
-                        PlatformInput::KeyDown(gpui::KeyDownEvent {
+                        PlatformInput::KeyDown(gpui_kit::KeyDownEvent {
                             keystroke: stroke.clone(),
                             is_held: true,
+                            prefer_character_input: false,
                         }),
                         cx,
                     );
@@ -248,7 +249,7 @@ impl Sequence {
                 }
                 if matches!(event, KeyEvent::Tap | KeyEvent::Release) {
                     window.dispatch_event(
-                        PlatformInput::KeyUp(gpui::KeyUpEvent { keystroke: stroke }),
+                        PlatformInput::KeyUp(gpui_kit::KeyUpEvent { keystroke: stroke }),
                         cx,
                     );
                 }
@@ -269,7 +270,7 @@ impl Sequence {
                     "press" => {
                         let button = button(which.as_deref().unwrap())?;
                         pressed = Some(button);
-                        PlatformInput::MouseDown(gpui::MouseDownEvent {
+                        PlatformInput::MouseDown(gpui_kit::MouseDownEvent {
                             button,
                             position,
                             modifiers,
@@ -280,20 +281,20 @@ impl Sequence {
                     "release" => {
                         let button = button(which.as_deref().unwrap())?;
                         pressed = None;
-                        PlatformInput::MouseUp(gpui::MouseUpEvent {
+                        PlatformInput::MouseUp(gpui_kit::MouseUpEvent {
                             button,
                             position,
                             modifiers,
                             click_count: 1,
                         })
                     }
-                    "wheel" => PlatformInput::ScrollWheel(gpui::ScrollWheelEvent {
+                    "wheel" => PlatformInput::ScrollWheel(gpui_kit::ScrollWheelEvent {
                         position,
-                        delta: gpui::ScrollDelta::Pixels(point(px(delta_x), px(delta_y))),
+                        delta: gpui_kit::ScrollDelta::Pixels(point(px(delta_x), px(delta_y))),
                         modifiers,
-                        touch_phase: gpui::TouchPhase::Moved,
+                        touch_phase: gpui_kit::TouchPhase::Moved,
                     }),
-                    _ => PlatformInput::MouseMove(gpui::MouseMoveEvent {
+                    _ => PlatformInput::MouseMove(gpui_kit::MouseMoveEvent {
                         position,
                         pressed_button: pressed,
                         modifiers,
@@ -305,11 +306,11 @@ impl Sequence {
         };
         if let Err(mut error) = result {
             for (_, keystroke) in keys {
-                window.dispatch_event(PlatformInput::KeyUp(gpui::KeyUpEvent { keystroke }), cx);
+                window.dispatch_event(PlatformInput::KeyUp(gpui_kit::KeyUpEvent { keystroke }), cx);
             }
             if let Some(button) = pressed {
                 window.dispatch_event(
-                    PlatformInput::MouseUp(gpui::MouseUpEvent {
+                    PlatformInput::MouseUp(gpui_kit::MouseUpEvent {
                         button,
                         position,
                         ..Default::default()
@@ -333,11 +334,11 @@ impl Sequence {
     }
     pub fn cancel(&mut self, window: &mut Window, cx: &mut App) -> ControlError {
         for (_, keystroke) in std::mem::take(&mut self.keys) {
-            window.dispatch_event(PlatformInput::KeyUp(gpui::KeyUpEvent { keystroke }), cx);
+            window.dispatch_event(PlatformInput::KeyUp(gpui_kit::KeyUpEvent { keystroke }), cx);
         }
         if let Some(button) = self.pressed.take() {
             window.dispatch_event(
-                PlatformInput::MouseUp(gpui::MouseUpEvent {
+                PlatformInput::MouseUp(gpui_kit::MouseUpEvent {
                     button,
                     position: self.position,
                     ..Default::default()

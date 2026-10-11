@@ -1,6 +1,6 @@
 //! Native composition is local UI state; only committed text reaches Ghostty.
 use super::{TerminalWidget, ViewportScroll};
-use gpui::{
+use gpui_kit::{
     Bounds, Context, EntityInputHandler, Keystroke, Pixels, Point, UTF16Selection, Window, point,
     size,
 };

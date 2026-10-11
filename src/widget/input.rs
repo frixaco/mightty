@@ -8,7 +8,7 @@ pub(super) fn encode_key_event(
     key_event: &mut Event,
     terminal: &Terminal,
     action: Action,
-    keystroke: &gpui::Keystroke,
+    keystroke: &gpui_kit::Keystroke,
 ) -> Option<Vec<u8>> {
     encode_key_event_checked(key_encoder, key_event, terminal, action, keystroke)
         .ok()
@@ -20,7 +20,7 @@ pub(super) fn encode_key_event_checked(
     key_event: &mut Event,
     terminal: &Terminal,
     action: Action,
-    keystroke: &gpui::Keystroke,
+    keystroke: &gpui_kit::Keystroke,
 ) -> crate::ghostty::Result<Option<Vec<u8>>> {
     let ghostty_key = convert_to_ghostty_key(keystroke);
     let ghostty_mods = convert_modifiers(&keystroke.modifiers);
@@ -49,7 +49,7 @@ pub(super) fn encode_key_event_checked(
     Ok((!response.is_empty()).then_some(response))
 }
 
-fn printable_text(keystroke: &gpui::Keystroke, action: Action) -> Option<&str> {
+fn printable_text(keystroke: &gpui_kit::Keystroke, action: Action) -> Option<&str> {
     if action == Action::Release {
         return None;
     }
@@ -69,7 +69,7 @@ fn printable_text(keystroke: &gpui::Keystroke, action: Action) -> Option<&str> {
         })
 }
 
-fn unshifted_codepoint(keystroke: &gpui::Keystroke) -> char {
+fn unshifted_codepoint(keystroke: &gpui_kit::Keystroke) -> char {
     if keystroke.key == "space" {
         return ' ';
     }
@@ -107,7 +107,7 @@ fn unshifted_codepoint(keystroke: &gpui::Keystroke) -> char {
     }
 }
 
-pub(super) fn key_identity(keystroke: &gpui::Keystroke) -> String {
+pub(super) fn key_identity(keystroke: &gpui_kit::Keystroke) -> String {
     let codepoint = unshifted_codepoint(keystroke);
     if codepoint == '\0' {
         keystroke.key.clone()
@@ -145,7 +145,7 @@ fn key_implies_shift(key: &str, ucp: char) -> bool {
     ucp != '\0' && kc != ucp
 }
 
-fn convert_to_ghostty_key(keystroke: &gpui::Keystroke) -> Key {
+fn convert_to_ghostty_key(keystroke: &gpui_kit::Keystroke) -> Key {
     match keystroke.key.as_str() {
         "up" => Key::ArrowUp,
         "down" => Key::ArrowDown,
@@ -234,7 +234,7 @@ fn convert_to_ghostty_key(keystroke: &gpui::Keystroke) -> Key {
     }
 }
 
-pub(super) fn convert_modifiers(modifiers: &gpui::Modifiers) -> Mods {
+pub(super) fn convert_modifiers(modifiers: &gpui_kit::Modifiers) -> Mods {
     let mut mods = Mods::empty();
     if modifiers.shift {
         mods |= Mods::SHIFT;
@@ -261,15 +261,15 @@ mod tests {
             ("!", "1", Key::Digit1),
             ("?", "/", Key::Slash),
         ] {
-            let shifted = gpui::Keystroke {
+            let shifted = gpui_kit::Keystroke {
                 key: shifted.to_string(),
                 key_char: None,
-                modifiers: gpui::Modifiers {
+                modifiers: gpui_kit::Modifiers {
                     shift: true,
                     ..Default::default()
                 },
             };
-            let plain = gpui::Keystroke {
+            let plain = gpui_kit::Keystroke {
                 key: plain.to_string(),
                 key_char: None,
                 modifiers: Default::default(),

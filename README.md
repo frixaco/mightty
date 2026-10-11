@@ -50,8 +50,8 @@ The command palette over the active terminal layout.
 
 ## Stack
 
-- [GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui) for UI rendering.
-- [gpui-component](https://crates.io/crates/gpui-component) for the root component wrapper.
+- [GPUI Kit](https://github.com/longbridge/gpui-kit) 0.7.1 for GPUI rendering,
+  application infrastructure, and styled components.
 - [Ghostty](https://github.com/ghostty-org/ghostty) for the VT engine.
 - A project-owned Rust module over Ghostty's public C interface.
 - Windows ConPTY and Unix forkpty for shell process integration.

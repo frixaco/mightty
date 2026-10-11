@@ -3,7 +3,7 @@ use crate::{
     control::{ControlError, Request},
     feedback::TerminalCapture,
 };
-use gpui::{AppContext, Bounds, GpuCapture, IntoElement, Pixels};
+use gpui_kit::{AppContext, Bounds, GpuCapture, IntoElement, Pixels};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
@@ -20,7 +20,7 @@ static LIVE_STATE: std::sync::Mutex<Option<Arc<Value>>> = std::sync::Mutex::new(
 pub fn publish_state(state: Value) {
     *LIVE_STATE.lock().unwrap() = Some(Arc::new(state));
 }
-pub fn feedback(window: &mut gpui::Window, cx: &mut gpui::App) {
+pub fn feedback(window: &mut gpui_kit::Window, cx: &mut gpui_kit::App) {
     let mut request = Request {
         protocol_version: 1,
         instance_id: crate::control::instance_id().into(),
@@ -72,7 +72,7 @@ pub struct Permit;
 impl Permit {
     pub fn acquire() -> Result<Self, ControlError> {
         ACTIVE
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |active| {
                 (active < 4).then_some(active + 1)
             })
             .map(|_| Self)
@@ -115,14 +115,14 @@ pub struct Prepared {
     pub diagnostics_observed_at: String,
 }
 
-pub fn validate_size(size: gpui::Size<Pixels>, scale: f32) -> Result<(), ControlError> {
+pub fn validate_size(size: gpui_kit::Size<Pixels>, scale: f32) -> Result<(), ControlError> {
     let width = f32::from(size.width) * scale;
     let height = f32::from(size.height) * scale;
     if !width.is_finite()
         || !height.is_finite()
         || width <= 0.
         || height <= 0.
-        || width.ceil() as u64 * height.ceil() as u64 * 4 > gpui::MAX_CAPTURE_RGBA_BYTES as u64
+        || width.ceil() as u64 * height.ceil() as u64 * 4 > gpui_kit::MAX_CAPTURE_RGBA_BYTES as u64
     {
         return Err(ControlError::new(
             "capture_limit",
@@ -131,30 +131,30 @@ pub fn validate_size(size: gpui::Size<Pixels>, scale: f32) -> Result<(), Control
     }
     Ok(())
 }
-struct Scratch(Option<gpui::AnyElement>);
-impl gpui::Render for Scratch {
+struct Scratch(Option<gpui_kit::AnyElement>);
+impl gpui_kit::Render for Scratch {
     fn render(
         &mut self,
-        _: &mut gpui::Window,
-        _: &mut gpui::Context<Self>,
-    ) -> impl gpui::IntoElement {
+        _: &mut gpui_kit::Window,
+        _: &mut gpui_kit::Context<Self>,
+    ) -> impl gpui_kit::IntoElement {
         self.0
             .take()
-            .unwrap_or_else(|| gpui::Empty.into_any_element())
+            .unwrap_or_else(|| gpui_kit::Empty.into_any_element())
     }
 }
 pub fn scratch_window(
-    size: gpui::Size<Pixels>,
-    cx: &mut gpui::App,
-) -> Result<gpui::AnyWindowHandle, ControlError> {
+    size: gpui_kit::Size<Pixels>,
+    cx: &mut gpui_kit::App,
+) -> Result<gpui_kit::AnyWindowHandle, ControlError> {
     let handle = cx
         .open_window(
-            gpui::WindowOptions {
+            gpui_kit::WindowOptions {
                 show: false,
                 focus: false,
                 titlebar: None,
-                window_bounds: Some(gpui::WindowBounds::Windowed(Bounds::new(
-                    gpui::Point::default(),
+                window_bounds: Some(gpui_kit::WindowBounds::Windowed(Bounds::new(
+                    gpui_kit::Point::default(),
                     size,
                 ))),
                 ..Default::default()
@@ -165,11 +165,11 @@ pub fn scratch_window(
     Ok(handle.into())
 }
 pub fn paint_offscreen(
-    handle: gpui::AnyWindowHandle,
-    element: gpui::AnyElement,
-    size: gpui::Size<Pixels>,
+    handle: gpui_kit::AnyWindowHandle,
+    element: gpui_kit::AnyElement,
+    size: gpui_kit::Size<Pixels>,
     scale: f32,
-    cx: &mut gpui::App,
+    cx: &mut gpui_kit::App,
 ) -> Result<GpuCapture, ControlError> {
     handle
         .update(cx, |_, window, cx| {
@@ -181,7 +181,7 @@ pub fn paint_offscreen(
         })
         .map_err(|e| ControlError::new("frame_unavailable", e.to_string()))?
 }
-pub fn visibility(window: &gpui::Window) -> Value {
+pub fn visibility(window: &gpui_kit::Window) -> Value {
     #[cfg(windows)]
     {
         use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -195,7 +195,7 @@ pub fn visibility(window: &gpui::Window) -> Value {
     }
     json!({"visible":null,"minimized":null})
 }
-pub fn pane_presentation(window: &gpui::Window, pane_id: &str) -> Value {
+pub fn pane_presentation(window: &gpui_kit::Window, pane_id: &str) -> Value {
     if let Some(data) = window.presented_metadata()
         && let Ok(frame) = data.downcast::<Frame>()
         && let Some(pane) = frame
@@ -231,7 +231,7 @@ fn operating_system() -> Value {
 }
 pub fn acquire_presented(
     request: &Request,
-    window: &gpui::Window,
+    window: &gpui_kit::Window,
 ) -> Result<Prepared, ControlError> {
     let (gpu, metadata) = window
         .capture_presented()
@@ -323,7 +323,7 @@ pub fn write(
         std::fs::create_dir_all(&out)?;
         std::fs::create_dir(&temporary)?;
         let frame_id = prepared.gpu.frame_id;
-        let retention = json!({"retained_bytes":prepared.gpu.retained_bytes.to_string(),"copy_submission_ns":prepared.gpu.copy_submission_ns.to_string(),"gpu_copy_duration":{"availability":"unavailable","reason":"GPU timestamp queries are not enabled"},"max_retention_per_window_bytes":(2*gpui::MAX_CAPTURE_RGBA_BYTES).to_string(),"max_readback_bytes":gpui::MAX_CAPTURE_RGBA_BYTES.to_string()});
+        let retention = json!({"retained_bytes":prepared.gpu.retained_bytes.to_string(),"copy_submission_ns":prepared.gpu.copy_submission_ns.to_string(),"gpu_copy_duration":{"availability":"unavailable","reason":"GPU timestamp queries are not enabled"},"max_retention_per_window_bytes":(2*gpui_kit::MAX_CAPTURE_RGBA_BYTES).to_string(),"max_readback_bytes":gpui_kit::MAX_CAPTURE_RGBA_BYTES.to_string()});
         let width = prepared.gpu.width;
         let height = prepared.gpu.height;
         let timestamp = prepared
@@ -393,7 +393,7 @@ pub fn write(
                 None
             }
         };
-        let environment = json!({"build":{"mightty_version":env!("CARGO_PKG_VERSION"),"mightty_revision":env!("MIGHTTY_BUILD_REVISION"),"target":env!("MIGHTTY_BUILD_TARGET"),"profile":env!("MIGHTTY_BUILD_PROFILE"),"ghostty_optimize":env!("MIGHTTY_GHOSTTY_OPTIMIZE"),"ghostty_headers":env!("MIGHTTY_GHOSTTY_HEADERS"),"embedded_fonts":env!("MIGHTTY_FONT_FINGERPRINTS"),"ghostty_revision":crate::ghostty::SOURCE_REVISION,"gpui_version":"0.2.2 with local capture patch","debug_assertions":cfg!(debug_assertions)},"os":operating_system(),"backend":"Direct3D11","color":{"source":"BGRA8 UNORM","export":"RGBA8 PNG","conversion":"lossless channel swizzle; no color correction"},"dpi_scale":prepared.frame.dpi_scale,"frame_effective_settings":prepared.frame.window["settings"],"gpu":prepared.frame.window["gpu"],"current_settings_generations":state["windows"].as_array().map(|windows|windows.iter().map(|window|json!({"window_id":window["window_id"],"generation":window["settings_generation"]})).collect::<Vec<_>>()),"launch_recipes":prepared.frame.panes.iter().map(|pane|&pane.state["launch"]).collect::<Vec<_>>()});
+        let environment = json!({"build":{"mightty_version":env!("CARGO_PKG_VERSION"),"mightty_revision":env!("MIGHTTY_BUILD_REVISION"),"target":env!("MIGHTTY_BUILD_TARGET"),"profile":env!("MIGHTTY_BUILD_PROFILE"),"ghostty_optimize":env!("MIGHTTY_GHOSTTY_OPTIMIZE"),"ghostty_headers":env!("MIGHTTY_GHOSTTY_HEADERS"),"embedded_fonts":env!("MIGHTTY_FONT_FINGERPRINTS"),"ghostty_revision":crate::ghostty::SOURCE_REVISION,"gpui_version":"gpui-pre 0.3.8 with local capture patch","gpui_kit_version":"0.7.1","debug_assertions":cfg!(debug_assertions)},"os":operating_system(),"backend":"Direct3D11","color":{"source":"BGRA8 UNORM","export":"RGBA8 PNG","conversion":"lossless channel swizzle; no color correction"},"dpi_scale":prepared.frame.dpi_scale,"frame_effective_settings":prepared.frame.window["settings"],"gpu":prepared.frame.window["gpu"],"current_settings_generations":state["windows"].as_array().map(|windows|windows.iter().map(|window|json!({"window_id":window["window_id"],"generation":window["settings_generation"]})).collect::<Vec<_>>()),"launch_recipes":prepared.frame.panes.iter().map(|pane|&pane.state["launch"]).collect::<Vec<_>>()});
         for (name, value) in [
             (
                 "frame.json",

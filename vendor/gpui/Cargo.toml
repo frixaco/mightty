@@ -11,8 +11,8 @@
 
 [package]
 edition = "2024"
-name = "gpui"
-version = "0.2.2"
+name = "gpui-pre"
+version = "0.3.8"
 authors = ["Nathan Sobo <nathan@zed.dev>"]
 build = "build.rs"
 publish = true
@@ -21,7 +21,7 @@ autobins = false
 autoexamples = false
 autotests = false
 autobenches = false
-description = "Zed's GPU-accelerated UI framework"
+description = "Zed's GPU-accelerated UI framework (gpui-pre snapshot of zed@279fe07)"
 homepage = "https://gpui.rs"
 readme = "README.md"
 keywords = [
@@ -34,7 +34,28 @@ license = "Apache-2.0"
 repository = "https://github.com/zed-industries/zed"
 resolver = "2"
 
+[package.metadata.cargo-shear]
+ignored = [
+    "bindgen",
+    "font-kit",
+    "getrandom",
+    "objc2",
+    "objc2-metal",
+]
+ignored-paths = ["src/_ownership_and_data_flow.rs"]
+
+[package.metadata.gpui-pre]
+zed-crate = "gpui"
+zed-version = "0.2.2"
+zed-rev = "279fe070bb389b79652e52065b2f001edcc0b11b"
+
 [features]
+bench = ["bench-support"]
+bench-support = [
+    "profiler",
+    "dep:criterion",
+    "dep:bench_metrics",
+]
 default = [
     "font-kit",
     "wayland",
@@ -42,67 +63,36 @@ default = [
     "windows-manifest",
 ]
 inspector = ["gpui_macros/inspector"]
-leak-detection = ["backtrace"]
-macos-blade = [
-    "blade-graphics",
-    "blade-macros",
-    "blade-util",
-    "bytemuck",
-    "objc2",
-    "objc2-metal",
-]
-runtime_shaders = []
+leak-detection = []
+profiler = ["dep:hdrhistogram"]
 screen-capture = ["scap"]
+stacker = ["dep:stacksafe"]
 test-support = [
-    "leak-detection",
     "collections/test-support",
-    "rand",
-    "util/test-support",
     "http_client/test-support",
     "wayland",
     "x11",
+    "proptest",
 ]
-wayland = [
-    "blade-graphics",
-    "blade-macros",
-    "blade-util",
-    "bytemuck",
-    "ashpd/wayland",
-    "cosmic-text",
-    "font-kit",
-    "calloop-wayland-source",
-    "wayland-backend",
-    "wayland-client",
-    "wayland-cursor",
-    "wayland-protocols",
-    "wayland-protocols-plasma",
-    "filedescriptor",
-    "xkbcommon",
-    "open",
-]
-windows-manifest = []
-x11 = [
-    "blade-graphics",
-    "blade-macros",
-    "blade-util",
-    "bytemuck",
-    "ashpd",
-    "cosmic-text",
-    "font-kit",
-    "as-raw-xcb-connection",
-    "x11rb",
-    "xkbcommon",
-    "xim",
-    "x11-clipboard",
-    "filedescriptor",
-    "open",
-    "scap?/x11",
-]
+wayland = []
+windows-manifest = ["dep:embed-resource"]
+x11 = ["scap?/x11"]
 
 [lib]
 name = "gpui"
 path = "src/gpui.rs"
-doctest = false
+
+[[example]]
+name = "a11y"
+path = "examples/a11y.rs"
+
+[[example]]
+name = "active_state_bug"
+path = "examples/active_state_bug.rs"
+
+[[example]]
+name = "anchor"
+path = "examples/anchor.rs"
 
 [[example]]
 name = "animation"
@@ -115,6 +105,10 @@ path = "examples/data_table.rs"
 [[example]]
 name = "drag_drop"
 path = "examples/drag_drop.rs"
+
+[[example]]
+name = "focus_visible"
+path = "examples/focus_visible.rs"
 
 [[example]]
 name = "gif_viewer"
@@ -149,6 +143,22 @@ name = "input"
 path = "examples/input.rs"
 
 [[example]]
+name = "layer_shell"
+path = "examples/layer_shell.rs"
+
+[[example]]
+name = "list_example"
+path = "examples/list_example.rs"
+
+[[example]]
+name = "mouse_pressure"
+path = "examples/mouse_pressure.rs"
+
+[[example]]
+name = "move_entity_between_windows"
+path = "examples/move_entity_between_windows.rs"
+
+[[example]]
 name = "on_window_close_quit"
 path = "examples/on_window_close_quit.rs"
 
@@ -173,6 +183,10 @@ name = "pattern"
 path = "examples/pattern.rs"
 
 [[example]]
+name = "popover"
+path = "examples/popover.rs"
+
+[[example]]
 name = "scrollable"
 path = "examples/scrollable.rs"
 
@@ -189,8 +203,16 @@ name = "svg"
 path = "examples/svg/svg.rs"
 
 [[example]]
+name = "system_notifications"
+path = "examples/system_notifications.rs"
+
+[[example]]
 name = "tab_stop"
 path = "examples/tab_stop.rs"
+
+[[example]]
+name = "testing"
+path = "examples/testing.rs"
 
 [[example]]
 name = "text"
@@ -205,6 +227,10 @@ name = "text_wrapper"
 path = "examples/text_wrapper.rs"
 
 [[example]]
+name = "toggle_headless"
+path = "examples/toggle_headless.rs"
+
+[[example]]
 name = "tree"
 path = "examples/tree.rs"
 
@@ -213,8 +239,16 @@ name = "uniform_list"
 path = "examples/uniform_list.rs"
 
 [[example]]
+name = "view_example"
+path = "examples/view_example/view_example_main.rs"
+
+[[example]]
 name = "window"
 path = "examples/window.rs"
+
+[[example]]
+name = "window_movable"
+path = "examples/window_movable.rs"
 
 [[example]]
 name = "window_positioning"
@@ -228,6 +262,10 @@ path = "examples/window_shadow.rs"
 name = "action_macros"
 path = "tests/action_macros.rs"
 
+[dependencies.accesskit]
+version = "0.24.0"
+features = ["enumn"]
+
 [dependencies.anyhow]
 version = "1.0.86"
 
@@ -236,59 +274,105 @@ version = "4.7"
 
 [dependencies.backtrace]
 version = "0.3"
-optional = true
 
-[dependencies.blade-graphics]
-version = "0.7.0"
+[dependencies.bench_metrics]
+version = "=0.3.8"
 optional = true
+package = "gpui-pre-bench-metrics"
 
-[dependencies.blade-macros]
-version = "0.3.0"
-optional = true
+[dependencies.bitflags]
+version = "2.6.0"
 
-[dependencies.blade-util]
-version = "0.3.0"
-optional = true
-
-[dependencies.bytemuck]
-version = "1"
-optional = true
+[dependencies.chrono]
+version = "0.4"
+features = ["serde"]
 
 [dependencies.collections]
-version = "0.2.2"
-package = "gpui_collections"
+version = "=0.3.8"
+package = "gpui-pre-collections"
+
+[dependencies.criterion]
+version = "0.8.2"
+features = ["html_reports"]
+optional = true
 
 [dependencies.ctor]
-version = "0.4.0"
+version = "1.0.12"
 
 [dependencies.derive_more]
-version = "0.99.17"
+version = "2.1.1"
+features = [
+    "add",
+    "add_assign",
+    "deref",
+    "deref_mut",
+    "display",
+    "from",
+    "from_str",
+    "mul",
+    "mul_assign",
+    "not",
+]
 
 [dependencies.etagere]
 version = "0.2"
 
 [dependencies.futures]
-version = "0.3"
+version = "0.3.34"
+
+[dependencies.futures-concurrency]
+version = "7.7.1"
 
 [dependencies.gpui_macros]
-version = "0.2.2"
-package = "gpui-macros"
+version = "=0.3.8"
+package = "gpui-pre-macros"
+
+[dependencies.gpui_shared_string]
+version = "=0.3.8"
+package = "gpui-pre-shared-string"
+
+[dependencies.gpui_util]
+version = "=0.3.8"
+package = "gpui-pre-util"
+
+[dependencies.hdrhistogram]
+version = "7"
+optional = true
+default-features = false
+
+[dependencies.heapless]
+version = "0.9.2"
 
 [dependencies.http_client]
-version = "0.2.2"
-package = "gpui_http_client"
+version = "=0.3.8"
+package = "gpui-pre-http-client"
 
 [dependencies.image]
 version = "0.25.1"
+features = [
+    "bmp",
+    "dds",
+    "exr",
+    "ff",
+    "gif",
+    "hdr",
+    "ico",
+    "jpeg",
+    "png",
+    "pnm",
+    "qoi",
+    "rayon",
+    "tga",
+    "tiff",
+    "webp",
+]
+default-features = false
 
 [dependencies.inventory]
 version = "0.3.19"
 
 [dependencies.itertools]
 version = "0.14.0"
-
-[dependencies.libc]
-version = "0.2"
 
 [dependencies.log]
 version = "0.4.16"
@@ -312,6 +396,9 @@ version = "0.12.1"
 [dependencies.pin-project]
 version = "1.1.10"
 
+[dependencies.pollster]
+version = "0.4.0"
+
 [dependencies.postage]
 version = "0.5"
 features = ["futures-traits"]
@@ -319,25 +406,38 @@ features = ["futures-traits"]
 [dependencies.profiling]
 version = "1"
 
+[dependencies.proptest]
+version = "1"
+features = ["attr-macro"]
+optional = true
+package = "proptest"
+
 [dependencies.rand]
 version = "0.9"
-optional = true
 
 [dependencies.raw-window-handle]
 version = "0.6"
 
 [dependencies.refineable]
-version = "0.2.2"
-package = "gpui_refineable"
+version = "=0.3.8"
+package = "gpui-pre-refineable"
+
+[dependencies.regex]
+version = "1.5"
 
 [dependencies.resvg]
-version = "0.45.0"
+version = "0.46.0"
 features = [
     "text",
     "system-fonts",
     "memmap-fonts",
+    "raster-images",
 ]
 default-features = false
+
+[dependencies.scheduler]
+version = "=0.3.8"
+package = "gpui-pre-scheduler"
 
 [dependencies.schemars]
 version = "1.0"
@@ -345,10 +445,6 @@ features = ["indexmap2"]
 
 [dependencies.seahash]
 version = "4.1"
-
-[dependencies.semantic_version]
-version = "0.2.2"
-package = "gpui_semantic_version"
 
 [dependencies.serde]
 version = "1.0.221"
@@ -369,39 +465,45 @@ version = "1.0.6"
 
 [dependencies.smallvec]
 version = "1.6"
-features = ["union"]
+features = [
+    "union",
+    "const_new",
+]
 
-[dependencies.smol]
-version = "2.0"
+[dependencies.spin]
+version = "0.10.0"
 
 [dependencies.stacksafe]
-version = "0.1"
+version = "1.0"
+optional = true
 
 [dependencies.strum]
-version = "0.27.2"
+version = "0.28"
 features = ["derive"]
 
 [dependencies.sum_tree]
-version = "0.2.2"
-package = "gpui_sum_tree"
+version = "=0.3.8"
+package = "gpui-pre-sum-tree"
 
 [dependencies.taffy]
-version = "=0.9.0"
+version = "0.13.0"
 
 [dependencies.thiserror]
 version = "2.0.12"
 
+[dependencies.ttf-parser]
+version = "0.25"
+
+[dependencies.url]
+version = "2.2"
+
 [dependencies.usvg]
-version = "0.45.0"
+version = "0.46.0"
 default-features = false
 
-[dependencies.util]
-version = "0.2.2"
-package = "gpui_util"
-
 [dependencies.util_macros]
-version = "0.2.2"
-package = "gpui_util_macros"
+version = "=0.3.8"
+package = "gpui-pre-util-macros"
 
 [dependencies.uuid]
 version = "1.1.2"
@@ -415,173 +517,19 @@ features = [
 [dependencies.waker-fn]
 version = "1.2.0"
 
-[dev-dependencies.backtrace]
-version = "0.3"
+[dependencies.web-time]
+version = "1.1.0"
 
-[dev-dependencies.collections]
-version = "0.2.2"
-features = ["test-support"]
-package = "gpui_collections"
-
-[dev-dependencies.env_logger]
-version = "0.11"
-
-[dev-dependencies.http_client]
-version = "0.2.2"
-features = ["test-support"]
-package = "gpui_http_client"
-
-[dev-dependencies.lyon]
-version = "1.0"
-features = ["extra"]
-
-[dev-dependencies.pretty_assertions]
-version = "1.3.0"
-features = ["unstable"]
-
-[dev-dependencies.rand]
-version = "0.9"
-
-[dev-dependencies.unicode-segmentation]
-version = "1.10"
-
-[dev-dependencies.util]
-version = "0.2.2"
-features = ["test-support"]
-package = "gpui_util"
-
-[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies.as-raw-xcb-connection]
-version = "1"
+[build-dependencies.embed-resource]
+version = "3.0"
 optional = true
 
-[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies.ashpd]
-version = "0.11"
-features = ["async-std"]
-optional = true
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies.async-channel]
+version = "2.5.0"
 default-features = false
 
-[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies.blade-graphics]
-version = "0.7.0"
-optional = true
-
-[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies.blade-macros]
-version = "0.3.0"
-optional = true
-
-[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies.blade-util]
-version = "0.3.0"
-optional = true
-
-[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies.bytemuck]
-version = "1"
-optional = true
-
-[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies.calloop]
-version = "0.13.0"
-
-[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies.calloop-wayland-source]
-version = "0.3.0"
-optional = true
-
-[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies.cosmic-text]
-version = "0.14.0"
-optional = true
-
-[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies.filedescriptor]
-version = "0.8.2"
-optional = true
-
-[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies.flume]
-version = "0.11"
-
-[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies.font-kit]
-version = "0.14.1-zed"
-features = ["source-fontconfig-dlopen"]
-optional = true
-package = "zed-font-kit"
-
-[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies.oo7]
-version = "0.5.0"
-features = [
-    "async-std",
-    "native_crypto",
-]
-default-features = false
-
-[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies.open]
-version = "5.2.0"
-optional = true
-
-[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies.wayland-backend]
-version = "0.3.3"
-features = [
-    "client_system",
-    "dlopen",
-]
-optional = true
-
-[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies.wayland-client]
-version = "0.31.2"
-optional = true
-
-[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies.wayland-cursor]
-version = "0.31.1"
-optional = true
-
-[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies.wayland-protocols]
-version = "0.31.2"
-features = [
-    "client",
-    "staging",
-    "unstable",
-]
-optional = true
-
-[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies.wayland-protocols-plasma]
-version = "0.2.0"
-features = ["client"]
-optional = true
-
-[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies.x11-clipboard]
-version = "0.9.3"
-optional = true
-
-[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies.x11rb]
-version = "0.13.1"
-features = [
-    "allow-unsafe-code",
-    "xkb",
-    "randr",
-    "xinput",
-    "cursor",
-    "resource_manager",
-    "sync",
-]
-optional = true
-
-[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies.xim]
-version = "0.4.0-zed"
-features = [
-    "x11rb-xcb",
-    "x11rb-client",
-]
-optional = true
-package = "zed-xim"
-
-[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies.xkbcommon]
-version = "0.8.0"
-features = [
-    "wayland",
-    "x11",
-]
-optional = true
-
-[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.build-dependencies.naga]
-version = "25.0"
-features = ["wgsl-in"]
-
-[target.'cfg(any(target_os = "linux", target_os = "freebsd", target_os = "macos"))'.dependencies.pathfinder_geometry]
-version = "0.5"
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies.libc]
+version = "0.2"
 
 [target.'cfg(any(target_os = "linux", target_os = "freebsd", target_os = "windows"))'.dependencies.scap]
 version = "0.0.8-zed"
@@ -589,38 +537,31 @@ optional = true
 default-features = false
 package = "zed-scap"
 
-[target.'cfg(target_os = "macos")'.dependencies.block]
-version = "0.1"
-
-[target.'cfg(target_os = "macos")'.dependencies.cocoa]
-version = "=0.26.0"
-
-[target.'cfg(target_os = "macos")'.dependencies.cocoa-foundation]
-version = "=0.2.0"
-
-[target.'cfg(target_os = "macos")'.dependencies.core-foundation]
-version = "=0.10.0"
-
-[target.'cfg(target_os = "macos")'.dependencies.core-foundation-sys]
-version = "0.8.6"
-
-[target.'cfg(target_os = "macos")'.dependencies.core-graphics]
-version = "0.24"
-
-[target.'cfg(target_os = "macos")'.dependencies.core-text]
-version = "21"
-
-[target.'cfg(target_os = "macos")'.dependencies.core-video]
-version = "0.4.3"
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies.core-video]
+version = "0.5.2"
 features = ["metal"]
+
+[target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dependencies.async-channel]
+version = "2.5.0"
+
+[target.'cfg(target_family = "wasm")'.dependencies.getrandom]
+version = "0.3.4"
+features = ["wasm_js"]
+
+[target.'cfg(target_family = "wasm")'.dependencies.uuid]
+version = "1.1.2"
+features = [
+    "v4",
+    "v5",
+    "v7",
+    "serde",
+    "js",
+]
 
 [target.'cfg(target_os = "macos")'.dependencies.font-kit]
 version = "0.14.1-zed"
 optional = true
 package = "zed-font-kit"
-
-[target.'cfg(target_os = "macos")'.dependencies.foreign-types]
-version = "0.5"
 
 [target.'cfg(target_os = "macos")'.dependencies.log]
 version = "0.4.16"
@@ -629,56 +570,49 @@ features = [
     "serde",
 ]
 
-[target.'cfg(target_os = "macos")'.dependencies.media]
-version = "0.2.2"
-package = "gpui_media"
-
-[target.'cfg(target_os = "macos")'.dependencies.metal]
-version = "0.29"
-
-[target.'cfg(target_os = "macos")'.dependencies.objc]
-version = "0.2"
-
 [target.'cfg(target_os = "macos")'.dependencies.objc2]
 version = "0.6"
 optional = true
+
+[target.'cfg(target_os = "macos")'.dependencies.objc2-core-foundation]
+version = "0.3.2"
+default-features = false
+
+[target.'cfg(target_os = "macos")'.dependencies.objc2-core-video]
+version = "0.3.2"
+features = [
+    "CVBuffer",
+    "CVImageBuffer",
+]
+default-features = false
 
 [target.'cfg(target_os = "macos")'.dependencies.objc2-metal]
 version = "0.3"
 optional = true
 
 [target.'cfg(target_os = "macos")'.build-dependencies.bindgen]
-version = "0.71"
-
-[target.'cfg(target_os = "macos")'.build-dependencies.cbindgen]
-version = "0.28.0"
-default-features = false
-
-[target.'cfg(target_os = "macos")'.build-dependencies.naga]
-version = "25.0"
-features = ["wgsl-in"]
-
-[target.'cfg(target_os = "windows")'.dependencies.flume]
-version = "0.11"
-
-[target.'cfg(target_os = "windows")'.dependencies.rand]
-version = "0.9"
+version = "0.72"
 
 [target.'cfg(target_os = "windows")'.dependencies.windows]
-version = "0.61"
+version = "0.62"
 features = [
+    "Data_Xml_Dom",
     "Foundation_Numerics",
+    "Globalization_DateTimeFormatting",
     "Storage_Search",
     "Storage_Streams",
     "System_Threading",
+    "UI_Notifications",
     "UI_ViewManagement",
     "Wdk_System_SystemServices",
+    "Win32_Foundation",
     "Win32_Globalization",
     "Win32_Graphics_Direct3D",
     "Win32_Graphics_Direct3D11",
     "Win32_Graphics_Direct3D_Fxc",
     "Win32_Graphics_DirectComposition",
     "Win32_Graphics_DirectWrite",
+    "Win32_Graphics_DirectManipulation",
     "Win32_Graphics_Dwm",
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
@@ -690,16 +624,21 @@ features = [
     "Win32_Security_Credentials",
     "Win32_Security_Cryptography",
     "Win32_Storage_FileSystem",
+    "Win32_Storage_Packaging_Appx",
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",
     "Win32_System_Console",
+    "Win32_System_Diagnostics_Debug",
     "Win32_System_DataExchange",
     "Win32_System_IO",
+    "Win32_System_JobObjects",
     "Win32_System_LibraryLoader",
     "Win32_System_Memory",
     "Win32_System_Ole",
     "Win32_System_Performance",
     "Win32_System_Pipes",
+    "Win32_System_Power",
+    "Win32_System_RestartManager",
     "Win32_System_SystemInformation",
     "Win32_System_SystemServices",
     "Win32_System_Threading",
@@ -709,23 +648,18 @@ features = [
     "Win32_UI_HiDpi",
     "Win32_UI_Input_Ime",
     "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Input_Pointer",
     "Win32_UI_Shell",
     "Win32_UI_Shell_Common",
     "Win32_UI_Shell_PropertiesSystem",
     "Win32_UI_WindowsAndMessaging",
+    "Win32_Media",
+    "Win32_Foundation",
+    "Win32_System_Power",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_Threading",
+    "Win32_System_WindowsProgramming",
 ]
-
-[target.'cfg(target_os = "windows")'.dependencies.windows-core]
-version = "0.61"
-
-[target.'cfg(target_os = "windows")'.dependencies.windows-numerics]
-version = "0.2"
-
-[target.'cfg(target_os = "windows")'.dependencies.windows-registry]
-version = "0.5"
-
-[target.'cfg(target_os = "windows")'.build-dependencies.embed-resource]
-version = "3.0"
 
 [lints.clippy]
 dbg_macro = "deny"

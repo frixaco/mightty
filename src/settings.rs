@@ -505,7 +505,7 @@ fn apply_theme(settings: ThemeSettings, theme: &mut TerminalTheme) -> Result<(),
     Ok(())
 }
 
-fn parse_color(field: &str, value: &str) -> Result<gpui::Rgba, SettingsError> {
+fn parse_color(field: &str, value: &str) -> Result<gpui_kit::Rgba, SettingsError> {
     let Some(hex) = value.strip_prefix('#') else {
         return Err(SettingsError::new(format!(
             "{field} must use #RRGGBB format"
@@ -518,7 +518,7 @@ fn parse_color(field: &str, value: &str) -> Result<gpui::Rgba, SettingsError> {
     }
     let color = u32::from_str_radix(hex, 16)
         .map_err(|_| SettingsError::new(format!("{field} must use #RRGGBB format")))?;
-    Ok(gpui::rgb(color))
+    Ok(gpui_kit::rgb(color))
 }
 
 fn validate_app_settings(settings: &AppSettings) -> Result<(), SettingsError> {
@@ -963,10 +963,17 @@ fn git_bash_candidates() -> Vec<PathBuf> {
 #[cfg(windows)]
 fn decode_wsl_names(bytes: &[u8]) -> Vec<String> {
     let text = if bytes.starts_with(&[0xff, 0xfe])
-        || bytes.chunks_exact(2).take(16).any(|pair| pair[1] == 0)
+        || bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .take(16)
+            .any(|pair| pair[1] == 0)
     {
         let words = bytes
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
             .filter(|word| *word != 0xfeff)
             .collect::<Vec<_>>();
@@ -1126,9 +1133,9 @@ mod tests {
 
         assert_eq!(settings.terminal.font_family, "Test Mono");
         assert_eq!(settings.terminal.font_size_px, 18.0);
-        assert_eq!(settings.terminal.theme.background, gpui::rgb(0x102030));
-        assert_eq!(settings.terminal.theme.foreground, gpui::rgb(0xffffff));
-        assert_eq!(settings.terminal.theme.palette[4], gpui::rgb(0x5ea1ff));
+        assert_eq!(settings.terminal.theme.background, gpui_kit::rgb(0x102030));
+        assert_eq!(settings.terminal.theme.foreground, gpui_kit::rgb(0xffffff));
+        assert_eq!(settings.terminal.theme.palette[4], gpui_kit::rgb(0x5ea1ff));
         let binding = settings
             .key_bindings
             .iter()

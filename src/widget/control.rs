@@ -10,8 +10,8 @@ impl TerminalWidget {
         open: bool,
         query: Option<&str>,
         visible: bool,
-        window: &mut gpui::Window,
-        cx: &mut gpui::Context<Self>,
+        window: &mut gpui_kit::Window,
+        cx: &mut gpui_kit::Context<Self>,
     ) {
         if open {
             self.prepare_search(visible, window, cx);
@@ -31,7 +31,7 @@ impl TerminalWidget {
             self.search = None;
             self.search_input = None;
             self.search_input_subscription = None;
-            self.search_task = gpui::Task::ready(());
+            self.search_task = gpui_kit::Task::ready(());
             self.presentation_dirty = true;
             cx.notify();
         }
@@ -170,7 +170,7 @@ impl TerminalWidget {
     pub fn control_scroll(
         &mut self,
         request: &Request,
-        cx: &mut gpui::Context<Self>,
+        cx: &mut gpui_kit::Context<Self>,
     ) -> Result<Value, ControlError> {
         if let Some(to) = control::string_arg(request, "to")? {
             if request.args.contains_key("rows") {

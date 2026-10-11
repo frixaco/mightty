@@ -3,7 +3,7 @@
 use std::io;
 use std::mem::size_of;
 
-use gpui::Window;
+use gpui_kit::Window;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows_sys::Win32::Foundation::{HWND, POINT, RECT};
 use windows_sys::Win32::Graphics::Gdi::{

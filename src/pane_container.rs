@@ -1,12 +1,12 @@
-use gpui::{
-    AnyElement, Context, Entity, FocusHandle, Font, FontFallbacks, IntoElement, KeyDownEvent,
-    KeyUpEvent, MouseButton, MouseDownEvent, Render, Task, Timer, Window, WindowControlArea, div,
-    font, prelude::*, px,
-};
-use gpui_component::{
+use gpui_kit::component::{
     InteractiveElementExt,
     button::{Button, ButtonVariants},
     menu::AppMenuBar,
+};
+use gpui_kit::{
+    AnyElement, Context, Entity, FocusHandle, Font, FontFallbacks, IntoElement, KeyDownEvent,
+    KeyUpEvent, MouseButton, MouseDownEvent, Render, Task, Window, WindowControlArea, div, font,
+    prelude::*, px,
 };
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -67,8 +67,8 @@ struct PaletteState {
 
 pub struct PaneContainer {
     window_id: String,
-    content_bounds: Option<gpui::Bounds<gpui::Pixels>>,
-    layout_input: Option<(gpui::Size<gpui::Pixels>, bool)>,
+    content_bounds: Option<gpui_kit::Bounds<gpui_kit::Pixels>>,
+    layout_input: Option<(gpui_kit::Size<gpui_kit::Pixels>, bool)>,
     control_acks: Vec<flume::Receiver<crate::control::Acknowledgement>>,
     tabs: Vec<Tab>,
     active_tab_index: usize,
@@ -84,10 +84,10 @@ pub struct PaneContainer {
     workspace_ids: Vec<WorkspaceId>,
     workspace_diagnostic: Option<String>,
     palette: Option<PaletteState>,
-    palette_restore_focus: Option<gpui::WeakFocusHandle>,
+    palette_restore_focus: Option<gpui_kit::WeakFocusHandle>,
     palette_focus: FocusHandle,
-    palette_input: Option<Entity<gpui_component::input::InputState>>,
-    palette_input_subscription: Option<gpui::Subscription>,
+    palette_input: Option<Entity<gpui_kit::component::input::InputState>>,
+    palette_input_subscription: Option<gpui_kit::Subscription>,
     exit_tx: flume::Sender<()>,
     exit_task: Task<()>,
 }
@@ -122,9 +122,9 @@ impl PaneContainer {
         } else {
             0.0
         };
-        let bounds = gpui::Bounds {
-            origin: gpui::point(px(WINDOW_HORIZONTAL_PADDING_PX + sidebar), px(titlebar)),
-            size: gpui::size(
+        let bounds = gpui_kit::Bounds {
+            origin: gpui_kit::point(px(WINDOW_HORIZONTAL_PADDING_PX + sidebar), px(titlebar)),
+            size: gpui_kit::size(
                 (viewport.width - px(2.0 * WINDOW_HORIZONTAL_PADDING_PX + sidebar)).max(px(1.0)),
                 (viewport.height - px(titlebar)).max(px(1.0)),
             ),
@@ -133,7 +133,7 @@ impl PaneContainer {
     }
     fn apply_content_layout(
         &mut self,
-        bounds: gpui::Bounds<gpui::Pixels>,
+        bounds: gpui_kit::Bounds<gpui_kit::Pixels>,
         window: &Window,
         cx: &mut Context<Self>,
     ) {
@@ -161,7 +161,7 @@ impl PaneContainer {
             config.launch.environment.insert(key.into(), value.into());
         }
     }
-    pub fn control_contains(&self, target: &crate::control::Target, cx: &gpui::App) -> bool {
+    pub fn control_contains(&self, target: &crate::control::Target, cx: &gpui_kit::App) -> bool {
         self.tabs.iter().any(|tab| {
             target
                 .tab_id
@@ -181,7 +181,7 @@ impl PaneContainer {
     fn control_target(
         &self,
         target: &crate::control::Target,
-        cx: &gpui::App,
+        cx: &gpui_kit::App,
     ) -> Result<(usize, crate::split::PaneId, Entity<TerminalWidget>), crate::control::ControlError>
     {
         use crate::control::ControlError;
@@ -234,7 +234,7 @@ impl PaneContainer {
         &self.window_id
     }
 
-    pub fn control_state(&self, window: &Window, cx: &gpui::App) -> serde_json::Value {
+    pub fn control_state(&self, window: &Window, cx: &gpui_kit::App) -> serde_json::Value {
         use serde_json::json;
         json!({"bounds":{"width":f32::from(window.viewport_size().width),"height":f32::from(window.viewport_size().height)},
             "visibility":crate::snapshot::visibility(window),
@@ -791,7 +791,7 @@ impl PaneContainer {
             );
             let pane_to_focus = split.update(cx, |split, cx| split.remove_active_pane(window, cx));
             if let Some(pane) = pane_to_focus {
-                pane.update(cx, |pane, _cx| pane.request_focus(window));
+                pane.update(cx, |pane, cx| pane.request_focus(window, cx));
             }
             cx.notify();
             return;
@@ -819,8 +819,7 @@ impl PaneContainer {
                         this.needs_focus = true;
                         cx.notify();
                     }
-                })
-                .ok();
+                });
             }
         });
     }
@@ -828,39 +827,34 @@ impl PaneContainer {
     fn start_settings_task(&mut self, cx: &mut Context<Self>) {
         self.settings_task = cx.spawn(async move |this, cx| {
             loop {
-                Timer::after(Duration::from_secs(2)).await;
+                cx.background_executor().timer(Duration::from_secs(2)).await;
                 let Some(this) = this.upgrade() else {
                     break;
                 };
-                let should_continue = this
-                    .update(cx, |this, cx| match this.settings.reload_if_changed() {
-                        ReloadOutcome::Unchanged => {}
-                        ReloadOutcome::Applied { .. } => {
-                            let settings = this.settings.current();
-                            this.sidebar_visible = settings.app.sidebar_visible;
-                            let bindings = settings.key_bindings.clone();
-                            let generation = this.settings.generation();
-                            for tab in &this.tabs {
-                                tab.split.update(cx, |split, cx| {
-                                    split.set_action_bindings(&bindings, generation, cx)
-                                });
-                            }
-                            cx.notify();
+                this.update(cx, |this, cx| match this.settings.reload_if_changed() {
+                    ReloadOutcome::Unchanged => {}
+                    ReloadOutcome::Applied { .. } => {
+                        let settings = this.settings.current();
+                        this.sidebar_visible = settings.app.sidebar_visible;
+                        let bindings = settings.key_bindings.clone();
+                        let generation = this.settings.generation();
+                        for tab in &this.tabs {
+                            tab.split.update(cx, |split, cx| {
+                                split.set_action_bindings(&bindings, generation, cx)
+                            });
                         }
-                        ReloadOutcome::Rejected(diagnostic) => {
-                            crate::diagnostics::record(
-                                "settings",
-                                "reload_rejected",
-                                &diagnostic.to_string(),
-                                serde_json::json!({"window_id":this.window_id}),
-                            );
-                            cx.notify();
-                        }
-                    })
-                    .is_ok();
-                if !should_continue {
-                    break;
-                }
+                        cx.notify();
+                    }
+                    ReloadOutcome::Rejected(diagnostic) => {
+                        crate::diagnostics::record(
+                            "settings",
+                            "reload_rejected",
+                            &diagnostic.to_string(),
+                            serde_json::json!({"window_id":this.window_id}),
+                        );
+                        cx.notify();
+                    }
+                });
             }
         });
     }
@@ -1071,12 +1065,12 @@ impl PaneContainer {
             selected: 0,
         });
         let input = cx.new(|cx| {
-            gpui_component::input::InputState::new(window, cx).placeholder("Type a command…")
+            gpui_kit::component::input::InputState::new(window, cx).placeholder("Type a command…")
         });
         self.palette_input_subscription =
             Some(
                 cx.subscribe_in(&input, window, |this, input, event, _window, cx| {
-                    if let gpui_component::input::InputEvent::Change = event
+                    if let gpui_kit::component::input::InputEvent::Change = event
                         && let Some(palette) = this.palette.as_mut()
                     {
                         palette.query = input.read(cx).value().to_string();
@@ -1099,7 +1093,7 @@ impl PaneContainer {
             .take()
             .and_then(|focus| focus.upgrade())
         {
-            focus.focus(window);
+            focus.focus(window, cx);
             self.needs_focus = false;
         } else {
             self.needs_focus = true;
@@ -1186,23 +1180,23 @@ fn window_control_button(
         .hover(move |style| {
             if is_close {
                 style
-                    .bg(gpui::rgb(theme::RED))
-                    .text_color(gpui::rgb(theme::BG))
+                    .bg(gpui_kit::rgb(theme::RED))
+                    .text_color(gpui_kit::rgb(theme::BG))
             } else {
-                style.bg(gpui::rgb(theme::BG_HIGHLIGHT))
+                style.bg(gpui_kit::rgb(theme::BG_HIGHLIGHT))
             }
         })
         .active(move |style| {
             if is_close {
                 style
-                    .bg(gpui::rgb(theme::RED))
-                    .text_color(gpui::rgb(theme::BG))
+                    .bg(gpui_kit::rgb(theme::RED))
+                    .text_color(gpui_kit::rgb(theme::BG))
             } else {
-                style.bg(gpui::rgb(theme::BG_ALT))
+                style.bg(gpui_kit::rgb(theme::BG_ALT))
             }
         })
         .text_size(px(10.0))
-        .text_color(gpui::rgb(theme::FG))
+        .text_color(gpui_kit::rgb(theme::FG))
         .line_height(px(TITLE_BAR_HEIGHT_PX))
         .font(caption_icon_font())
         .child(button.icon())
@@ -1264,7 +1258,7 @@ impl Render for PaneContainer {
         self.refresh_tab_titles(window, cx);
         self.deliver_bell_notification(window);
         if self.titlebar_visible && !cfg!(target_os = "macos") && self.app_menu_bar.is_none() {
-            self.app_menu_bar = Some(AppMenuBar::new(window, cx));
+            self.app_menu_bar = Some(AppMenuBar::new(cx));
         }
         let app_menu_bar = self.app_menu_bar.clone();
         let sidebar_toggle = Button::new("sidebar-toggle")
@@ -1283,7 +1277,7 @@ impl Render for PaneContainer {
                     .w(px(18.0))
                     .h(px(14.0))
                     .border_1()
-                    .border_color(gpui::rgb(theme::GREY))
+                    .border_color(gpui_kit::rgb(theme::GREY))
                     .rounded(px(2.0))
                     .overflow_hidden()
                     .child(
@@ -1291,8 +1285,10 @@ impl Render for PaneContainer {
                             .w(px(5.0))
                             .h_full()
                             .border_r_1()
-                            .border_color(gpui::rgb(theme::GREY))
-                            .when(self.sidebar_visible, |icon| icon.bg(gpui::rgb(theme::GREY))),
+                            .border_color(gpui_kit::rgb(theme::GREY))
+                            .when(self.sidebar_visible, |icon| {
+                                icon.bg(gpui_kit::rgb(theme::GREY))
+                            }),
                     ),
             )
             .on_mouse_down(MouseButton::Left, |_, window, cx| {
@@ -1313,7 +1309,7 @@ impl Render for PaneContainer {
             .relative()
             .flex()
             .flex_col()
-            .bg(gpui::rgb(WINDOW_BACKGROUND))
+            .bg(gpui_kit::rgb(WINDOW_BACKGROUND))
             .on_action(cx.listener(Self::on_app_action))
             .children(
                 self.titlebar_visible
@@ -1347,7 +1343,7 @@ impl Render for PaneContainer {
                             .overflow_hidden()
                             .relative()
                             .child(
-                                gpui::canvas(
+                                gpui_kit::canvas(
                                     {
                                         let entity = cx.entity();
                                         move |bounds, window, cx| {
@@ -1372,8 +1368,8 @@ fn render_settings_diagnostic(message: String) -> impl IntoElement {
     div()
         .px(px(10.0))
         .py(px(6.0))
-        .bg(gpui::rgb(theme::RED))
-        .text_color(gpui::rgb(theme::BG))
+        .bg(gpui_kit::rgb(theme::RED))
+        .text_color(gpui_kit::rgb(theme::BG))
         .text_size(px(12.0))
         .child(format!("Settings error: {message}"))
 }
@@ -1382,8 +1378,8 @@ fn render_workspace_diagnostic(message: String) -> impl IntoElement {
     div()
         .px(px(10.0))
         .py(px(6.0))
-        .bg(gpui::rgb(theme::YELLOW))
-        .text_color(gpui::rgb(theme::BG))
+        .bg(gpui_kit::rgb(theme::YELLOW))
+        .text_color(gpui_kit::rgb(theme::BG))
         .text_size(px(12.0))
         .child(format!("Workspace: {message}"))
 }
@@ -1404,7 +1400,7 @@ fn render_titlebar(
         .flex()
         .flex_row()
         .items_center()
-        .bg(gpui::rgb(WINDOW_BACKGROUND))
+        .bg(gpui_kit::rgb(WINDOW_BACKGROUND))
         .when(cfg!(target_os = "macos"), |titlebar| {
             titlebar.child(
                 div()
@@ -1487,24 +1483,24 @@ impl PaneContainer {
             .justify_center()
             .items_start()
             .pt(px(72.0))
-            .bg(gpui::rgba((theme::BG << 8) | 0x99))
+            .bg(gpui_kit::rgba((theme::BG << 8) | 0x99))
             .occlude()
             .track_focus(&self.palette_focus)
-            .capture_action(
-                cx.listener(|this, _: &gpui_component::input::MoveUp, window, cx| {
+            .capture_action(cx.listener(
+                |this, _: &gpui_kit::component::input::MoveUp, window, cx| {
                     this.handle_palette_navigation("up", window, cx);
-                }),
-            )
-            .capture_action(
-                cx.listener(|this, _: &gpui_component::input::MoveDown, window, cx| {
+                },
+            ))
+            .capture_action(cx.listener(
+                |this, _: &gpui_kit::component::input::MoveDown, window, cx| {
                     this.handle_palette_navigation("down", window, cx);
-                }),
-            )
-            .capture_action(
-                cx.listener(|this, _: &gpui_component::input::Enter, window, cx| {
+                },
+            ))
+            .capture_action(cx.listener(
+                |this, _: &gpui_kit::component::input::Enter, window, cx| {
                     this.handle_palette_navigation("enter", window, cx);
-                }),
-            )
+                },
+            ))
             .on_key_down(cx.listener(Self::handle_palette_key_down))
             .on_key_up(cx.listener(Self::handle_palette_key_up))
             .on_mouse_down(
@@ -1522,8 +1518,8 @@ impl PaneContainer {
                     .overflow_hidden()
                     .rounded(px(8.0))
                     .border_1()
-                    .border_color(gpui::rgb(theme::BG_HIGHLIGHT))
-                    .bg(gpui::rgb(theme::BG_ALT))
+                    .border_color(gpui_kit::rgb(theme::BG_HIGHLIGHT))
+                    .bg(gpui_kit::rgb(theme::BG_ALT))
                     .shadow_lg()
                     .on_mouse_down(MouseButton::Left, |_event: &MouseDownEvent, window, cx| {
                         window.prevent_default();
@@ -1536,13 +1532,13 @@ impl PaneContainer {
                             .flex()
                             .items_center()
                             .border_b_1()
-                            .border_color(gpui::rgb(theme::BG_HIGHLIGHT))
+                            .border_color(gpui_kit::rgb(theme::BG_HIGHLIGHT))
                             .text_size(px(15.0))
-                            .text_color(gpui::rgb(theme::FG))
+                            .text_color(gpui_kit::rgb(theme::FG))
                             .children(
                                 self.palette_input
                                     .as_ref()
-                                    .map(gpui_component::input::Input::new),
+                                    .map(gpui_kit::component::input::Input::new),
                             ),
                     )
                     .children(
@@ -1568,18 +1564,20 @@ impl PaneContainer {
                                     .items_center()
                                     .justify_between()
                                     .bg(if result_index == selected {
-                                        gpui::rgb(theme::BG_HIGHLIGHT)
+                                        gpui_kit::rgb(theme::BG_HIGHLIGHT)
                                     } else {
-                                        gpui::rgb(theme::BG_ALT)
+                                        gpui_kit::rgb(theme::BG_ALT)
                                     })
                                     .text_color(if available {
-                                        gpui::rgb(theme::FG)
+                                        gpui_kit::rgb(theme::FG)
                                     } else {
-                                        gpui::rgb(theme::GREY)
+                                        gpui_kit::rgb(theme::GREY)
                                     })
                                     .when(available, |row| {
-                                        row.hover(|style| style.bg(gpui::rgb(theme::BG_HIGHLIGHT)))
-                                            .on_mouse_down(
+                                        row.hover(|style| {
+                                            style.bg(gpui_kit::rgb(theme::BG_HIGHLIGHT))
+                                        })
+                                        .on_mouse_down(
                                             MouseButton::Left,
                                             cx.listener(
                                                 move |this, _event: &MouseDownEvent, window, cx| {
@@ -1599,7 +1597,7 @@ impl PaneContainer {
                                     .child(
                                         div()
                                             .text_size(px(11.0))
-                                            .text_color(gpui::rgb(theme::GREY))
+                                            .text_color(gpui_kit::rgb(theme::GREY))
                                             .child(detail),
                                     )
                             }),
@@ -1614,7 +1612,7 @@ impl PaneContainer {
             .h_full()
             .flex_shrink_0()
             .mr(px(SIDEBAR_GAP_PX))
-            .bg(gpui::rgb(WINDOW_BACKGROUND))
+            .bg(gpui_kit::rgb(WINDOW_BACKGROUND))
             .pt(px(4.0))
             .children(self.tabs.iter().enumerate().map(|(index, tab)| {
                 let is_active = index == self.active_tab_index;
@@ -1636,18 +1634,18 @@ impl PaneContainer {
                     .gap(px(6.0))
                     .px(px(8.0))
                     .text_color(if is_active {
-                        gpui::rgb(theme::FG)
+                        gpui_kit::rgb(theme::FG)
                     } else {
-                        gpui::rgb(theme::GREY)
+                        gpui_kit::rgb(theme::GREY)
                     })
                     .bg(if is_active {
-                        gpui::rgb(theme::BG_HIGHLIGHT)
+                        gpui_kit::rgb(theme::BG_HIGHLIGHT)
                     } else {
-                        gpui::rgb(WINDOW_BACKGROUND)
+                        gpui_kit::rgb(WINDOW_BACKGROUND)
                     })
-                    .hover(|style| style.bg(gpui::rgb(theme::BG_HIGHLIGHT)))
+                    .hover(|style| style.bg(gpui_kit::rgb(theme::BG_HIGHLIGHT)))
                     .tooltip(move |window, cx| {
-                        gpui_component::tooltip::Tooltip::new(tooltip.clone()).build(window, cx)
+                        gpui_kit::component::tooltip::Tooltip::new(tooltip.clone()).build(window, cx)
                     })
                     .on_mouse_down(
                         MouseButton::Left,
@@ -1672,7 +1670,7 @@ impl PaneContainer {
                             .text_size(px(12.0))
                             .line_height(px(TAB_HEIGHT_PX))
                             .child(title)
-                            .child(gpui::canvas(move |bounds, window, _| {
+                            .child(gpui_kit::canvas(move |bounds, window, _| {
                                 let style = window.text_style();
                                 geometry.borrow_mut().insert(id, serde_json::json!({"bounds":crate::snapshot::rect(bounds),"ancestor_clip":crate::snapshot::rect(window.content_mask().bounds),"font_family":style.font_family.as_ref(),"font_size_px":12,"line_height_px":TAB_HEIGHT_PX,"wrap":"nowrap","overflow":"ellipsis"}));
                             }, |_, _, _, _| {}).absolute().top(px(0.)).left(px(0.)).size_full()),
@@ -1692,12 +1690,14 @@ mod tests {
         assert!(!bell_notification_allowed(false, false));
     }
 
-    #[gpui::test]
-    fn palette_native_input_preserves_query_editing_and_navigation(cx: &mut gpui::TestAppContext) {
-        use gpui::AppContext;
+    #[gpui_kit::test]
+    fn palette_native_input_preserves_query_editing_and_navigation(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use gpui_kit::AppContext;
         use std::{cell::RefCell, rc::Rc};
         cx.update(|cx| {
-            gpui_component::init(cx);
+            gpui_kit::init(cx);
             crate::widget::init(cx);
         });
         let slot = Rc::new(RefCell::new(None));
@@ -1713,7 +1713,7 @@ mod tests {
                 )
             });
             build_slot.replace(Some(container.clone()));
-            gpui_component::Root::new(container, window, cx)
+            gpui_kit::component::Root::new(container, window, cx)
         });
         let container = slot.borrow().clone().unwrap();
         cx.refresh().unwrap();

@@ -1,11 +1,11 @@
 use super::*;
 use crate::control::{ControlError, Request, string_arg};
-use gpui::App;
+use gpui_kit::App;
 use serde_json::{Value, json};
 
 pub struct ControlWait {
     request: Request,
-    terminal: Option<gpui::WeakEntity<TerminalWidget>>,
+    terminal: Option<gpui_kit::WeakEntity<TerminalWidget>>,
     search: Option<u64>,
     after: Option<u64>,
     pub last: Value,
@@ -155,8 +155,7 @@ impl PaneContainer {
     ) -> Result<Option<Value>, ControlError> {
         let request = &wait.request;
         let condition = string_arg(request, "condition")?.unwrap_or("text");
-        let satisfied;
-        if wait.terminal.is_some() {
+        let satisfied = if wait.terminal.is_some() {
             if !self.control_contains(&request.target, cx) {
                 let outcome = crate::diagnostics::outcome(&request.target);
                 if condition == "process-exited" {
@@ -182,7 +181,7 @@ impl PaneContainer {
                 .and_then(|terminal| terminal.upgrade())
                 .ok_or_else(|| ControlError::new("pane_closed", "pane was removed"))?;
             wait.last = terminal.read(cx).control_state();
-            satisfied = match condition {
+            match condition {
                 "text" => {
                     let (matched, changed) = terminal.update(cx, |terminal, _| {
                         terminal.control_probe_search(wait.search.unwrap())
@@ -213,10 +212,10 @@ impl PaneContainer {
                     }
                     wait.last["processes"]["lifecycle"] == "exited"
                 }
-            };
+            }
         } else {
             wait.last = self.control_state(window, cx);
-            satisfied = match condition {
+            match condition {
                 "settings-generation" => {
                     self.settings.generation()
                         >= string_arg(request, "at_least")?
@@ -259,8 +258,8 @@ impl PaneContainer {
                             .all(|pane| pane["terminal_size"] == pane["pty_size"])
                     }
                 }
-            };
-        }
+            }
+        };
         Ok(satisfied.then(|| json!({"condition":condition,"observation":wait.last})))
     }
 }

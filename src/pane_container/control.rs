@@ -9,7 +9,7 @@ impl PaneContainer {
     pub fn snapshot_presentation_ready(
         &self,
         request: &Request,
-        cx: &gpui::App,
+        cx: &gpui_kit::App,
     ) -> Result<bool, ControlError> {
         let (index, target) = if request.target.pane_id.is_some() {
             let (index, pane, _) = self.targeted_terminal(request, cx)?;
@@ -28,7 +28,7 @@ impl PaneContainer {
             })
             .all(|(_, _, terminal)| !terminal.read(cx).presentation_held()))
     }
-    pub(super) fn title_provenance(&self, index: usize, cx: &gpui::App) -> Value {
+    pub(super) fn title_provenance(&self, index: usize, cx: &gpui_kit::App) -> Value {
         let tab = &self.tabs[index];
         let split = tab.split.read(cx);
         let selected = split.active_pane_id();
@@ -38,7 +38,7 @@ impl PaneContainer {
         let from_pane = chosen.as_deref() == Some(tab.title.as_str());
         json!({"source":if from_pane{"selected_pane"}else if tab.title==tab.default_title{"profile_or_restored_fallback"}else{"retained_tab_title"},"source_pane_id":from_pane.then(||format!("p{}",selected.value())),"fallback_reason":(tab.title==tab.default_title&&!from_pane).then_some("selected pane has no matching display title")})
     }
-    pub fn receiving_focus(&self, window: &Window, cx: &gpui::App) -> Value {
+    pub fn receiving_focus(&self, window: &Window, cx: &gpui_kit::App) -> Value {
         if self.palette_focus.contains_focused(window, cx) {
             return json!({"kind":"palette","window_id":self.window_id});
         }
@@ -56,7 +56,7 @@ impl PaneContainer {
         &self,
         request: &Request,
         window: &Window,
-        cx: &gpui::App,
+        cx: &gpui_kit::App,
     ) -> Result<bool, ControlError> {
         let index = if request.target.tab_id.is_some() {
             Some(self.control_tab(request, cx)?)
@@ -83,7 +83,7 @@ impl PaneContainer {
     pub fn resolve_snapshot_target(
         &self,
         request: &Request,
-        cx: &gpui::App,
+        cx: &gpui_kit::App,
     ) -> Result<Request, ControlError> {
         let mut request = request.clone();
         request.target.window_id = Some(self.window_id.clone());
@@ -101,7 +101,7 @@ impl PaneContainer {
         &self,
         revision: u64,
         window: &Window,
-        cx: &mut gpui::App,
+        cx: &mut gpui_kit::App,
     ) -> std::sync::Arc<crate::snapshot::Frame> {
         self.presentation_tab(self.active_tab_index, None, revision, window, cx)
     }
@@ -111,7 +111,7 @@ impl PaneContainer {
         target: Option<PaneId>,
         revision: u64,
         window: &Window,
-        cx: &mut gpui::App,
+        cx: &mut gpui_kit::App,
     ) -> std::sync::Arc<crate::snapshot::Frame> {
         let tab = &self.tabs[index];
         let split = tab.split.read(cx);
@@ -172,7 +172,7 @@ impl PaneContainer {
         &self,
         request: &Request,
         window: &mut Window,
-        cx: &mut gpui::App,
+        cx: &mut gpui_kit::App,
     ) -> Result<crate::snapshot::Prepared, ControlError> {
         let (index, target) = if request.target.pane_id.is_some() {
             let (index, pane, _) = self.targeted_terminal(request, cx)?;
@@ -201,7 +201,7 @@ impl PaneContainer {
                     ControlError::new("layout_unavailable", "content bounds not established")
                 })?
         };
-        let size = gpui::size(
+        let size = gpui_kit::size(
             px(bounds["width"].as_f64().unwrap() as f32),
             px(bounds["height"].as_f64().unwrap() as f32),
         );
@@ -288,7 +288,7 @@ impl PaneContainer {
             crate::diagnostics::retain_outcome(state, root);
         }
     }
-    pub fn window_layout_token(&self, window: &Window, cx: &gpui::App) -> String {
+    pub fn window_layout_token(&self, window: &Window, cx: &gpui_kit::App) -> String {
         use std::hash::{Hash, Hasher};
         let mut hash = std::collections::hash_map::DefaultHasher::new();
         f32::from(window.viewport_size().width)
@@ -319,7 +319,7 @@ impl PaneContainer {
         request: &Request,
         index: Option<usize>,
         window: &Window,
-        cx: &gpui::App,
+        cx: &gpui_kit::App,
     ) -> Result<(), ControlError> {
         if let Some(expected) = &request.preconditions.layout_token {
             let actual = index.map_or_else(
@@ -339,7 +339,7 @@ impl PaneContainer {
     pub(super) fn control_tab(
         &self,
         request: &Request,
-        cx: &gpui::App,
+        cx: &gpui_kit::App,
     ) -> Result<usize, ControlError> {
         if request.target.pane_id.is_some() {
             return self.control_target(&request.target, cx).map(|v| v.0);
@@ -449,7 +449,7 @@ impl PaneContainer {
     pub(super) fn targeted_terminal(
         &self,
         request: &Request,
-        cx: &gpui::App,
+        cx: &gpui_kit::App,
     ) -> Result<(usize, PaneId, Entity<TerminalWidget>), ControlError> {
         let mut target = request.target.clone();
         if target.pane_id.is_none() && target.tab_id.is_none() && target.window_id.is_some() {
@@ -458,7 +458,7 @@ impl PaneContainer {
         self.control_target(&target, cx)
     }
 
-    fn tab_result(&self, index: usize, window: &Window, cx: &gpui::App) -> Value {
+    fn tab_result(&self, index: usize, window: &Window, cx: &gpui_kit::App) -> Value {
         let mut result = self.control_state(window, cx)["tabs"][index].clone();
         result["layout_token"] = json!(
             self.tabs[index]
@@ -643,7 +643,7 @@ impl PaneContainer {
                         "client dimensions must be 100..16384 logical pixels",
                     ));
                 }
-                window.resize(gpui::size(px(width as f32), px(height as f32)));
+                window.resize(gpui_kit::size(px(width as f32), px(height as f32)));
                 self.establish_layout(window, cx);
                 cx.notify();
                 Ok(self.control_state(window, cx))

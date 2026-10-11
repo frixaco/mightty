@@ -2,9 +2,9 @@
 //! Run `mise exec -- cargo run --example capture_fidelity` on Windows.
 #[cfg(windows)]
 mod fixture {
-    use gpui::{
-        App, Application, Bounds, Context, Render, Timer, Window, WindowBounds, WindowOptions, div,
-        prelude::*, px, size,
+    use gpui_kit::{
+        App, Bounds, Context, Render, Window, WindowBounds, WindowOptions, div, prelude::*, px,
+        size,
     };
     use std::{cell::Cell, rc::Rc, sync::Arc, time::Duration};
 
@@ -17,12 +17,12 @@ mod fixture {
             self.painted.set(self.intended_flower.get());
             div()
                 .size_full()
-                .bg(gpui::white())
+                .bg(gpui_kit::white())
                 .text_size(px(80.))
                 .text_color(if self.intended_flower.get() {
-                    gpui::rgb(0xff0000)
+                    gpui_kit::rgb(0xff0000)
                 } else {
-                    gpui::rgb(0x000000)
+                    gpui_kit::rgb(0x000000)
                 })
                 .child(if self.intended_flower.get() {
                     "❀"
@@ -31,7 +31,7 @@ mod fixture {
                 })
         }
     }
-    fn export(gpu: gpui::GpuCapture, path: std::path::PathBuf) -> image::RgbaImage {
+    fn export(gpu: gpui_kit::GpuCapture, path: std::path::PathBuf) -> image::RgbaImage {
         let dimensions = (gpu.width, gpu.height);
         let image =
             image::RgbaImage::from_raw(dimensions.0, dimensions.1, gpu.read().unwrap()).unwrap();
@@ -39,7 +39,7 @@ mod fixture {
         image
     }
     pub fn run() {
-        Application::new().run(|cx: &mut App| {
+        gpui_kit::application().run(|cx: &mut App| {
             let painted = Rc::new(Cell::new(false));
             let marker = painted.clone();
             let intended = Rc::new(Cell::new(false));
@@ -62,7 +62,7 @@ mod fixture {
                     },
                 )
                 .unwrap();
-            let handle = gpui::AnyWindowHandle::from(handle);
+            let handle = gpui_kit::AnyWindowHandle::from(handle);
             handle
                 .update(cx, |_, window, _| {
                     let scene_revision = Cell::new(0_u64);
@@ -84,7 +84,9 @@ mod fixture {
                         std::time::Instant::now() < deadline,
                         "initial presentation unavailable"
                     );
-                    Timer::after(Duration::from_millis(20)).await;
+                    cx.background_executor()
+                        .timer(Duration::from_millis(20))
+                        .await;
                 }
                 // Deliberately omit notify: current model changes, displayed pixels stay stale.
                 intended.set(true);
@@ -154,7 +156,9 @@ mod fixture {
                         std::time::Instant::now() < deadline,
                         "next presentation unavailable"
                     );
-                    Timer::after(Duration::from_millis(20)).await;
+                    cx.background_executor()
+                        .timer(Duration::from_millis(20))
+                        .await;
                 }
                 let (next, metadata) = handle
                     .update(cx, |_, window, _| window.capture_presented().unwrap())
@@ -175,7 +179,7 @@ mod fixture {
                 assert!(red(&after) > 20, "flower color missing from raster output");
                 assert_ne!(before.as_raw(), after.as_raw());
                 println!("Raster fidelity passed; artifacts: {}", directory.display());
-                cx.update(|cx| cx.quit()).unwrap();
+                cx.update(|cx| cx.quit());
             })
             .detach();
         });

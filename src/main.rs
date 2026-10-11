@@ -1,14 +1,12 @@
-use gpui::{
-    App, Application, Bounds, WindowBounds, WindowHandle, WindowKind, WindowOptions, prelude::*,
-    px, size,
+use gpui_kit::component::TitleBar;
+use gpui_kit::{
+    AnyWindowHandle, App, Bounds, WindowBounds, WindowKind, WindowOptions, prelude::*, px, size,
 };
-use gpui_component::{Root, TitleBar};
 use mightty::{action::app_menus, pane_container::PaneContainer, settings::SettingsStore};
 use std::borrow::Cow;
 
 #[cfg(windows)]
 use {
-    gpui::Timer,
     mightty::action::{AppAction, DispatchAppAction},
     mightty::application::{
         ActivationRequest,
@@ -34,40 +32,43 @@ fn main() {
         return;
     };
 
-    Application::new().run(move |cx: &mut App| {
-        load_embedded_fonts(cx);
-        gpui_component::init(cx);
-        mightty::widget::init(cx);
-        mightty::theme::init(cx);
-        cx.set_menus(app_menus());
+    gpui_kit::application()
+        .with_assets(gpui_kit::assets::Assets)
+        .run(move |cx: &mut App| {
+            load_embedded_fonts(cx);
+            gpui_kit::init(cx);
+            mightty::widget::init(cx);
+            mightty::theme::init(cx);
+            cx.set_menus(app_menus());
 
-        #[cfg(windows)]
-        {
-            let (control_tx, control_rx) = flume::bounded(32);
-            let control_server = mightty::application::windows::ControlServer::start(control_tx)
-                .expect("failed to start control endpoint");
-            mightty::control::set_instance_id(control_server.descriptor().instance_id.clone());
-            let normal_window = open_normal_window(windows_startup.show_normal_window(), cx);
-            start_windows_application(
-                windows_startup,
-                normal_window,
-                control_server,
-                control_rx,
-                cx,
-            );
-        }
-        #[cfg(not(windows))]
-        let _normal_window = open_normal_window(true, cx);
+            #[cfg(windows)]
+            {
+                let (control_tx, control_rx) = flume::bounded(32);
+                let control_server =
+                    mightty::application::windows::ControlServer::start(control_tx)
+                        .expect("failed to start control endpoint");
+                mightty::control::set_instance_id(control_server.descriptor().instance_id.clone());
+                let normal_window = open_normal_window(windows_startup.show_normal_window(), cx);
+                start_windows_application(
+                    windows_startup,
+                    normal_window,
+                    control_server,
+                    control_rx,
+                    cx,
+                );
+            }
+            #[cfg(not(windows))]
+            let _normal_window = open_normal_window(true, cx);
 
-        cx.activate(true);
-    });
+            cx.activate(true);
+        });
 }
 
 struct TerminalWindow {
     #[cfg(windows)]
     id: String,
-    handle: WindowHandle<Root>,
-    panes: gpui::Entity<PaneContainer>,
+    handle: AnyWindowHandle,
+    panes: gpui_kit::Entity<PaneContainer>,
 }
 
 fn open_normal_window(show: bool, cx: &mut App) -> TerminalWindow {
@@ -97,11 +98,7 @@ fn open_terminal_window(
             PaneContainer::new_without_titlebar(settings, cx)
         }
     });
-    let root_panes = panes.clone();
-    let handle = cx
-        .open_window(options, move |window, cx| {
-            cx.new(|cx| Root::new(root_panes, window, cx))
-        })
+    let (handle, panes) = gpui_kit::open_window(options, cx, move |_, _| panes)
         .expect("failed to open terminal window");
     let _ = handle.update(cx, |_, window, cx| {
         panes.update(cx, |panes, cx| panes.establish_layout(window, cx));
@@ -382,12 +379,8 @@ fn start_windows_application(
                     .borrow_mut()
                     .control_dispatch(&dispatch, cx)
             });
-            if let Ok(value) = result {
-                if let Some(value) = value {
-                    let _ = dispatch.reply.try_send(value);
-                }
-            } else {
-                break;
+            if let Some(value) = result {
+                let _ = dispatch.reply.try_send(value);
             }
         }
     })
@@ -417,12 +410,7 @@ fn start_windows_application(
     let request_controller = Rc::clone(&controller);
     cx.spawn(async move |cx| {
         while let Ok(request) = activation_rx.recv_async().await {
-            if cx
-                .update(|cx| request_controller.borrow_mut().dispatch(request, cx))
-                .is_err()
-            {
-                break;
-            }
+            cx.update(|cx| request_controller.borrow_mut().dispatch(request, cx));
         }
     })
     .detach();
@@ -430,12 +418,7 @@ fn start_windows_application(
     let handoff_controller = Rc::clone(&controller);
     cx.spawn(async move |cx| {
         while let Ok(handoff) = handoff_rx.recv_async().await {
-            if cx
-                .update(|cx| handoff_controller.borrow_mut().accept_handoff(handoff, cx))
-                .is_err()
-            {
-                break;
-            }
+            cx.update(|cx| handoff_controller.borrow_mut().accept_handoff(handoff, cx));
         }
     })
     .detach();
@@ -443,30 +426,24 @@ fn start_windows_application(
     let diagnostic_controller = Rc::clone(&controller);
     cx.spawn(async move |cx| {
         loop {
-            Timer::after(Duration::from_millis(100)).await;
-            if cx
-                .update(|cx| {
-                    diagnostic_controller
-                        .borrow_mut()
-                        .publish_diagnostics(cx, false)
-                })
-                .is_err()
-            {
-                break;
-            }
+            cx.background_executor()
+                .timer(Duration::from_millis(100))
+                .await;
+            cx.update(|cx| {
+                diagnostic_controller
+                    .borrow_mut()
+                    .publish_diagnostics(cx, false)
+            });
         }
     })
     .detach();
     let poll_controller = Rc::clone(&controller);
     cx.spawn(async move |cx| {
         loop {
-            Timer::after(Duration::from_millis(500)).await;
-            if cx
-                .update(|cx| poll_controller.borrow_mut().poll(cx))
-                .is_err()
-            {
-                break;
-            }
+            cx.background_executor()
+                .timer(Duration::from_millis(500))
+                .await;
+            cx.update(|cx| poll_controller.borrow_mut().poll(cx));
         }
     })
     .detach();
@@ -584,7 +561,7 @@ impl WindowsApplication {
                 let sender = dispatch.reply.clone();
                 let deadline = dispatch.deadline;
                 let revision = self.control_revision;
-                cx.spawn(async move |_| {
+                cx.spawn(async move |cx| {
                     loop {
                         let result = match mightty::diagnostics::outcome(&request.target) {
                             Some(outcome)
@@ -617,7 +594,9 @@ impl WindowsApplication {
                         if sender.is_disconnected() {
                             break;
                         }
-                        Timer::after(Duration::from_millis(50)).await;
+                        cx.background_executor()
+                            .timer(Duration::from_millis(50))
+                            .await;
                     }
                 })
                 .detach();
@@ -645,7 +624,7 @@ impl WindowsApplication {
         if let Some(quick) = &self.quick_window {
             windows.push((quick.id.clone(), quick.handle, quick.panes.clone()));
         }
-        windows.retain(|(_, handle, _)| handle.is_active(cx).is_some());
+        windows.retain(|(_, handle, _)| handle.update(cx, |_, _, _| ()).is_ok());
         if request.op == "state"
             && request.target.window_id.is_none()
             && request.target.tab_id.is_none()
@@ -685,7 +664,12 @@ impl WindowsApplication {
         }
         let active = windows
             .iter()
-            .find(|(_, handle, _)| handle.is_active(cx) == Some(true))
+            .find(|(_, handle, _)| {
+                handle
+                    .update(cx, |_, window, _| window.is_window_active())
+                    .ok()
+                    == Some(true)
+            })
             .map(|(id, _, _)| id.clone())
             .unwrap_or_else(|| self.last_focused_window.clone());
         let targets = windows
@@ -748,7 +732,7 @@ impl WindowsApplication {
                     )),
                 ));
             }
-            let handle = gpui::AnyWindowHandle::from(*handle);
+            let handle = *handle;
             if mode == "next" {
                 let ready = handle
                     .update(cx, |_, window, cx| {
@@ -852,7 +836,9 @@ impl WindowsApplication {
                             ));
                         }
                         _ => {
-                            Timer::after(Duration::from_millis(10)).await;
+                            cx.background_executor()
+                                .timer(Duration::from_millis(10))
+                                .await;
                         }
                     }
                 };
@@ -891,7 +877,9 @@ impl WindowsApplication {
                         let _ = sender.try_send(reply(&request, revision, Err(error)));
                         break;
                     }
-                    Timer::after(Duration::from_millis(10)).await;
+                    cx.background_executor()
+                        .timer(Duration::from_millis(10))
+                        .await;
                 }
             })
             .detach();
@@ -902,7 +890,7 @@ impl WindowsApplication {
             "ui.key" | "ui.text" | "ui.pointer" | "ui.input"
         ) && let [(_, handle, panes)] = targets.as_slice()
         {
-            let handle = gpui::AnyWindowHandle::from(*handle);
+            let handle = *handle;
             let registration = handle
                 .update(cx, |_, window, cx| {
                     if request.target.tab_id.is_some() || request.target.pane_id.is_some() {
@@ -954,7 +942,9 @@ impl WindowsApplication {
                         break;
                     }
                     // Let GPUI activate subscriptions and finish normal input/focus effects between steps.
-                    Timer::after(Duration::from_millis(15)).await;
+                    cx.background_executor()
+                        .timer(Duration::from_millis(15))
+                        .await;
                 }
             })
             .detach();
@@ -997,10 +987,12 @@ impl WindowsApplication {
             cx.spawn(async move |cx| {
                 loop {
                     if sender.is_disconnected() {
-                        let _ = cx.update(|cx| wait.release(cx));
+                        cx.update(|cx| wait.release(cx));
                         break;
                     }
-                    Timer::after(Duration::from_millis(15)).await;
+                    cx.background_executor()
+                        .timer(Duration::from_millis(15))
+                        .await;
                     let observed = handle.update(cx, |_, window, cx| {
                         panes.update(cx, |panes, cx| {
                             panes.probe_control_wait(&mut wait, window, cx)
@@ -1022,7 +1014,7 @@ impl WindowsApplication {
                         _ => None,
                     };
                     if let Some(result) = completion {
-                        let _ = cx.update(|cx| wait.release(cx));
+                        cx.update(|cx| wait.release(cx));
                         let _ = sender.try_send(reply(&request, revision, result));
                         break;
                     }
@@ -1032,7 +1024,7 @@ impl WindowsApplication {
             return None;
         }
         let result = match targets.as_slice() {
-            [(id, handle, panes)] => gpui::AnyWindowHandle::from(*handle)
+            [(id, handle, panes)] => (*handle)
                 .update(cx, |_, window, cx| {
                     panes.update(cx, |panes, cx| panes.control_dispatch(request, window, cx))
                 })
@@ -1091,6 +1083,7 @@ impl WindowsApplication {
                                 reply(&request, revision, Ok(state)),
                                 acks,
                                 deadline,
+                                cx.background_executor(),
                             )
                             .await;
                             mightty::diagnostics::record_control(&request, &response);
@@ -1098,7 +1091,9 @@ impl WindowsApplication {
                             break;
                         }
                         Ok(None) if std::time::Instant::now() < deadline => {
-                            Timer::after(Duration::from_millis(5)).await;
+                            cx.background_executor()
+                                .timer(Duration::from_millis(5))
+                                .await;
                         }
                         _ => {
                             let mut error = ControlError::new(
@@ -1146,10 +1141,14 @@ impl WindowsApplication {
         let deadline = dispatch.deadline;
         let sender = dispatch.reply.clone();
         let request = request.clone();
-        cx.spawn(async move |_| {
-            let response =
-                mightty::control::complete_acknowledgements(response, acknowledgements, deadline)
-                    .await;
+        cx.spawn(async move |cx| {
+            let response = mightty::control::complete_acknowledgements(
+                response,
+                acknowledgements,
+                deadline,
+                cx.background_executor(),
+            )
+            .await;
             mightty::diagnostics::record_control(&request, &response);
             let _ = sender.try_send(response);
         })
@@ -1259,9 +1258,9 @@ impl WindowsApplication {
         }
     }
 
-    fn ensure_quick_window(&mut self, cx: &mut App) -> WindowHandle<Root> {
+    fn ensure_quick_window(&mut self, cx: &mut App) -> AnyWindowHandle {
         if let Some(window) = &self.quick_window
-            && window.handle.is_active(cx).is_some()
+            && window.handle.update(cx, |_, _, _| ()).is_ok()
         {
             return window.handle;
         }
@@ -1297,7 +1296,7 @@ impl WindowsApplication {
         Self::dispatch_to_window(self.normal_window.handle, action, cx);
     }
 
-    fn dispatch_to_window(window: WindowHandle<Root>, action: AppAction, cx: &mut App) {
+    fn dispatch_to_window(window: AnyWindowHandle, action: AppAction, cx: &mut App) {
         let _ = window.update(cx, |_, window, cx| {
             window.dispatch_action(Box::new(DispatchAppAction { action }), cx);
         });

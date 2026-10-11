@@ -1,9 +1,9 @@
 [package]
-name = "gpui"
-version = "0.2.2"
-edition.workspace = true
+name = "gpui-pre"
+version = "0.3.8"
+edition = { workspace = true }
 authors = ["Nathan Sobo <nathan@zed.dev>"]
-description = "Zed's GPU-accelerated UI framework"
+description = "Zed's GPU-accelerated UI framework (gpui-pre snapshot of zed@279fe07)"
 repository = "https://github.com/zed-industries/zed"
 publish = true
 license = "Apache-2.0"
@@ -12,254 +12,151 @@ readme = "README.md"
 keywords = ["desktop", "gui", "immediate"]
 categories = ["gui"]
 
+[package.metadata.cargo-shear]
+ignored = ["bindgen", "font-kit", "getrandom", "objc2", "objc2-metal"]
+ignored-paths = ["src/_ownership_and_data_flow.rs"]
 
-[lints]
-workspace = true
+[package.metadata.gpui-pre]
+zed-crate = "gpui"
+zed-version = "0.2.2"
+zed-rev = "279fe070bb389b79652e52065b2f001edcc0b11b"
+
+[lib]
+path = "src/gpui.rs"
+name = "gpui"
 
 [features]
 default = ["font-kit", "wayland", "x11", "windows-manifest"]
 test-support = [
-    "leak-detection",
     "collections/test-support",
-    "rand",
-    "util/test-support",
     "http_client/test-support",
     "wayland",
     "x11",
+    "proptest",
 ]
+bench-support = ["profiler", "dep:criterion", "dep:bench_metrics"]
+bench = ["bench-support"]
 inspector = ["gpui_macros/inspector"]
-leak-detection = ["backtrace"]
-runtime_shaders = []
-macos-blade = [
-    "blade-graphics",
-    "blade-macros",
-    "blade-util",
-    "bytemuck",
-    "objc2",
-    "objc2-metal",
-]
-wayland = [
-    "blade-graphics",
-    "blade-macros",
-    "blade-util",
-    "bytemuck",
-    "ashpd/wayland",
-    "cosmic-text",
-    "font-kit",
-    "calloop-wayland-source",
-    "wayland-backend",
-    "wayland-client",
-    "wayland-cursor",
-    "wayland-protocols",
-    "wayland-protocols-plasma",
-    "filedescriptor",
-    "xkbcommon",
-    "open",
-]
-x11 = [
-    "blade-graphics",
-    "blade-macros",
-    "blade-util",
-    "bytemuck",
-    "ashpd",
-    "cosmic-text",
-    "font-kit",
-    "as-raw-xcb-connection",
-    "x11rb",
-    "xkbcommon",
-    "xim",
-    "x11-clipboard",
-    "filedescriptor",
-    "open",
-    "scap?/x11",
-]
-screen-capture = [
-    "scap",
-]
-windows-manifest = []
-
-[lib]
-path = "src/gpui.rs"
-doctest = false
+leak-detection = []
+wayland = []
+x11 = ["scap?/x11"]
+screen-capture = ["scap"]
+windows-manifest = ["dep:embed-resource"]
+profiler = ["dep:hdrhistogram"]
+stacker = ["dep:stacksafe"]
 
 [dependencies]
-anyhow.workspace = true
-async-task = "4.7"
-backtrace = { version = "0.3", optional = true }
-blade-graphics = { workspace = true, optional = true }
-blade-macros = { workspace = true, optional = true }
-blade-util = { workspace = true, optional = true }
-bytemuck = { version = "1", optional = true }
-collections.workspace = true
-ctor.workspace = true
-derive_more.workspace = true
-etagere = "0.2"
-futures.workspace = true
-gpui_macros.workspace = true
-http_client.workspace = true
-image.workspace = true
-inventory.workspace = true
-itertools.workspace = true
-log.workspace = true
+accesskit = { workspace = true }
+anyhow = { workspace = true }
+async-task = { workspace = true }
+backtrace = { workspace = true }
+bitflags = { workspace = true }
+collections = { workspace = true }
+bench_metrics = { workspace = true, optional = true }
+criterion = { workspace = true, optional = true }
+ctor = { workspace = true }
+derive_more = { workspace = true }
+etagere = { workspace = true }
+futures = { workspace = true }
+futures-concurrency = { workspace = true }
+gpui_macros = { workspace = true }
+gpui_shared_string = { workspace = true }
+http_client = { workspace = true }
+image = { workspace = true }
+inventory = { workspace = true }
+itertools = { workspace = true }
+log = { workspace = true }
 num_cpus = "1.13"
 parking = "2.0.0"
-parking_lot.workspace = true
-postage.workspace = true
-profiling.workspace = true
-rand = { optional = true, workspace = true }
-raw-window-handle = "0.6"
-refineable.workspace = true
-resvg = { version = "0.45.0", default-features = false, features = [
-    "text",
-    "system-fonts",
-    "memmap-fonts",
-] }
-usvg = { version = "0.45.0", default-features = false }
-util_macros.workspace = true
-schemars.workspace = true
+parking_lot = { workspace = true }
+postage = { workspace = true }
+proptest = { workspace = true, optional = true }
+chrono = { workspace = true }
+profiling = { workspace = true }
+rand = { workspace = true }
+raw-window-handle = { workspace = true }
+regex = { workspace = true }
+refineable = { workspace = true }
+scheduler = { workspace = true }
+resvg = { workspace = true }
+usvg = { workspace = true }
+ttf-parser = "0.25"
+util_macros = { workspace = true }
+schemars = { workspace = true }
 seahash = "4.1"
-semantic_version.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-slotmap.workspace = true
-smallvec.workspace = true
-smol.workspace = true
-stacksafe.workspace = true
-strum.workspace = true
-sum_tree.workspace = true
-taffy = "=0.9.0"
-thiserror.workspace = true
-util.workspace = true
-uuid.workspace = true
+serde = { workspace = true }
+serde_json = { workspace = true }
+slotmap = { workspace = true }
+smallvec = { workspace = true }
+stacksafe = { workspace = true, optional = true }
+strum = { workspace = true }
+sum_tree = { workspace = true }
+taffy = "0.13.0"
+thiserror = { workspace = true }
+gpui_util = { workspace = true }
+hdrhistogram = { workspace = true, optional = true }
 waker-fn = "1.2.0"
 lyon = "1.0"
-libc.workspace = true
 pin-project = "1.1.10"
+spin = "0.10.0"
+pollster = { workspace = true }
+url = { workspace = true }
+uuid = { workspace = true }
+web-time = { workspace = true }
+heapless = { workspace = true }
+
+[build-dependencies]
+embed-resource = { version = "3.0", optional = true }
+
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+async-channel = { version = "2.5.0", default-features = false }
+
+[target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dependencies]
+async-channel = { workspace = true }
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+getrandom = { version = "0.3.4", features = ["wasm_js"] }
+uuid = { workspace = true, features = ["js"] }
+
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
+core-video = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-block = "0.1"
-cocoa.workspace = true
-cocoa-foundation.workspace = true
-core-foundation.workspace = true
-core-foundation-sys.workspace = true
-core-graphics = "0.24"
-core-video.workspace = true
-core-text = "21"
-# WARNING: If you change this, you must also publish a new version of zed-font-kit to crates.io
-font-kit = { git = "https://github.com/zed-industries/font-kit", rev = "110523127440aefb11ce0cf280ae7c5071337ec5", package = "zed-font-kit", version = "0.14.1-zed", optional = true }
-foreign-types = "0.5"
-log.workspace = true
-media.workspace = true
-objc.workspace = true
-objc2 = { version = "0.6", optional = true }
+objc2-core-foundation = { workspace = true }
+objc2-core-video = { workspace = true }
+font-kit = { git = "https://github.com/zed-industries/font-kit", rev = "94b0f28166665e8fd2f53ff6d268a14955c82269", package = "zed-font-kit", version = "0.14.1-zed", optional = true }
+log = { workspace = true }
+objc2 = { workspace = true, optional = true }
 objc2-metal = { version = "0.3", optional = true }
-#TODO: replace with "objc2"
-metal.workspace = true
 
-[target.'cfg(any(target_os = "linux", target_os = "freebsd", target_os = "macos"))'.dependencies]
-pathfinder_geometry = "0.5"
+[target.'cfg(target_os = "macos")'.build-dependencies]
+bindgen = "0.72"
 
 [target.'cfg(any(target_os = "linux", target_os = "freebsd", target_os = "windows"))'.dependencies]
 scap = { workspace = true, optional = true }
 
-[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
-# Always used
-flume = "0.11"
-oo7 = { version = "0.5.0", default-features = false, features = [
-    "async-std",
-    "native_crypto",
-] }
-
-# Used in both windowing options
-ashpd = { workspace = true, optional = true }
-blade-graphics = { workspace = true, optional = true }
-blade-macros = { workspace = true, optional = true }
-blade-util = { workspace = true, optional = true }
-bytemuck = { version = "1", optional = true }
-cosmic-text = { version = "0.14.0", optional = true }
-# WARNING: If you change this, you must also publish a new version of zed-font-kit to crates.io
-font-kit = { git = "https://github.com/zed-industries/font-kit", rev = "110523127440aefb11ce0cf280ae7c5071337ec5", package = "zed-font-kit", version = "0.14.1-zed", features = [
-    "source-fontconfig-dlopen",
-], optional = true }
-
-calloop = { version = "0.13.0" }
-filedescriptor = { version = "0.8.2", optional = true }
-open = { version = "5.2.0", optional = true }
-
-# Wayland
-calloop-wayland-source = { version = "0.3.0", optional = true }
-wayland-backend = { version = "0.3.3", features = [
-    "client_system",
-    "dlopen",
-], optional = true }
-wayland-client = { version = "0.31.2", optional = true }
-wayland-cursor = { version = "0.31.1", optional = true }
-wayland-protocols = { version = "0.31.2", features = [
-    "client",
-    "staging",
-    "unstable",
-], optional = true }
-wayland-protocols-plasma = { version = "0.2.0", features = [
-    "client",
-], optional = true }
-
-# X11
-as-raw-xcb-connection = { version = "1", optional = true }
-x11rb = { version = "0.13.1", features = [
-    "allow-unsafe-code",
-    "xkb",
-    "randr",
-    "xinput",
-    "cursor",
-    "resource_manager",
-    "sync",
-], optional = true }
-xkbcommon = { version = "0.8.0", features = [
-    "wayland",
-    "x11",
-], optional = true }
-# WARNING: If you change this, you must also publish a new version of zed-xim to crates.io
-xim = { git = "https://github.com/zed-industries/xim-rs.git", rev = "16f35a2c881b815a2b6cdfd6687988e84f8447d8" , features = [
-    "x11rb-xcb",
-    "x11rb-client",
-], package = "zed-xim", version = "0.4.0-zed", optional = true }
-x11-clipboard = { version = "0.9.3", optional = true }
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
+libc = { workspace = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-flume = "0.11"
-rand.workspace = true
-windows.workspace = true
-windows-core.workspace = true
-windows-numerics = "0.2"
-windows-registry = "0.5"
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_System_Power",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_Threading",
+    "Win32_System_WindowsProgramming",
+] }
 
-[dev-dependencies]
-backtrace = "0.3"
-collections = { workspace = true, features = ["test-support"] }
-env_logger.workspace = true
-http_client = { workspace = true, features = ["test-support"] }
-lyon = { version = "1.0", features = ["extra"] }
-pretty_assertions.workspace = true
-rand.workspace = true
-reqwest_client = { workspace = true, features = ["test-support"] }
-unicode-segmentation.workspace = true
-util = { workspace = true, features = ["test-support"] }
-
-[target.'cfg(target_os = "windows")'.build-dependencies]
-embed-resource = "3.0"
-
-[target.'cfg(target_os = "macos")'.build-dependencies]
-bindgen = "0.71"
-cbindgen = { version = "0.28.0", default-features = false }
-naga.workspace = true
-
-[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.build-dependencies]
-naga.workspace = true
-
+[lints]
+workspace = true
 
 [[example]]
 name = "hello_world"
 path = "examples/hello_world.rs"
+
+[[example]]
+name = "move_entity_between_windows"
+path = "examples/move_entity_between_windows.rs"
 
 [[example]]
 name = "image"
@@ -274,6 +171,10 @@ name = "on_window_close_quit"
 path = "examples/on_window_close_quit.rs"
 
 [[example]]
+name = "window_movable"
+path = "examples/window_movable.rs"
+
+[[example]]
 name = "opacity"
 path = "examples/opacity.rs"
 
@@ -284,6 +185,10 @@ path = "examples/pattern.rs"
 [[example]]
 name = "set_menus"
 path = "examples/set_menus.rs"
+
+[[example]]
+name = "system_notifications"
+path = "examples/system_notifications.rs"
 
 [[example]]
 name = "shadow"
@@ -320,3 +225,23 @@ path = "examples/window_shadow.rs"
 [[example]]
 name = "grid_layout"
 path = "examples/grid_layout.rs"
+
+[[example]]
+name = "list_example"
+path = "examples/list_example.rs"
+
+[[example]]
+name = "mouse_pressure"
+path = "examples/mouse_pressure.rs"
+
+[[example]]
+name = "a11y"
+path = "examples/a11y.rs"
+
+[[example]]
+name = "view_example"
+path = "examples/view_example/view_example_main.rs"
+
+[[example]]
+name = "toggle_headless"
+path = "examples/toggle_headless.rs"

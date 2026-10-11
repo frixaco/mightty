@@ -29,7 +29,7 @@ impl TerminalWidget {
     }
     pub fn presentation(
         &mut self,
-        window: &gpui::Window,
+        window: &gpui_kit::Window,
         offscreen: bool,
         include_source: bool,
     ) -> crate::snapshot::PaneFrame {

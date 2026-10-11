@@ -1,8 +1,8 @@
 //! Cyberdream's default dark palette, shared by the app and terminal.
 //! https://github.com/scottmckendry/cyberdream.nvim
 
-use gpui::{App, rgb};
-use gpui_component::{Theme, ThemeColor, ThemeMode};
+use gpui_kit::component::{Theme, ThemeColor, ThemeMode};
+use gpui_kit::{App, rgb};
 
 pub(crate) const BG: u32 = 0x16181a;
 pub(crate) const BG_ALT: u32 = 0x1e2124;
@@ -40,7 +40,7 @@ pub(crate) const ANSI: [u32; 16] = [
 
 pub fn init(cx: &mut App) {
     Theme::change(ThemeMode::Dark, None, cx);
-    Theme::global_mut(cx).colors = colors();
+    Theme::update(cx, |theme| theme.colors = colors());
 }
 
 fn colors() -> ThemeColor {
@@ -59,9 +59,36 @@ fn colors() -> ThemeColor {
         accent: highlight,
         accent_foreground: fg,
         accordion: alt,
-        accordion_hover: highlight,
         background: bg,
         border: highlight,
+        button: alt,
+        button_active: highlight,
+        button_foreground: fg,
+        button_hover: highlight,
+        button_primary: blue,
+        button_primary_active: cyan,
+        button_primary_foreground: bg,
+        button_primary_hover: cyan,
+        button_secondary: alt,
+        button_secondary_active: highlight,
+        button_secondary_foreground: fg,
+        button_secondary_hover: highlight,
+        button_danger: red,
+        button_danger_active: red,
+        button_danger_foreground: bg,
+        button_danger_hover: red,
+        button_info: blue,
+        button_info_active: blue,
+        button_info_foreground: bg,
+        button_info_hover: blue,
+        button_success: green,
+        button_success_active: green,
+        button_success_foreground: bg,
+        button_success_hover: green,
+        button_warning: yellow,
+        button_warning_active: yellow,
+        button_warning_foreground: bg,
+        button_warning_hover: yellow,
         group_box: alt,
         group_box_foreground: fg,
         caret: fg,
@@ -125,8 +152,9 @@ fn colors() -> ThemeColor {
         success_foreground: bg,
         success_hover: green,
         success_active: green,
-        bullish: green,
-        bearish: red,
+        chart_bullish: green,
+        chart_bearish: red,
+        chart_grid: highlight,
         switch: highlight,
         switch_thumb: fg,
         tab: bg,
@@ -141,16 +169,19 @@ fn colors() -> ThemeColor {
         table_even: alt,
         table_head: alt,
         table_head_foreground: fg,
+        table_foot: alt,
+        table_foot_foreground: fg,
         table_hover: highlight,
         table_row_border: highlight,
         title_bar: bg,
         title_bar_border: highlight,
-        tiles: bg,
+        status_bar: bg,
+        status_bar_border: highlight,
         warning: yellow,
         warning_active: yellow,
         warning_hover: yellow,
         warning_foreground: bg,
-        overlay: gpui::rgba((BG << 8) | 0x99).into(),
+        overlay: gpui_kit::rgba((BG << 8) | 0x99).into(),
         window_border: highlight,
         red,
         red_light: red,
