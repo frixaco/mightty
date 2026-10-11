@@ -1,22 +1,21 @@
 use gpui_kit::component::{
-    InteractiveElementExt,
+    Icon, InteractiveElementExt,
     button::{Button, ButtonVariants},
-    menu::AppMenuBar,
 };
 use gpui_kit::{
     AnyElement, Context, Entity, FocusHandle, Font, FontFallbacks, IntoElement, KeyDownEvent,
-    KeyUpEvent, MouseButton, MouseDownEvent, Render, Task, Window, WindowControlArea, div, font,
-    prelude::*, px,
+    KeyUpEvent, MouseButton, MouseDownEvent, Render, SharedString, Task, Window, WindowControlArea,
+    div, font, prelude::*, px,
 };
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Duration;
 
 use crate::action::{
     ActionContext, AppAction, DispatchAppAction, SplitDirection as ActionSplitDirection,
 };
-use crate::command_palette::{PaletteCommand, commands, filtered_command_indices};
+use crate::command_palette::{PaletteCommand, chord_keycaps, commands, filtered_command_indices};
 use crate::profile::ProfileId;
 use crate::settings::{ReloadOutcome, SettingsStore};
 #[cfg(windows)]
@@ -33,16 +32,24 @@ mod wait;
 pub use wait::ControlWait;
 
 const WINDOW_BACKGROUND: u32 = theme::BG;
-const WINDOW_HORIZONTAL_PADDING_PX: f32 = 8.0;
-const TITLE_BAR_HEIGHT_PX: f32 = 34.0;
+const TITLE_BAR_HEIGHT_PX: f32 = 32.0;
 const MAC_TRAFFIC_LIGHT_SPACER_PX: f32 = 78.0;
 const WINDOW_CONTROL_WIDTH_PX: f32 = 46.0;
-const SIDEBAR_WIDTH_PX: f32 = 160.0;
-const SIDEBAR_GAP_PX: f32 = 8.0;
-const TAB_RADIUS_PX: f32 = 4.0;
+/// Sidebar width including its 1px right border.
+const SIDEBAR_WIDTH_PX: f32 = 180.0;
+const SIDEBAR_BUTTON_WIDTH_PX: f32 = 28.0;
+const SIDEBAR_BUTTON_HEIGHT_PX: f32 = 24.0;
+const TAB_RADIUS_PX: f32 = 5.0;
 const TAB_HEIGHT_PX: f32 = 28.0;
+const TAB_FONT_SIZE_PX: f32 = 12.0;
 const MAX_SELECTABLE_TABS: usize = 9;
 const PALETTE_MAX_RESULTS: usize = 12;
+const PALETTE_WIDTH_PX: f32 = 560.0;
+const PALETTE_INPUT_HEIGHT_PX: f32 = 36.0;
+const PALETTE_ROW_HEIGHT_PX: f32 = 26.0;
+const PALETTE_CATEGORY_WIDTH_PX: f32 = 64.0;
+/// Codicon `split-horizontal` from the embedded Nerd Font.
+const SPLIT_GLYPH: &str = "\u{eb56}";
 
 #[derive(Clone, Copy)]
 enum WindowsCaptionButton {
@@ -74,9 +81,10 @@ pub struct PaneContainer {
     active_tab_index: usize,
     sidebar_visible: bool,
     label_geometry: std::rc::Rc<std::cell::RefCell<BTreeMap<u64, serde_json::Value>>>,
+    /// Sidebar row under the pointer, by tab id; it shows a close button.
+    hovered_tab: Option<u64>,
     needs_focus: bool,
     titlebar_visible: bool,
-    app_menu_bar: Option<Entity<AppMenuBar>>,
     bell_notification_pending: bool,
     settings: SettingsStore,
     settings_task: Task<()>,
@@ -112,20 +120,22 @@ impl PaneContainer {
             return;
         }
         self.layout_input = Some((viewport, self.sidebar_visible));
+        // First-frame estimate; the content canvas reports the measured bounds.
         let sidebar = if self.sidebar_visible {
-            SIDEBAR_WIDTH_PX + SIDEBAR_GAP_PX
+            SIDEBAR_WIDTH_PX
         } else {
             0.0
         };
+        // The title bar is followed by a 1px border above the panes.
         let titlebar = if self.titlebar_visible {
-            TITLE_BAR_HEIGHT_PX
+            TITLE_BAR_HEIGHT_PX + 1.0
         } else {
             0.0
         };
         let bounds = gpui_kit::Bounds {
-            origin: gpui_kit::point(px(WINDOW_HORIZONTAL_PADDING_PX + sidebar), px(titlebar)),
+            origin: gpui_kit::point(px(sidebar), px(titlebar)),
             size: gpui_kit::size(
-                (viewport.width - px(2.0 * WINDOW_HORIZONTAL_PADDING_PX + sidebar)).max(px(1.0)),
+                (viewport.width - px(sidebar)).max(px(1.0)),
                 (viewport.height - px(titlebar)).max(px(1.0)),
             ),
         };
@@ -316,9 +326,9 @@ impl PaneContainer {
             active_tab_index: 0,
             sidebar_visible,
             label_geometry: Default::default(),
+            hovered_tab: None,
             needs_focus: true,
             titlebar_visible,
-            app_menu_bar: None,
             bell_notification_pending: false,
             settings,
             settings_task: Task::ready(()),
@@ -1257,84 +1267,51 @@ impl Render for PaneContainer {
         }
         self.refresh_tab_titles(window, cx);
         self.deliver_bell_notification(window);
-        if self.titlebar_visible && !cfg!(target_os = "macos") && self.app_menu_bar.is_none() {
-            self.app_menu_bar = Some(AppMenuBar::new(cx));
-        }
-        let app_menu_bar = self.app_menu_bar.clone();
-        let sidebar_toggle = Button::new("sidebar-toggle")
-            .ghost()
-            .w(px(34.0))
-            .h(px(28.0))
-            .p_0()
-            .mx(px(3.0))
-            .tooltip(if self.sidebar_visible {
-                "Hide sidebar"
-            } else {
-                "Show sidebar"
-            })
-            .child(
-                div()
-                    .w(px(18.0))
-                    .h(px(14.0))
-                    .border_1()
-                    .border_color(gpui_kit::rgb(theme::GREY))
-                    .rounded(px(2.0))
-                    .overflow_hidden()
-                    .child(
-                        div()
-                            .w(px(5.0))
-                            .h_full()
-                            .border_r_1()
-                            .border_color(gpui_kit::rgb(theme::GREY))
-                            .when(self.sidebar_visible, |icon| {
-                                icon.bg(gpui_kit::rgb(theme::GREY))
-                            }),
-                    ),
-            )
-            .on_mouse_down(MouseButton::Left, |_, window, cx| {
-                window.prevent_default();
-                cx.stop_propagation();
-            })
-            .on_click(cx.listener(|this, _, window, cx| {
-                this.dispatch_app_action(AppAction::ToggleSidebar, window, cx);
-            }))
-            .into_any_element();
         let palette = self
             .palette
             .as_ref()
             .map(|_| self.render_command_palette(window, cx));
+        let titlebar = self.titlebar_visible.then(|| {
+            // The sidebar carries its own toggle while it is shown.
+            let sidebar_toggle = (!self.sidebar_visible).then(|| {
+                self.sidebar_button(
+                    "titlebar-sidebar-toggle",
+                    "icons/panel-left.svg",
+                    "Show sidebar",
+                    AppAction::ToggleSidebar,
+                    cx,
+                )
+            });
+            let title = self.window_title(window, cx);
+            render_titlebar(window, sidebar_toggle, title)
+        });
 
         div()
             .size_full()
             .relative()
             .flex()
-            .flex_col()
+            .flex_row()
             .bg(gpui_kit::rgb(WINDOW_BACKGROUND))
             .on_action(cx.listener(Self::on_app_action))
-            .children(
-                self.titlebar_visible
-                    .then(|| render_titlebar(window, app_menu_bar, sidebar_toggle)),
-            )
-            .children(
-                self.settings
-                    .diagnostic()
-                    .map(|diagnostic| render_settings_diagnostic(diagnostic.to_string())),
-            )
-            .children(
-                self.workspace_diagnostic
-                    .clone()
-                    .map(render_workspace_diagnostic),
-            )
+            .children(self.sidebar_visible.then(|| self.render_sidebar(cx)))
             .child(
                 div()
                     .flex_1()
-                    .min_h_0()
-                    .overflow_hidden()
-                    .pl(px(WINDOW_HORIZONTAL_PADDING_PX))
-                    .pr(px(WINDOW_HORIZONTAL_PADDING_PX))
+                    .min_w_0()
+                    .h_full()
                     .flex()
-                    .flex_row()
-                    .children(self.sidebar_visible.then(|| self.render_sidebar(cx)))
+                    .flex_col()
+                    .children(titlebar)
+                    .children(
+                        self.settings
+                            .diagnostic()
+                            .map(|diagnostic| render_settings_diagnostic(diagnostic.to_string())),
+                    )
+                    .children(
+                        self.workspace_diagnostic
+                            .clone()
+                            .map(render_workspace_diagnostic),
+                    )
                     .child(
                         div()
                             .flex_1()
@@ -1342,6 +1319,11 @@ impl Render for PaneContainer {
                             .min_h_0()
                             .overflow_hidden()
                             .relative()
+                            .when(self.titlebar_visible, |content| {
+                                content
+                                    .border_t_1()
+                                    .border_color(gpui_kit::rgb(theme::CHROME_BORDER))
+                            })
                             .child(
                                 gpui_kit::canvas(
                                     {
@@ -1384,60 +1366,64 @@ fn render_workspace_diagnostic(message: String) -> impl IntoElement {
         .child(format!("Workspace: {message}"))
 }
 
+/// Empty title-bar space that moves the window and maximizes on double-click.
+fn titlebar_drag_region(id: &'static str) -> gpui_kit::Stateful<gpui_kit::Div> {
+    div()
+        .id(id)
+        .h_full()
+        .window_control_area(WindowControlArea::Drag)
+        .on_double_click(|_, window, _| {
+            if cfg!(target_os = "macos") {
+                window.titlebar_double_click();
+            } else {
+                window.zoom_window();
+            }
+        })
+}
+
 fn render_titlebar(
     window: &mut Window,
-    app_menu_bar: Option<Entity<AppMenuBar>>,
-    sidebar_toggle: AnyElement,
+    sidebar_toggle: Option<AnyElement>,
+    title: SharedString,
 ) -> impl IntoElement {
     let maximize_button = if window.is_maximized() {
         WindowsCaptionButton::Restore
     } else {
         WindowsCaptionButton::Maximize
     };
+    let has_toggle = sidebar_toggle.is_some();
 
     div()
         .h(px(TITLE_BAR_HEIGHT_PX))
+        .flex_shrink_0()
         .flex()
         .flex_row()
         .items_center()
         .bg(gpui_kit::rgb(WINDOW_BACKGROUND))
-        .when(cfg!(target_os = "macos"), |titlebar| {
+        // With the sidebar shown, the traffic lights sit over the sidebar instead.
+        .when(cfg!(target_os = "macos") && has_toggle, |titlebar| {
             titlebar.child(
-                div()
-                    .id("mac-traffic-light-space")
-                    .h_full()
+                titlebar_drag_region("mac-traffic-light-space")
                     .w(px(MAC_TRAFFIC_LIGHT_SPACER_PX))
-                    .flex_shrink_0()
-                    .window_control_area(WindowControlArea::Drag)
-                    .on_double_click(|_, window, _| window.titlebar_double_click()),
+                    .flex_shrink_0(),
             )
         })
-        .child(sidebar_toggle)
-        .when(cfg!(target_os = "macos"), |titlebar| {
-            titlebar.child(
-                div()
-                    .id("titlebar-drag")
-                    .h_full()
-                    .flex_1()
-                    .window_control_area(WindowControlArea::Drag)
-                    .on_double_click(|_, window, _| window.titlebar_double_click()),
-            )
-        })
+        .children(sidebar_toggle.map(|toggle| div().pl(px(4.0)).child(toggle)))
+        .child(
+            titlebar_drag_region("titlebar-drag")
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .items_center()
+                .pl(px(if has_toggle { 8.0 } else { 12.0 }))
+                .text_size(px(11.5))
+                .text_color(gpui_kit::rgb(theme::GREY))
+                .child(div().min_w_0().truncate().child(title)),
+        )
+        // TODO(resource-usage): show system CPU, memory, GPU and VRAM usage here,
+        // sampled on a background task about once a second, as in the A2 design.
         .when(!cfg!(target_os = "macos"), |titlebar| {
             titlebar
-                .children(
-                    app_menu_bar.map(|menu_bar| {
-                        div().h_full().w(px(300.0)).flex_shrink_0().child(menu_bar)
-                    }),
-                )
-                .child(
-                    div()
-                        .id("titlebar-drag")
-                        .h_full()
-                        .flex_1()
-                        .window_control_area(WindowControlArea::Drag)
-                        .on_double_click(|_, window, _| window.zoom_window()),
-                )
                 .child(window_control_button(
                     "minimize",
                     WindowControlArea::Min,
@@ -1459,11 +1445,105 @@ fn render_titlebar(
         })
 }
 
+fn render_keycaps(keys: Vec<SharedString>) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_shrink_0()
+        .gap(px(2.0))
+        .children(keys.into_iter().map(|key| {
+            div()
+                .h(px(17.0))
+                .min_w(px(16.0))
+                .px(px(4.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(3.0))
+                .bg(gpui_kit::rgb(theme::KEYCAP))
+                .border_b_1()
+                .border_color(gpui_kit::rgb(theme::BG_HIGHLIGHT))
+                .font_family(crate::widget::DEFAULT_TERMINAL_FONT_FAMILY)
+                .text_size(px(10.0))
+                .text_color(gpui_kit::rgb(theme::FG_MUTED))
+                .child(key)
+        }))
+}
+
 fn bell_notification_allowed(enabled: bool, window_active: bool) -> bool {
     enabled && !window_active
 }
 
+/// Show a directory with the user's home folder abbreviated to `~`.
+fn display_directory(directory: &Path) -> String {
+    let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+        .map(PathBuf::from)
+        .filter(|home| !home.as_os_str().is_empty());
+    match home.and_then(|home| directory.strip_prefix(home).ok().map(Path::to_path_buf)) {
+        Some(relative) if relative.as_os_str().is_empty() => "~".to_string(),
+        Some(relative) => format!("~{}{}", std::path::MAIN_SEPARATOR, relative.display()),
+        None => directory.display().to_string(),
+    }
+}
+
+struct SidebarTab {
+    title: String,
+    pane_count: usize,
+    exited: bool,
+    bell_pending: bool,
+    id: u64,
+}
+
 impl PaneContainer {
+    fn binding_label(&self, action: &AppAction) -> Option<String> {
+        crate::command_palette::preferred_binding(self.settings.current(), action)
+            .map(|chord| chord_keycaps(&chord).join("+"))
+    }
+
+    fn sidebar_button(
+        &self,
+        id: &'static str,
+        icon: &'static str,
+        label: &'static str,
+        action: AppAction,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let tooltip = match self.binding_label(&action) {
+            Some(binding) => format!("{label} ({binding})"),
+            None => label.to_string(),
+        };
+        Button::new(id)
+            .ghost()
+            .w(px(SIDEBAR_BUTTON_WIDTH_PX))
+            .h(px(SIDEBAR_BUTTON_HEIGHT_PX))
+            .p_0()
+            .tooltip(tooltip)
+            .child(
+                Icon::default()
+                    .path(icon)
+                    .size(px(14.0))
+                    .text_color(gpui_kit::rgb(theme::GREY)),
+            )
+            .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                window.prevent_default();
+                cx.stop_propagation();
+            })
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.dispatch_app_action(action.clone(), window, cx);
+            }))
+            .into_any_element()
+    }
+
+    fn window_title(&self, window: &Window, cx: &mut Context<Self>) -> SharedString {
+        let title = self.tabs[self.active_tab_index].title.clone();
+        match self
+            .active_terminal(window, cx)
+            .and_then(|terminal| terminal.read(cx).workspace_working_directory())
+        {
+            Some(directory) => format!("{title}  ·  {}", display_directory(&directory)).into(),
+            None => title.into(),
+        }
+    }
+
     fn render_command_palette(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let palette = self
             .palette
@@ -1472,6 +1552,10 @@ impl PaneContainer {
         let commands = self.palette_commands(window, cx);
         let matches = filtered_command_indices(&commands, &palette.query);
         let selected = palette.selected.min(matches.len().saturating_sub(1));
+        let result_count = match matches.len() {
+            1 => "1 result".to_string(),
+            count => format!("{count} results"),
+        };
 
         div()
             .absolute()
@@ -1482,7 +1566,7 @@ impl PaneContainer {
             .flex()
             .justify_center()
             .items_start()
-            .pt(px(72.0))
+            .pt(px(64.0))
             .bg(gpui_kit::rgba((theme::BG << 8) | 0x99))
             .occlude()
             .track_focus(&self.palette_focus)
@@ -1513,13 +1597,13 @@ impl PaneContainer {
             )
             .child(
                 div()
-                    .w(px(620.0))
+                    .w(px(PALETTE_WIDTH_PX))
                     .max_h(px(560.0))
                     .overflow_hidden()
                     .rounded(px(8.0))
                     .border_1()
-                    .border_color(gpui_kit::rgb(theme::BG_HIGHLIGHT))
-                    .bg(gpui_kit::rgb(theme::BG_ALT))
+                    .border_color(gpui_kit::rgb(theme::ROW_ACTIVE_BORDER))
+                    .bg(gpui_kit::rgb(theme::PALETTE_BG))
                     .shadow_lg()
                     .on_mouse_down(MouseButton::Left, |_event: &MouseDownEvent, window, cx| {
                         window.prevent_default();
@@ -1527,155 +1611,385 @@ impl PaneContainer {
                     })
                     .child(
                         div()
-                            .h(px(48.0))
-                            .px(px(14.0))
+                            .h(px(PALETTE_INPUT_HEIGHT_PX))
+                            .px(px(12.0))
                             .flex()
                             .items_center()
+                            .gap(px(8.0))
                             .border_b_1()
-                            .border_color(gpui_kit::rgb(theme::BG_HIGHLIGHT))
-                            .text_size(px(15.0))
+                            .border_color(gpui_kit::rgb(theme::CHROME_BORDER))
+                            .text_size(px(13.0))
                             .text_color(gpui_kit::rgb(theme::FG))
-                            .children(
-                                self.palette_input
-                                    .as_ref()
-                                    .map(gpui_kit::component::input::Input::new),
-                            ),
-                    )
-                    .children(
-                        matches
-                            .into_iter()
-                            .take(PALETTE_MAX_RESULTS)
-                            .enumerate()
-                            .map(|(result_index, command_index)| {
-                                let command = &commands[command_index];
-                                let action = command.action.clone();
-                                let available = command.unavailable_reason.is_none();
-                                let detail = command
-                                    .unavailable_reason
-                                    .map(ToOwned::to_owned)
-                                    .or_else(|| command.binding.clone())
-                                    .unwrap_or_else(|| command.category.title().to_string());
-
+                            .child(
+                                Icon::default()
+                                    .path("icons/search.svg")
+                                    .size(px(13.0))
+                                    .text_color(gpui_kit::rgb(theme::GREY)),
+                            )
+                            .child(div().flex_1().min_w_0().children(
+                                self.palette_input.as_ref().map(|input| {
+                                    gpui_kit::component::input::Input::new(input).appearance(false)
+                                }),
+                            ))
+                            .child(
                                 div()
-                                    .id(("palette-command", command_index))
-                                    .h(px(40.0))
-                                    .px(px(12.0))
-                                    .flex()
-                                    .items_center()
-                                    .justify_between()
-                                    .bg(if result_index == selected {
-                                        gpui_kit::rgb(theme::BG_HIGHLIGHT)
-                                    } else {
-                                        gpui_kit::rgb(theme::BG_ALT)
-                                    })
-                                    .text_color(if available {
-                                        gpui_kit::rgb(theme::FG)
-                                    } else {
-                                        gpui_kit::rgb(theme::GREY)
-                                    })
-                                    .when(available, |row| {
-                                        row.hover(|style| {
-                                            style.bg(gpui_kit::rgb(theme::BG_HIGHLIGHT))
-                                        })
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(
-                                                move |this, _event: &MouseDownEvent, window, cx| {
-                                                    this.close_palette(window, cx);
-                                                    this.dispatch_app_action(
-                                                        action.clone(),
-                                                        window,
-                                                        cx,
-                                                    );
-                                                    window.prevent_default();
-                                                    cx.stop_propagation();
-                                                },
-                                            ),
-                                        )
-                                    })
-                                    .child(div().text_size(px(13.0)).child(command.title.clone()))
-                                    .child(
-                                        div()
-                                            .text_size(px(11.0))
-                                            .text_color(gpui_kit::rgb(theme::GREY))
-                                            .child(detail),
+                                    .flex_shrink_0()
+                                    .text_size(px(10.5))
+                                    .text_color(gpui_kit::rgb(theme::GREY_DIM))
+                                    .child(result_count),
+                            )
+                            .child(render_keycaps(vec!["↑↓".into(), "↵".into(), "Esc".into()])),
+                    )
+                    .child(
+                        div().p(px(4.0)).flex().flex_col().children(
+                            matches
+                                .into_iter()
+                                .take(PALETTE_MAX_RESULTS)
+                                .enumerate()
+                                .map(|(result_index, command_index)| {
+                                    self.render_palette_row(
+                                        &commands[command_index],
+                                        command_index,
+                                        result_index == selected,
+                                        cx,
                                     )
-                            }),
+                                }),
+                        ),
                     ),
             )
             .into_any_element()
     }
 
+    fn render_palette_row(
+        &self,
+        command: &PaletteCommand,
+        command_index: usize,
+        is_selected: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let action = command.action.clone();
+        let available = command.unavailable_reason.is_none();
+        let title_color = match (available, is_selected) {
+            (false, _) => theme::GREY,
+            (true, true) => theme::FG,
+            (true, false) => theme::FG_MUTED,
+        };
+        // Every row states its shortcut, including that it has none.
+        let shortcut = match &command.binding {
+            Some(chord) => {
+                render_keycaps(chord_keycaps(chord).into_iter().map(Into::into).collect())
+                    .into_any_element()
+            }
+            None => div()
+                .flex_shrink_0()
+                .h(px(17.0))
+                .px(px(5.0))
+                .flex()
+                .items_center()
+                .rounded(px(3.0))
+                .border_1()
+                .border_dashed()
+                .border_color(gpui_kit::rgb(theme::BG_HIGHLIGHT))
+                .text_size(px(10.0))
+                .text_color(gpui_kit::rgb(theme::GREY_DIM))
+                .child("Unbound")
+                .into_any_element(),
+        };
+
+        div()
+            .id(("palette-command", command_index))
+            .h(px(PALETTE_ROW_HEIGHT_PX))
+            .flex_shrink_0()
+            .px(px(8.0))
+            .rounded(px(4.0))
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .text_size(px(12.5))
+            .when(is_selected, |row| row.bg(gpui_kit::rgb(theme::KEYCAP)))
+            .when(available, |row| {
+                row.hover(|style| style.bg(gpui_kit::rgb(theme::KEYCAP)))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _event: &MouseDownEvent, window, cx| {
+                            this.close_palette(window, cx);
+                            this.dispatch_app_action(action.clone(), window, cx);
+                            window.prevent_default();
+                            cx.stop_propagation();
+                        }),
+                    )
+            })
+            .child(
+                div()
+                    .w(px(PALETTE_CATEGORY_WIDTH_PX))
+                    .flex_shrink_0()
+                    .text_size(px(10.5))
+                    .text_color(gpui_kit::rgb(if is_selected {
+                        theme::GREY
+                    } else {
+                        theme::GREY_DIM
+                    }))
+                    .child(command.category.title()),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_color(gpui_kit::rgb(title_color))
+                    .child(command.title.clone()),
+            )
+            .children(command.unavailable_reason.map(|reason| {
+                div()
+                    .flex_shrink_0()
+                    .max_w(px(170.0))
+                    .truncate()
+                    .text_size(px(10.5))
+                    .text_color(gpui_kit::rgb(theme::GREY_DIM))
+                    .child(reason)
+            }))
+            .child(shortcut)
+            .into_any_element()
+    }
+
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let top_row = self.titlebar_visible.then(|| {
+            div()
+                .h(px(TITLE_BAR_HEIGHT_PX))
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .px(px(4.0))
+                .gap(px(2.0))
+                .when(cfg!(target_os = "macos"), |row| {
+                    row.child(
+                        titlebar_drag_region("mac-traffic-light-space")
+                            .w(px(MAC_TRAFFIC_LIGHT_SPACER_PX))
+                            .flex_shrink_0(),
+                    )
+                })
+                .child(self.sidebar_button(
+                    "sidebar-toggle",
+                    "icons/panel-left.svg",
+                    "Hide sidebar",
+                    AppAction::ToggleSidebar,
+                    cx,
+                ))
+                .child(titlebar_drag_region("sidebar-drag").flex_1())
+                .child(self.sidebar_button(
+                    "sidebar-command-palette",
+                    "icons/search.svg",
+                    "Command palette",
+                    AppAction::CommandPalette,
+                    cx,
+                ))
+                .child(self.sidebar_button(
+                    "sidebar-new-tab",
+                    "icons/plus.svg",
+                    "New tab",
+                    AppAction::NewTab { profile_id: None },
+                    cx,
+                ))
+        });
+        let tabs = self
+            .tabs
+            .iter()
+            .map(|tab| {
+                let split = tab.split.read(cx);
+                let pane_count = split.pane_count();
+                SidebarTab {
+                    title: tab.title.clone(),
+                    pane_count,
+                    exited: split.exited_terminal_ids(cx).len() == pane_count,
+                    bell_pending: tab.bell_pending,
+                    id: tab.id.value(),
+                }
+            })
+            .collect::<Vec<_>>();
+
         div()
             .w(px(SIDEBAR_WIDTH_PX))
             .h_full()
             .flex_shrink_0()
-            .mr(px(SIDEBAR_GAP_PX))
-            .bg(gpui_kit::rgb(WINDOW_BACKGROUND))
-            .pt(px(4.0))
-            .children(self.tabs.iter().enumerate().map(|(index, tab)| {
-                let is_active = index == self.active_tab_index;
-                let title = tab.title.clone();
-                let tooltip = title.clone();
-                let geometry = self.label_geometry.clone();
-                let id = tab.id.value();
-
+            .flex()
+            .flex_col()
+            .bg(gpui_kit::rgb(theme::SIDEBAR_BG))
+            .border_r_1()
+            .border_color(gpui_kit::rgb(theme::CHROME_BORDER))
+            .children(top_row)
+            .child(
                 div()
-                    .id(("tab", index))
-                    .h(px(TAB_HEIGHT_PX))
-                    .w_full()
-                    .mb(px(2.0))
-                    .rounded(px(TAB_RADIUS_PX))
-                    .overflow_hidden()
                     .flex()
-                    .flex_row()
+                    .flex_col()
+                    .gap(px(1.0))
+                    .px(px(6.0))
+                    .pt(px(if self.titlebar_visible { 2.0 } else { 6.0 }))
+                    .children(
+                        tabs.into_iter()
+                            .enumerate()
+                            .map(|(index, tab)| self.render_sidebar_tab(index, tab, cx)),
+                    ),
+            )
+    }
+
+    fn render_sidebar_tab(
+        &self,
+        index: usize,
+        tab: SidebarTab,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let is_active = index == self.active_tab_index;
+        let tooltip = match u8::try_from(index)
+            .ok()
+            .and_then(|index| self.binding_label(&AppAction::SelectTab { index }))
+        {
+            Some(binding) => format!("{} ({binding})", tab.title),
+            None => tab.title.clone(),
+        };
+        let geometry = self.label_geometry.clone();
+        let id = tab.id;
+        let (icon_color, title_color) = if tab.exited {
+            (theme::GREY_DIM, theme::GREY)
+        } else if is_active {
+            (theme::CYAN, theme::FG)
+        } else {
+            (theme::GREY, theme::FG_MUTED)
+        };
+        let status = if tab.exited {
+            Some(
+                div()
+                    .text_size(px(10.5))
+                    .text_color(gpui_kit::rgb(theme::RED))
+                    .child("exited")
+                    .into_any_element(),
+            )
+        } else if tab.bell_pending {
+            Some(
+                div()
+                    .size(px(6.0))
+                    .rounded_full()
+                    .bg(gpui_kit::rgb(theme::ORANGE))
+                    .into_any_element(),
+            )
+        } else if tab.pane_count > 1 {
+            Some(
+                div()
+                    .flex()
                     .items_center()
-                    .gap(px(6.0))
-                    .px(px(8.0))
-                    .text_color(if is_active {
-                        gpui_kit::rgb(theme::FG)
-                    } else {
-                        gpui_kit::rgb(theme::GREY)
-                    })
-                    .bg(if is_active {
-                        gpui_kit::rgb(theme::BG_HIGHLIGHT)
-                    } else {
-                        gpui_kit::rgb(WINDOW_BACKGROUND)
-                    })
-                    .hover(|style| style.bg(gpui_kit::rgb(theme::BG_HIGHLIGHT)))
-                    .tooltip(move |window, cx| {
-                        gpui_kit::component::tooltip::Tooltip::new(tooltip.clone()).build(window, cx)
-                    })
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _event: &MouseDownEvent, _window, cx| {
-                            this.activate_tab(index, cx);
-                        }),
-                    )
-                    .children(tab.bell_pending.then(|| {
-                        div()
-                            .flex_shrink_0()
-                            .text_size(px(12.0))
-                            .line_height(px(TAB_HEIGHT_PX))
-                            .child("•")
-                    }))
+                    .gap(px(3.0))
+                    .text_size(px(10.5))
+                    .text_color(gpui_kit::rgb(theme::GREY))
                     .child(
                         div()
-                            .flex_1()
-                            .min_w_0()
-                            .w_full()
-                            .truncate()
-                            .relative()
-                            .text_size(px(12.0))
-                            .line_height(px(TAB_HEIGHT_PX))
-                            .child(title)
-                            .child(gpui_kit::canvas(move |bounds, window, _| {
-                                let style = window.text_style();
-                                geometry.borrow_mut().insert(id, serde_json::json!({"bounds":crate::snapshot::rect(bounds),"ancestor_clip":crate::snapshot::rect(window.content_mask().bounds),"font_family":style.font_family.as_ref(),"font_size_px":12,"line_height_px":TAB_HEIGHT_PX,"wrap":"nowrap","overflow":"ellipsis"}));
-                            }, |_, _, _, _| {}).absolute().top(px(0.)).left(px(0.)).size_full()),
+                            .font_family(crate::widget::DEFAULT_TERMINAL_FONT_FAMILY)
+                            .child(SPLIT_GLYPH),
                     )
+                    .child(tab.pane_count.to_string())
+                    .into_any_element(),
+            )
+        } else {
+            None
+        };
+        // Hovering swaps the status indicator for a close button.
+        let trailing = if self.hovered_tab == Some(id) {
+            Some(
+                div()
+                    .id(("tab-close", index))
+                    .size(px(18.0))
+                    .mr(px(-4.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(4.0))
+                    .hover(|style| style.bg(gpui_kit::rgb(theme::BG_HIGHLIGHT)))
+                    .tooltip(|window, cx| {
+                        gpui_kit::component::tooltip::Tooltip::new("Close tab").build(window, cx)
+                    })
+                    .child(
+                        Icon::default()
+                            .path("icons/close.svg")
+                            .size(px(11.0))
+                            .text_color(gpui_kit::rgb(theme::FG_MUTED)),
+                    )
+                    // Keep the row from activating the tab being closed.
+                    .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                        window.prevent_default();
+                        cx.stop_propagation();
+                    })
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        if let Some(index) = this.tabs.iter().position(|tab| tab.id.value() == id) {
+                            this.close_tab_target(index, window, cx);
+                        }
+                    }))
+                    .into_any_element(),
+            )
+        } else {
+            status
+        };
+
+        div()
+            .id(("tab", index))
+            .h(px(TAB_HEIGHT_PX))
+            .w_full()
+            .flex_shrink_0()
+            .rounded(px(TAB_RADIUS_PX))
+            .overflow_hidden()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(7.0))
+            .px(px(8.0))
+            .border_1()
+            .when(is_active, |row| {
+                row.bg(gpui_kit::rgb(theme::ROW_ACTIVE))
+                    .border_color(gpui_kit::rgb(theme::ROW_ACTIVE_BORDER))
+            })
+            .when(!is_active, |row| {
+                row.border_color(gpui_kit::transparent_black())
+                    .hover(|style| style.bg(gpui_kit::rgb(theme::ROW_ACTIVE)))
+            })
+            .tooltip(move |window, cx| {
+                gpui_kit::component::tooltip::Tooltip::new(tooltip.clone()).build(window, cx)
+            })
+            .on_hover(cx.listener(move |this, hovered: &bool, _window, cx| {
+                if *hovered {
+                    this.hovered_tab = Some(id);
+                } else if this.hovered_tab == Some(id) {
+                    this.hovered_tab = None;
+                }
+                cx.notify();
             }))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _event: &MouseDownEvent, _window, cx| {
+                    this.activate_tab(index, cx);
+                }),
+            )
+            .child(
+                Icon::default()
+                    .path("icons/square-terminal.svg")
+                    .size(px(13.0))
+                    .flex_shrink_0()
+                    .text_color(gpui_kit::rgb(icon_color)),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .relative()
+                    .text_size(px(TAB_FONT_SIZE_PX))
+                    .line_height(px(TAB_HEIGHT_PX))
+                    .text_color(gpui_kit::rgb(title_color))
+                    .child(tab.title)
+                    .child(gpui_kit::canvas(move |bounds, window, _| {
+                        let style = window.text_style();
+                        geometry.borrow_mut().insert(id, serde_json::json!({"bounds":crate::snapshot::rect(bounds),"ancestor_clip":crate::snapshot::rect(window.content_mask().bounds),"font_family":style.font_family.as_ref(),"font_size_px":TAB_FONT_SIZE_PX,"line_height_px":TAB_HEIGHT_PX,"wrap":"nowrap","overflow":"ellipsis"}));
+                    }, |_, _, _, _| {}).absolute().top(px(0.)).left(px(0.)).size_full()),
+            )
+            .children(trailing.map(|trailing| div().flex_shrink_0().child(trailing)))
+            .into_any_element()
     }
 }
 

@@ -1,292 +1,287 @@
 # mightty
 
-mightty is a GPU-powered terminal emulator built with Rust, GPUI, platform
-PTYs, and Ghostty's `libghostty-vt`.
+A fast, GPU-rendered terminal for Windows that you can drive entirely from the
+command line, by hand, from scripts, or from an AI agent.
 
-mightty targets Windows first, with Windows shell I/O through ConPTY and Unix
-shell I/O through a forkpty-backed bridge.
+![Claude Code session explaining how panes are laid out, with three tabs in the sidebar](docs/screenshots/terminal.png)
+
+mightty is built in Rust on [GPUI Kit](https://github.com/longbridge/gpui-kit)
+and [Ghostty](https://github.com/ghostty-org/ghostty)'s `libghostty-vt` terminal
+engine. It targets Windows first (ConPTY), with a Unix shell bridge (forkpty)
+behind the same interface.
 
 ## Screenshots
 
-PowerShell with colored output and Nerd Font icons.
+Claude Code and Codex side by side. The focused pane is outlined and the other
+is dimmed.
 
-![PowerShell terminal with colored commands, folder icons, and sidebar tabs](docs/screenshots/terminal.png)
+![Claude Code and Codex running side by side in split panes](docs/screenshots/split-panes.png)
 
-Split panes with source files, Git history, and truecolor output.
+lazygit in one of several tabs.
 
-![Three terminal panes showing Git history, Rust source, and six truecolor swatches](docs/screenshots/split-panes.png)
+![lazygit showing files, commits and a colored diff, with three tabs in the sidebar](docs/screenshots/tabs.png)
 
-The command palette over the active terminal layout.
+The command palette, showing each command's category and shortcut.
 
-![Command palette with pane and tab actions over colored terminal output](docs/screenshots/command-palette.png)
+![Command palette filtered to pane commands, each with its key binding](docs/screenshots/command-palette.png)
+
+## Why mightty
+
+- **Everything is scriptable.** Every tab, pane, window, keystroke, and pixel is
+  reachable through `mightty ctl`. Anything you can do with the keyboard and
+  mouse, a script or agent can do too, and get structured JSON back.
+- **Built for AI agents.** Agents can open panes, run commands, wait for output,
+  read the screen, and take lossless screenshots without guessing. IDs never
+  silently fall back to the wrong target, and every reply says exactly what
+  happened.
+- **A real terminal underneath.** Ghostty's VT engine handles escape sequences,
+  so modern TUIs like Claude Code, Codex, and lazygit render correctly.
+
+## Control mightty from the CLI
+
+`mightty ctl` talks to a running mightty instance. Add `--json` to any command
+for machine-readable output.
+
+```powershell
+# What's running?
+mightty ctl instances --json
+mightty ctl state --json          # windows, tabs, panes, sizes, titles, processes
+
+# Open a pane to the right (the reply names the new pane, here p2) and run a command in it
+mightty ctl pane split --pane p1 --direction right --cwd C:\work
+mightty ctl pane send-text --pane p2 --text "cargo test"
+mightty ctl pane send-key --pane p2 --key Enter
+
+# Wait for a result, then read what the terminal shows
+mightty ctl wait --pane p2 --text "test result" --timeout 60s
+mightty ctl pane read --pane p2 --tail 50
+
+# Capture the pane exactly as it renders: PNG plus cell data and state
+mightty ctl snapshot --pane p2 --out .\captures
+```
+
+Inside a mightty pane, commands default to that pane. Every shell gets
+`MIGHTTY_INSTANCE_ID`, `MIGHTTY_WINDOW_ID`, `MIGHTTY_TAB_ID`, and
+`MIGHTTY_PANE_ID`, so an agent running in mightty can run
+`mightty ctl pane read --tail 100` without looking up any IDs.
+
+### What you can do
+
+| Area | Commands |
+| --- | --- |
+| Discover | `instances`, `state`, `capabilities`, `profiles` |
+| Tabs | `tab new`, `tab select`, `tab move`, `tab close` |
+| Panes | `pane split`, `pane resize`, `pane focus`, `pane zoom`, `pane scroll`, `pane close` |
+| Terminal input | `pane send-text`, `pane send-key`, `pane input` (ordered text and key steps) |
+| Terminal output | `pane read` (viewport or tail, as text or styled cells) |
+| Windows and UI | `window focus`, `window resize`, `ui sidebar`, `ui palette`, `ui search` |
+| Real UI events | `ui key`, `ui text`, `ui pointer`, `ui input` (clicks, drags, selections) |
+| Synchronize | `wait` (for text, process exit, title, layout, overlay, settings) and `events` (live change stream) |
+| Capture | `snapshot` of a window, tab, or pane |
+
+Run `mightty ctl --help` for every argument, or
+`mightty ctl capabilities --json` for the full machine-readable contract:
+operations, arguments, error codes, and limits.
+
+### Why it's safe to automate
+
+- **No guessing.** Stale or ambiguous pane, tab, window, or instance IDs fail
+  with an error. They never fall back to a different target.
+- **Honest replies.** Each JSON reply has `ok`, a `result` or a typed `error`,
+  and an `effect` (`none`, `committed`, `partial`, or `unknown`), so callers
+  know whether anything changed.
+- **Waits instead of sleeps.** `wait` blocks until text appears, a process
+  exits, or a layout settles. `--after-output` ignores text that was already
+  on screen.
+- **Race-free layout changes.** Pass `--if-layout TOKEN` to a layout mutation
+  and it fails cleanly if the layout changed since you last looked.
+- **Observation has no side effects.** Reading state, reading output, and
+  offscreen snapshots don't change focus, selection, scroll position, or
+  terminal size.
+- **Pixel-exact screenshots.** Snapshots read back the GPU frame, so other
+  windows can't cover them, and rendering bugs show up exactly as the user saw
+  them. Each bundle also has matching cell data, state, environment, and
+  diagnostics.
+
+### Disposable test instances
+
+Start a separate GUI instance with its own settings and storage, no global
+hotkeys, and no default-terminal registration:
+
+```powershell
+mightty --test-instance --data-dir C:\temp\mightty-case
+```
+
+Pass `--instance ID` to `ctl` commands when more than one instance is running.
+`mightty ctl state --saved` reads the last persisted state even after the
+instance has exited.
+
+The CLI control transport and pixel capture are Windows-only for now. See the
+[control and diagnostics contract](docs/control-and-diagnostics-design.md) for
+targeting rules, input encoding, waits, event streams, snapshot modes, and the
+wire protocol.
 
 ## Features
 
-- GPU-rendered terminal UI through GPUI.
-- Terminal emulation through Ghostty's `libghostty-vt`, built directly from the
-  pinned Ghostty source submodule.
-- Protocol-controlled cursor appearance and synchronized output, with one owned
-  presentation frame shared by rendering, IME positioning and capture.
-- Scrollback, selection, mouse reporting, safe paste, hyperlinks, a scrollbar,
-  and full-scrollback search.
-- Typed profiles, themes, fonts, key bindings, and safe settings reload.
-- Native text composition with local preedit and cursor-positioned candidates;
-  search and command-palette queries use native text fields.
-- One typed action model for shortcuts, native menus, and the command palette.
-- Binary pane splits with divider drag, directional focus, resize, and zoom.
-- Named workspace save and restore with fresh shell processes.
-- Shell titles, trusted local directories, prompt navigation, and command-output
-  selection through PowerShell and Bash integration.
-- One Windows process with activation IPC and a persistent quick-terminal
-  window.
-- Signed per-user MSIX packaging, AppInstaller updates, and Windows
-  default-terminal handoff support.
-- Kitty graphics rendering with crop, z-order, deletion, and GPU cache reuse.
-- Windows shell I/O through ConPTY and Unix shell I/O through forkpty.
-- Embedded JetBrainsMono Nerd Font Mono for terminal text.
-- Windows CLI control, persisted diagnostic state, waits, and event streams.
-- Lossless GPU snapshots of the presented UI and offscreen tabs/panes;
-  `Ctrl+Shift+F12` writes the same diagnostic bundle.
+**Terminal**
+- Ghostty's `libghostty-vt`, built from a pinned source submodule
+- Scrollback, mouse reporting, hyperlinks, a scrollbar, and full-scrollback search
+- Text selection by drag, word, line, or rectangle
+- Safe paste with confirmation for risky content
+- Kitty graphics protocol
+- Native IME text composition
+- Embedded JetBrainsMono Nerd Font Mono
 
-## Stack
+**Layout**
+- Up to nine tabs in a compact sidebar
+- Split panes with draggable dividers, directional focus, resize, and zoom
+- Named workspaces you can save and restore
 
-- [GPUI Kit](https://github.com/longbridge/gpui-kit) 0.7.1 for GPUI rendering,
-  application infrastructure, and styled components.
-- [Ghostty](https://github.com/ghostty-org/ghostty) for the VT engine.
-- A project-owned Rust module over Ghostty's public C interface.
-- Windows ConPTY and Unix forkpty for shell process integration.
+**Customization**
+- Typed profiles, themes, fonts, and key bindings with safe live reload
+- A command palette listing every action with its shortcut
 
-## Requirements
+**Windows integration**
+- Single-process app with a persistent quick-terminal window
+- Signed MSIX packages, AppInstaller updates, and default-terminal support
+- PowerShell and Bash shell integration for titles, working directories, and
+  prompt navigation
 
-- Rust with edition 2024 support.
-- Git, used to initialize and validate the pinned Ghostty submodule.
-- Zig `0.16.0`, used directly by `build.rs` to compile Ghostty's VT library.
-- The initialized Ghostty source submodule at `ghostty/`.
-- Four local JetBrainsMono Nerd Font Mono files under `fonts/JetBrainsMono/`:
-  `JetBrainsMonoNerdFontMono-Regular.ttf`,
-  `JetBrainsMonoNerdFontMono-Bold.ttf`,
-  `JetBrainsMonoNerdFontMono-Italic.ttf`, and
-  `JetBrainsMonoNerdFontMono-BoldItalic.ttf`. Fonts are not vendored.
-- Windows 10 version 1809 or newer for ConPTY, or a Unix platform for forkpty.
+## Getting started
 
-This repo includes a `.mise.toml` pin for Zig:
+### Requirements
+
+- Rust with edition 2024 support
+- Git, for the pinned Ghostty submodule
+- Zig `0.16.0` (pinned in `.mise.toml`)
+- Windows 10 version 1809 or newer, or a Unix platform
+- The JetBrainsMono Nerd Font Mono files in `fonts/JetBrainsMono/` (not
+  vendored): `JetBrainsMonoNerdFontMono-Regular.ttf`, `-Bold.ttf`,
+  `-Italic.ttf`, and `-BoldItalic.ttf`
+
+### Build and run
 
 ```bash
 git submodule update --init ghostty
 mise install
-```
-
-The commands below use `mise exec --` so Cargo sees the pinned Zig executable.
-You can instead put Zig on `PATH` or set `ZIG` to a specific executable and run
-Cargo directly. Normal builds do not require Clang. Regenerating the private
-Rust C bindings after a Ghostty update additionally requires `libclang`.
-
-## Build
-
-```bash
-mise exec -- cargo build
-mise exec -- cargo build --release
-```
-
-The root `build.rs` runs Zig against the local `ghostty/` submodule and links
-the resulting static `libghostty-vt` archive. It never fetches a separate
-Ghostty checkout and there are no `libghostty-vt` Rust crate dependencies.
-
-Development builds use Zig `ReleaseSafe`, retaining runtime safety without
-Ghostty's expensive page integrity audits. Use `cargo run --features ghostty-debug`
-when investigating Ghostty core integrity. Release builds use `ReleaseFast`.
-
-The binding generator records the Ghostty commit and public-header fingerprint
-in `src/ghostty/bindings.version`. Every build verifies the submodule against
-that record before compiling or linking. See
-[`docs/ghostty-integration.md`](docs/ghostty-integration.md) for ownership,
-safety invariants, and the update procedure.
-
-The ordered product feature list and implementation research are in
-[`docs/feature-roadmap.md`](docs/feature-roadmap.md).
-
-## Run
-
-```bash
 mise exec -- cargo run
 ```
 
-The default shell is `pwsh.exe` on Windows. Unix uses `$SHELL`, falling back to
-`/bin/sh` when the variable is unset.
+For a release build, use `mise exec -- cargo build --release`.
 
-See [Settings](docs/settings.md) for profiles, themes, fonts, key bindings, and
-safe live reload.
+`mise exec --` makes the pinned Zig visible to Cargo. You can instead put Zig
+on `PATH` or set `ZIG` to its path and run Cargo directly.
 
-See [Workspaces](docs/workspaces.md) for named layout save and restore.
+The default shell is `pwsh.exe` on Windows. On Unix it's `$SHELL`, falling back
+to `/bin/sh`.
 
-See [Shell integration](docs/shell-integration.md) for PowerShell and Bash
-prompt markers, directory inheritance, and semantic actions.
+## Keyboard shortcuts
 
-See [Windows distribution](docs/windows-distribution.md) for signed packages,
-updates, protocol activation, and default-terminal setup.
+On macOS, use `Cmd` in place of `Ctrl` and `Cmd+Option` in place of `Alt`.
 
-## Control and diagnostics (Windows)
+| Shortcut | Action |
+| --- | --- |
+| `Ctrl+T` | New tab (up to nine) |
+| `Ctrl+1` … `Ctrl+9` | Switch to a tab |
+| `Ctrl+B` | Show or hide the sidebar |
+| `Alt+Enter` | Split right |
+| `Alt+Shift+Enter` | Split down |
+| `Alt+Arrow` | Focus the adjacent pane |
+| `Alt+Shift+Arrow` | Resize the active pane |
+| `Ctrl+D` | Close the pane, or the tab if it has one pane |
+| `Ctrl+Shift+C` / `Ctrl+Shift+V` | Copy / paste (`Cmd+C` / `Cmd+V` on macOS) |
+| `Ctrl+Shift+F` | Search scrollback (`Cmd+F` on macOS) |
+| `Ctrl+Shift+P` | Command palette |
+| `Ctrl+Shift+F12` | Save a diagnostic capture to `captures/` (Windows) |
+| `Cmd+Q` | Quit (macOS) |
 
-Inspect a running instance, use its returned IDs, and keep `--instance ID` on
-commands when more than one instance is running:
+With the mouse: drag to select, double-click for a word, triple-click for a
+line, and hold `Ctrl+Alt` (`Option` on macOS) while dragging for a rectangle.
+Drag split dividers to resize. The mouse wheel scrolls history.
 
-```powershell
-mightty ctl instances --json
-mightty ctl capabilities --json
-mightty ctl state --json
-mightty ctl pane split --pane p1 --direction left
-mightty ctl pane resize --pane p1 --edge right --delta-px 40
-mightty ctl pane read --pane p1 --tail 100
-mightty ctl snapshot --window active --frame presented --out .\captures
-mightty ctl snapshot --pane p1 --out .\captures
-mightty ctl state --saved --instance ID --json
-```
+Sidebar rows show the folder and process (such as `mightty · pwsh`) or a custom
+shell title, plus the pane count, a pending bell, or an exited shell. Hover a
+row to close its tab.
 
-`presented` captures the retained successful frame without repainting; `next`
-waits for a fresh scene. Pane/tab snapshots default to offscreen rendering and
-preserve live selection and PTY size. Bundles include PNG pixels, matching
-source/frame metadata, current state, environment, and bounded diagnostics.
+## Documentation
 
-For disposable automation, start `mightty --test-instance --data-dir PATH`.
-This uses isolated settings/storage and disables global hotkeys and COM
-registration. See the [control and diagnostics contract](docs/control-and-diagnostics-design.md)
-for targeting, input, waits, persistence, and capture limits. The
-[local GPUI patch](vendor/gpui/MIGHTTY-PATCH.md) supplies native input dispatch
-and Direct3D readback; optional resolved glyph/face diagnostics are unavailable.
-
-## Shell I/O
-
-Terminal I/O is wake-driven. `TerminalWidget` owns a `PtyWorker`; the platform
-shell modules own the raw PTY handles.
-
-`LaunchSpec` keeps the executable, arguments, working directory, and environment
-separate. Both platform shell modules use these values without a shell command
-string.
-
-On Windows, `PtyParts::spawn` creates split ConPTY handles:
-
-- `PtyInput::write_all(&[u8])` sends command input and terminal responses.
-- `PtyOutput::read(&mut [u8])` blocks in `ReadFile` and returns `Data(usize)` or `Eof`.
-- `PtyControl::resize(PtySize)` resizes the pseudoconsole.
-- `PtyControl::shutdown()` closes the pseudoconsole and cleans up the child process.
-
-The worker uses one command/control thread and one blocking output reader
-thread. Output events wake a retained GPUI foreground task, which applies data
-to the local Ghostty terminal module, drains ready chunks up to a fixed budget,
-and then notifies the UI. Both platform backends expose blocking reads as
-`PtyRead::Data(usize)` or `PtyRead::Eof`.
+- [Settings](docs/settings.md): profiles, themes, fonts, key bindings, live reload
+- [Workspaces](docs/workspaces.md): saving and restoring layouts
+- [Shell integration](docs/shell-integration.md): PowerShell and Bash prompt markers and directories
+- [Windows distribution](docs/windows-distribution.md): MSIX packages, updates, default terminal
+- [Control and diagnostics](docs/control-and-diagnostics-design.md): the full `mightty ctl` contract
+- [Ghostty integration](docs/ghostty-integration.md): bindings, safety invariants, updating Ghostty
+- [Feature roadmap](docs/feature-roadmap.md)
+- [portable-pty experiment](docs/pty-experiment.md): an optional comparison with WezTerm's PTY library
 
 ## Development
 
-Useful checks:
-
 ```bash
 mise exec -- cargo fmt --all -- --check
-mise exec -- cargo check
 mise exec -- cargo clippy --all-targets -- -D warnings
 mise exec -- cargo test
-# Disposable Windows GUI checks, after cargo build:
+```
+
+Windows GUI checks run against a disposable instance after `cargo build`:
+
+```bash
 pwsh -NoProfile -File tools/control-smoke.ps1
 pwsh -NoProfile -File tools/control-smoke.ps1 -SnapshotOnly
 mise exec -- cargo run --example capture_fidelity
 ```
 
-After changing the Ghostty submodule revision or public C headers, regenerate
-the private bindings. This command requires `libclang`:
+After changing the Ghostty submodule revision or its C headers, regenerate the
+private bindings (requires `libclang`):
 
 ```bash
 mise exec -- cargo run --manifest-path tools/ghostty-bindings/Cargo.toml
 ```
 
-Useful runtime shortcuts:
+### How it's built
 
-- `Ctrl+T` (`Cmd+T` on macOS): open a new tab, up to nine tabs.
-- `Ctrl+B` or the panel button before **Terminal**: hide or show the tab sidebar. The button's panel is filled while the sidebar is visible.
-- `Ctrl+1` through `Ctrl+9`: switch to an existing tab.
-- Sidebar tabs use compact rows without numbers. Default titles show the folder and process, such as `mightty · pwsh`; custom shell titles are preserved, and hovering shows the full label.
-- `Alt+Enter`: split the active pane to the right.
-- `Alt+Shift+Enter`: split the active pane downward.
-- `Ctrl+D`: close the active pane, or close the active tab when it has one pane.
-- `Ctrl+Shift+C` (`Cmd+C` on macOS): copy the active terminal selection.
-- `Ctrl+Shift+V` (`Cmd+V` on macOS): paste with unsafe-paste confirmation.
-- `Ctrl+Shift+F` (`Cmd+F` on macOS): search the full terminal scrollback.
-- `Ctrl+Shift+P` (`Cmd+Shift+P` on macOS): open the command palette.
-- `Cmd+Q` on macOS: quit.
-- `Ctrl+Shift+F12`: write a presented-frame diagnostic bundle to `captures/` on Windows.
+- `build.rs` compiles Ghostty's VT library from the local `ghostty/` submodule
+  with Zig and links it statically. Nothing is fetched at build time, and there
+  are no `libghostty-vt` crate dependencies.
+- Every build checks the submodule against the commit and header fingerprint
+  in `src/ghostty/bindings.version`.
+- Debug builds use Zig `ReleaseSafe`; release builds use `ReleaseFast`. Run with
+  `--features ghostty-debug` to enable Ghostty's integrity checks.
+- Terminal I/O is wake-driven: a reader thread blocks on the PTY, wakes a GPUI
+  task, and that task feeds the output to Ghostty in bounded batches before
+  repainting.
+- The [GPUI patch](vendor/gpui/MIGHTTY-PATCH.md) adds text commit and Direct3D
+  frame readback used by input injection and snapshots.
 
-Drag with the left mouse button to select text. Double-click selects a word and
-triple-click selects a line using Ghostty's selection rules. Hold `Ctrl+Alt`
-while dragging for rectangular selection (`Option` on macOS).
-
-Split dividers are draggable. The command palette provides directional focus,
-pane resize, and pane zoom actions.
-
-## Project Layout
+<details>
+<summary>Project layout</summary>
 
 ```text
 src/
 ├── main.rs              # App entry point and window lifecycle
-├── lib.rs               # Library module exports
-├── action.rs            # Typed actions, descriptors, bindings, and menus
-├── command_palette.rs   # Palette filtering and action entries
-├── control.rs           # CLI, protocol, schemas, and bounded transport
+├── action.rs            # Typed actions, bindings, and menus
+├── command_palette.rs   # Palette filtering and entries
+├── control.rs           # `mightty ctl` CLI, protocol, and transport
 ├── diagnostics.rs       # State persistence, process sampling, and logs
-├── snapshot.rs          # GPU frame acquisition and diagnostic bundles
-├── ui_control.rs        # Normal GPUI keyboard, pointer, and text injection
-├── feedback.rs          # Serializable terminal/frame capture data
+├── snapshot.rs          # GPU frame capture and diagnostic bundles
+├── ui_control.rs        # Keyboard, pointer, and text injection
 ├── pane_container.rs    # Tabs, sidebar, workspaces, and action dispatch
-├── profile.rs           # Stable profile IDs and shell launch values
-├── settings.rs          # Typed settings, discovery, and safe reload
-├── shell_integration.rs # Trusted shell metadata and integration setup
-├── split.rs             # Binary split tree and pane geometry
-├── workspace.rs         # Serializable workspace layouts
-├── application/
-│   ├── activation.rs    # Typed process activation requests
-│   └── windows/         # Hotkey, IPC, quick terminal, and COM handoff
-├── widget/
-│   ├── mod.rs           # Terminal widget lifecycle and GPUI task wiring
-│   ├── pty.rs           # Wake-driven PTY worker bridge
-│   ├── input.rs         # GPUI key event to Ghostty key encoding
-│   ├── presentation.rs  # Owned frame builder and synchronized publication
-│   ├── render.rs        # Terminal cell rendering
-│   ├── native_presentation.rs # Explicit Windows GPU regression (tests only)
-│   ├── graphics.rs      # Kitty graphics resource cache and placement
-│   ├── search.rs        # Search result projection and overlay state
-│   └── capture.rs       # Terminal-state feedback snapshot
-├── ghostty/
-│   ├── mod.rs           # Public local Ghostty interface
-│   ├── terminal.rs      # Terminal ownership and PTY callback
-│   ├── selection.rs     # Ghostty selection gesture state and event bridge
-│   ├── render.rs        # Snapshot and lending render iterators
-│   ├── graphics.rs      # Lending Kitty graphics wrappers
-│   ├── search.rs        # Incremental full-scrollback search
-│   ├── diagnostics.rs   # Non-consuming bounded terminal observations
-│   ├── semantic.rs      # Shell metadata and semantic regions
-│   ├── mouse.rs         # Mouse mode and event encoding
-│   ├── paste.rs         # Paste safety and bracketed encoding
-│   ├── key.rs           # Key event and encoder ownership
-│   ├── style.rs         # Renderer-facing colors and styles
-│   ├── error.rs         # C result conversion
-│   ├── abi.rs           # Target-native Rust/Zig layout audit
-│   ├── bindings.version # Expected Ghostty revision/header fingerprint
-│   └── ffi.rs           # Generated private C bindings
-└── shell/
-    ├── mod.rs           # Platform shell bridge exports
-    ├── windows.rs       # Windows ConPTY implementation
-    └── unix.rs          # Unix forkpty implementation
-tools/
-├── ghostty-bindings/    # Reproducible binding generator
-└── *.ps1                # Windows package, proxy, and upgrade tools
+├── split.rs             # Split tree and pane geometry
+├── settings.rs          # Typed settings and safe reload
+├── profile.rs           # Profiles and shell launch values
+├── shell_integration.rs # Shell metadata and integration setup
+├── workspace.rs         # Saved workspace layouts
+├── application/         # Activation, IPC, quick terminal, COM handoff
+├── widget/              # Terminal widget: PTY bridge, input, rendering, search, graphics, capture
+├── ghostty/             # Safe wrappers over Ghostty's C API (raw bindings in ffi.rs)
+└── shell/               # ConPTY (Windows) and forkpty (Unix)
+tools/                   # Binding generator, packaging, and smoke tests
 packaging/windows/       # MSIX, AppInstaller, and COM proxy inputs
-shell-integration/       # PowerShell and Bash integration resources
+shell-integration/       # PowerShell and Bash integration scripts
 ```
 
-An optional [portable-pty experiment](docs/pty-experiment.md) compares the existing
-bridge with WezTerm's library using real shells, the GUI, protocol probes, and
-shutdown stress tests. Native remains the default.
+</details>
 
 ## License
 
-
-Project code is MIT-licensed. Adapted code and third-party attribution are
-recorded in [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
+Project code is MIT-licensed. Adapted code and third-party attribution are in
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).

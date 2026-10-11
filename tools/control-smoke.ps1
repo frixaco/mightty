@@ -382,7 +382,9 @@ $stream.Flush()
     $null = Invoke-Control @('ui', 'search', '--pane', $pane, '--open', 'false')
     $split = Invoke-Control @('pane', 'split', '--pane', $pane, '--direction', 'right')
     $left = @($split.panes | Where-Object pane_id -eq $pane)[0].computed_bounds
-    $x = $left.x + $left.width + 2
+    $right = @($split.panes | Where-Object pane_id -eq $split.new_pane_id)[0].computed_bounds
+    # Terminal bounds exclude pane padding; the divider sits midway between them.
+    $x = ($left.x + $left.width + $right.x) / 2
     $y = $left.y + $left.height / 2
     $drag = @(@{ type = 'pointer'; event = 'move'; x = $x; y = $y }, @{ type = 'pointer'; event = 'press'; button = 'left'; x = $x; y = $y }, @{ type = 'pointer'; event = 'move'; x = $x + 8; y = $y }, @{ type = 'pointer'; event = 'move'; x = $x + 40; y = $y }, @{ type = 'pointer'; event = 'release'; button = 'left'; x = $x + 40; y = $y })
     $drag | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $caseDirectory 'drag.json') -Encoding utf8NoBOM

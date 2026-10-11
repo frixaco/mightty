@@ -105,20 +105,45 @@ impl AppAction {
             ),
             Self::FocusPane {
                 direction: Direction::Left,
-            } => descriptor("focus_left", "Focus pane left", ActionCategory::Pane, &[]),
+            } => descriptor(
+                "focus_left",
+                "Focus pane left",
+                ActionCategory::Pane,
+                pane_chord(PANE_FOCUS_LEFT),
+            ),
             Self::FocusPane {
                 direction: Direction::Right,
-            } => descriptor("focus_right", "Focus pane right", ActionCategory::Pane, &[]),
+            } => descriptor(
+                "focus_right",
+                "Focus pane right",
+                ActionCategory::Pane,
+                pane_chord(PANE_FOCUS_RIGHT),
+            ),
             Self::FocusPane {
                 direction: Direction::Up,
-            } => descriptor("focus_up", "Focus pane up", ActionCategory::Pane, &[]),
+            } => descriptor(
+                "focus_up",
+                "Focus pane up",
+                ActionCategory::Pane,
+                pane_chord(PANE_FOCUS_UP),
+            ),
             Self::FocusPane {
                 direction: Direction::Down,
-            } => descriptor("focus_down", "Focus pane down", ActionCategory::Pane, &[]),
+            } => descriptor(
+                "focus_down",
+                "Focus pane down",
+                ActionCategory::Pane,
+                pane_chord(PANE_FOCUS_DOWN),
+            ),
             Self::ResizePane {
                 direction: Direction::Left,
                 ..
-            } => descriptor("resize_left", "Resize pane left", ActionCategory::Pane, &[]),
+            } => descriptor(
+                "resize_left",
+                "Resize pane left",
+                ActionCategory::Pane,
+                pane_chord(PANE_RESIZE_LEFT),
+            ),
             Self::ResizePane {
                 direction: Direction::Right,
                 ..
@@ -126,16 +151,26 @@ impl AppAction {
                 "resize_right",
                 "Resize pane right",
                 ActionCategory::Pane,
-                &[],
+                pane_chord(PANE_RESIZE_RIGHT),
             ),
             Self::ResizePane {
                 direction: Direction::Up,
                 ..
-            } => descriptor("resize_up", "Resize pane up", ActionCategory::Pane, &[]),
+            } => descriptor(
+                "resize_up",
+                "Resize pane up",
+                ActionCategory::Pane,
+                pane_chord(PANE_RESIZE_UP),
+            ),
             Self::ResizePane {
                 direction: Direction::Down,
                 ..
-            } => descriptor("resize_down", "Resize pane down", ActionCategory::Pane, &[]),
+            } => descriptor(
+                "resize_down",
+                "Resize pane down",
+                ActionCategory::Pane,
+                pane_chord(PANE_RESIZE_DOWN),
+            ),
             Self::TogglePaneZoom => descriptor(
                 "toggle_pane_zoom",
                 "Toggle pane zoom",
@@ -480,6 +515,27 @@ pub fn chord_for_keystroke(keystroke: &gpui_kit::Keystroke) -> String {
     parts.join("-")
 }
 
+type PlatformChords = [&'static [&'static str]; 2];
+
+// Pane navigation follows Windows Terminal. Option+arrow is word movement on
+// macOS, so the macOS variants add Cmd.
+const PANE_FOCUS_LEFT: PlatformChords = [&["alt-left"], &["cmd-alt-left"]];
+const PANE_FOCUS_RIGHT: PlatformChords = [&["alt-right"], &["cmd-alt-right"]];
+const PANE_FOCUS_UP: PlatformChords = [&["alt-up"], &["cmd-alt-up"]];
+const PANE_FOCUS_DOWN: PlatformChords = [&["alt-down"], &["cmd-alt-down"]];
+const PANE_RESIZE_LEFT: PlatformChords = [&["alt-shift-left"], &["cmd-alt-shift-left"]];
+const PANE_RESIZE_RIGHT: PlatformChords = [&["alt-shift-right"], &["cmd-alt-shift-right"]];
+const PANE_RESIZE_UP: PlatformChords = [&["alt-shift-up"], &["cmd-alt-shift-up"]];
+const PANE_RESIZE_DOWN: PlatformChords = [&["alt-shift-down"], &["cmd-alt-shift-down"]];
+
+const fn pane_chord(chords: PlatformChords) -> &'static [&'static str] {
+    if cfg!(target_os = "macos") {
+        chords[1]
+    } else {
+        chords[0]
+    }
+}
+
 const fn descriptor(
     id: &'static str,
     title: &'static str,
@@ -556,6 +612,21 @@ mod tests {
         assert!(bindings.contains(&ActionBinding {
             chord: "ctrl-1".to_string(),
             action: AppAction::SelectTab { index: 0 },
+        }));
+        #[cfg(not(target_os = "macos"))]
+        assert!(bindings.contains(&ActionBinding {
+            chord: "alt-left".to_string(),
+            action: AppAction::FocusPane {
+                direction: Direction::Left,
+            },
+        }));
+        #[cfg(not(target_os = "macos"))]
+        assert!(bindings.contains(&ActionBinding {
+            chord: "alt-shift-down".to_string(),
+            action: AppAction::ResizePane {
+                direction: Direction::Down,
+                amount: 5,
+            },
         }));
     }
 

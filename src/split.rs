@@ -14,8 +14,13 @@ use crate::profile::ProfileId;
 use crate::theme;
 use crate::widget::TerminalWidget;
 
-const SEPARATOR_COLOR: u32 = theme::GREEN;
-const SEPARATOR_SIZE_PX: f32 = 4.0;
+const SEPARATOR_COLOR: u32 = theme::DIVIDER;
+const SEPARATOR_SIZE_PX: f32 = 1.0;
+/// Pointer target added on each side of the hairline divider.
+const DIVIDER_HIT_SLOP_PX: f32 = 3.0;
+const PANE_PADDING_X_PX: f32 = 10.0;
+const PANE_PADDING_Y_PX: f32 = 6.0;
+const INACTIVE_PANE_OPACITY: f32 = 0.6;
 const MIN_PANE_WIDTH_PX: f32 = 80.0;
 const MIN_PANE_HEIGHT_PX: f32 = 54.0;
 
@@ -260,6 +265,7 @@ impl Split {
             } else {
                 pane_layout.bounds
             };
+            let rect = pane_content_rect(rect);
             let absolute = Bounds {
                 origin: gpui_kit::point(bounds.origin.x + px(rect.x), bounds.origin.y + px(rect.y)),
                 size: gpui_kit::size(px(rect.width), px(rect.height)),
@@ -577,21 +583,11 @@ impl Split {
             let terminal = self.panes[&pane.pane_id]
                 .terminal
                 .update(cx, |terminal, cx| terminal.offscreen_element(window, cx));
-            elements.push(
-                div()
-                    .absolute()
-                    .left(px(bounds.x))
-                    .top(px(bounds.y))
-                    .w(px(bounds.width))
-                    .h(px(bounds.height))
-                    .min_w_0()
-                    .min_h_0()
-                    .rounded(px(4.))
-                    .overflow_hidden()
-                    .bg(gpui_kit::rgb(theme::BG))
-                    .child(terminal)
-                    .into_any_element(),
-            );
+            elements.push(pane_frame(
+                bounds,
+                terminal,
+                self.pane_emphasis(pane.pane_id),
+            ));
         }
         if self.zoomed_pane_id.is_none() {
             elements.extend(layout.dividers.into_iter().map(|divider| {
@@ -695,21 +691,11 @@ impl Split {
             } else {
                 pane_layout.bounds
             };
-            elements.push(
-                div()
-                    .absolute()
-                    .left(px(bounds.x))
-                    .top(px(bounds.y))
-                    .w(px(bounds.width))
-                    .h(px(bounds.height))
-                    .min_w_0()
-                    .min_h_0()
-                    .rounded(px(4.0))
-                    .overflow_hidden()
-                    .bg(gpui_kit::rgb(theme::BG))
-                    .child(pane.terminal.clone())
-                    .into_any_element(),
-            );
+            elements.push(pane_frame(
+                bounds,
+                pane.terminal.clone().into_any_element(),
+                self.pane_emphasis(pane_layout.pane_id),
+            ));
         }
         if zoomed.is_none() {
             for (index, divider) in layout.dividers.into_iter().enumerate() {
@@ -718,27 +704,106 @@ impl Split {
                     owner: cx.entity_id(),
                     path: divider.path.clone(),
                 };
+                // The hairline is drawn centered in a wider invisible drag target.
+                let (hit_x, hit_y) = if is_horizontal {
+                    (DIVIDER_HIT_SLOP_PX, 0.0)
+                } else {
+                    (0.0, DIVIDER_HIT_SLOP_PX)
+                };
                 elements.push(
                     div()
                         .id(("split-divider", index))
                         .absolute()
-                        .left(px(divider.bounds.x))
-                        .top(px(divider.bounds.y))
-                        .w(px(divider.bounds.width))
-                        .h(px(divider.bounds.height))
+                        .left(px(divider.bounds.x - hit_x))
+                        .top(px(divider.bounds.y - hit_y))
+                        .w(px(divider.bounds.width + 2.0 * hit_x))
+                        .h(px(divider.bounds.height + 2.0 * hit_y))
                         .flex()
                         .items_center()
                         .justify_center()
                         .when(is_horizontal, |divider| divider.cursor_col_resize())
                         .when(!is_horizontal, |divider| divider.cursor_row_resize())
                         .on_drag(drag, |drag, _, _, cx| cx.new(|_| drag.clone()))
-                        .child(div().size_full().bg(gpui_kit::rgb(SEPARATOR_COLOR)))
+                        .child(
+                            div()
+                                .w(px(divider.bounds.width))
+                                .h(px(divider.bounds.height))
+                                .bg(gpui_kit::rgb(SEPARATOR_COLOR)),
+                        )
                         .into_any_element(),
                 );
             }
         }
         elements
     }
+
+    fn pane_emphasis(&self, pane_id: PaneId) -> PaneEmphasis {
+        if self.zoomed_pane_id.is_some() || self.panes.len() < 2 {
+            PaneEmphasis::Sole
+        } else if pane_id == self.active_pane_id {
+            PaneEmphasis::Focused
+        } else {
+            PaneEmphasis::Inactive
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PaneEmphasis {
+    Sole,
+    Focused,
+    Inactive,
+}
+
+/// Terminal grid area inside a pane's frame.
+fn pane_content_rect(rect: LayoutRect) -> LayoutRect {
+    LayoutRect {
+        x: rect.x + PANE_PADDING_X_PX,
+        y: rect.y + PANE_PADDING_Y_PX,
+        width: (rect.width - 2.0 * PANE_PADDING_X_PX).max(1.0),
+        height: (rect.height - 2.0 * PANE_PADDING_Y_PX).max(1.0),
+    }
+}
+
+/// Padded pane with a focus outline, or dimmed when another pane has focus.
+fn pane_frame(bounds: LayoutRect, terminal: AnyElement, emphasis: PaneEmphasis) -> AnyElement {
+    let content = pane_content_rect(LayoutRect {
+        x: 0.0,
+        y: 0.0,
+        ..bounds
+    });
+    div()
+        .absolute()
+        .left(px(bounds.x))
+        .top(px(bounds.y))
+        .w(px(bounds.width))
+        .h(px(bounds.height))
+        .min_w_0()
+        .min_h_0()
+        .overflow_hidden()
+        .bg(gpui_kit::rgb(theme::BG))
+        .child(
+            div()
+                .absolute()
+                .left(px(content.x))
+                .top(px(content.y))
+                .w(px(content.width))
+                .h(px(content.height))
+                .when(emphasis == PaneEmphasis::Inactive, |content| {
+                    content.opacity(INACTIVE_PANE_OPACITY)
+                })
+                .child(terminal),
+        )
+        .when(emphasis == PaneEmphasis::Focused, |frame| {
+            frame.child(
+                div()
+                    .absolute()
+                    .size_full()
+                    .border_1()
+                    .border_color(gpui_kit::rgba(theme::FOCUS_RING)),
+            )
+        })
+        .into_any_element()
 }
 
 #[derive(Clone)]
@@ -1211,6 +1276,8 @@ fn ratio_at_path(root: &SplitNode, path: &NodePath) -> Option<f32> {
 
 impl Render for Split {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Mouse focus changes do not go through split actions; keep emphasis current.
+        self.update_active_from_focus(window, cx);
         let layout = self.current_layout(window);
         let elements = self.render_layout(layout, cx);
         let entity = cx.entity();

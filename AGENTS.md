@@ -84,11 +84,18 @@ requirement because `build.rs` validates the submodule revision.
 - The app supports at most nine tabs.
 - Tabs appear in a left sidebar and can be selected with `Ctrl+1` through `Ctrl+9`.
 - Sidebar rows are compact and unnumbered; default titles show folder and process
-  (`mightty · pwsh`), while custom shell titles are preserved.
-- `Ctrl+B` toggles the sidebar.
+  (`mightty · pwsh`), while custom shell titles are preserved. Rows show pane
+  count, pending bell, or exited state; hovering a row shows a close button
+  that closes the tab and its panes.
+- The sidebar header holds the sidebar toggle, command palette, and new-tab
+  buttons. The title bar shows the active tab title and working directory.
+- `Ctrl+B` toggles the sidebar; while hidden, its toggle moves to the title bar.
 - `Alt+Enter` splits the active pane to the right.
 - `Alt+Shift+Enter` splits the active pane downward.
-- Split dividers are draggable. The command palette provides focus, resize, and zoom actions.
+- `Alt+Arrow` focuses the adjacent pane and `Alt+Shift+Arrow` resizes it
+  (`Cmd+Option` variants on macOS).
+- Split dividers are 1px and draggable. With several panes, the focused pane is
+  outlined and the others are dimmed. The command palette provides zoom.
 - `Ctrl+D` closes the active pane, or closes the active tab when it has one pane.
 - The mouse wheel scrolls terminal history.
 - Left-button drag selects text; double-click selects a word and triple-click
@@ -97,6 +104,7 @@ requirement because `build.rs` validates the submodule revision.
 - `Ctrl+Shift+C` copies the active selection; `Cmd+C` does the same on macOS.
 - `Ctrl+Shift+V` pastes text; `Cmd+V` does the same on macOS.
 - `Ctrl+Shift+P` opens the command palette; `Cmd+Shift+P` does the same on macOS.
+  Each row shows its category and shortcut, or `Unbound`.
 - `Cmd+Q` quits on macOS.
 - Exited panes are removed when more than one pane exists.
 - `Ctrl+Shift+F12` writes a feedback capture under `captures/`.

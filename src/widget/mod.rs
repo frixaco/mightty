@@ -1036,9 +1036,10 @@ impl TerminalWidget {
         let text = window.text_system();
         let id = text.resolve_font(&font);
         let size = px(self.config.font_size_px);
+        // GPUI font metrics report descent below the baseline as a negative value.
         self.cell_size = (
             text.ch_advance(id, size).unwrap_or(size * 0.6).max(px(1.0)),
-            (text.ascent(id, size) + text.descent(id, size))
+            (text.ascent(id, size) + text.descent(id, size).abs())
                 .max(size)
                 .ceil(),
         );

@@ -227,7 +227,8 @@ impl TerminalWidget {
                 if let Some(background) = segment_bg {
                     backgrounds.push((bounds, rgb_to_rgba(background)));
                 }
-                text_segments.push((bounds, segment));
+                let max_width = cell_size.0 * glyph_columns(&segment, &row.cells) as f32;
+                text_segments.push((bounds, segment, max_width));
             }
         }
 
@@ -291,51 +292,54 @@ impl TerminalWidget {
                 move |_, window, _| {
                     text_segments
                         .into_iter()
-                        .map(|(bounds, segment)| {
+                        .map(|(bounds, segment, max_width)| {
                             let run = text_run_for_style(
                                 &base_text_style,
                                 segment.style,
                                 segment.text.len(),
                             );
-                            let line = window.text_system().shape_line(
-                                segment.text.into(),
-                                font_size,
-                                &[run],
-                                None,
-                            );
+                            let shape = |size| {
+                                window.text_system().shape_line(
+                                    segment.text.clone().into(),
+                                    size,
+                                    std::slice::from_ref(&run),
+                                    None,
+                                )
+                            };
+                            let mut line = shape(font_size);
+                            // Shrink fallback glyphs that would spill past their allowed cells.
+                            if line.width > max_width && !segment.text.is_ascii() {
+                                line = shape(font_size * (max_width / line.width));
+                            }
                             (bounds, line)
                         })
                         .collect::<Vec<_>>()
                 },
                 move |bounds, lines, window, cx| {
+                    // Glyphs are not clipped to their cells: descenders and wide symbols
+                    // may overlap neighbors, as in other terminals. Backgrounds are
+                    // already painted, so overflow stays visible.
                     for (segment_bounds, line) in lines {
                         let segment_bounds = pixel_aligned_bounds(
                             segment_bounds,
                             bounds.origin,
                             window.scale_factor(),
                         );
-                        window.with_content_mask(
-                            Some(ContentMask {
-                                bounds: segment_bounds,
-                            }),
-                            |window| {
-                                if let Err(error) = line.paint(
-                                    segment_bounds.origin,
-                                    cell_size.1,
-                                    gpui_kit::TextAlign::Left,
-                                    None,
-                                    window,
-                                    cx,
-                                ) {
-                                    crate::diagnostics::record(
-                                        "render",
-                                        "text_paint_failed",
-                                        &error.to_string(),
-                                        serde_json::json!({}),
-                                    );
-                                }
-                            },
-                        );
+                        if let Err(error) = line.paint(
+                            segment_bounds.origin,
+                            cell_size.1,
+                            gpui_kit::TextAlign::Left,
+                            None,
+                            window,
+                            cx,
+                        ) {
+                            crate::diagnostics::record(
+                                "render",
+                                "text_paint_failed",
+                                &error.to_string(),
+                                serde_json::json!({}),
+                            );
+                        }
                     }
                 },
             )
@@ -901,6 +905,21 @@ fn text_run_for_style(base_style: &TextStyle, style: RowTextStyle, len: usize) -
         color: Some(rgb_to_rgba(fg).into()),
     });
     run_style.to_run(len)
+}
+
+/// Columns a segment's glyphs may cover. Following Kitty and Ghostty, a
+/// one-column symbol may extend into the next cell when that cell is blank.
+fn glyph_columns(segment: &RowSegment, cells: &[super::presentation::FrameCell]) -> u16 {
+    let next_is_blank = || {
+        cells
+            .get(usize::from(segment.start_col + segment.columns))
+            .is_some_and(|cell| cell.text.trim().is_empty())
+    };
+    if segment.columns == 1 && !segment.text.is_ascii() && next_is_blank() {
+        2
+    } else {
+        segment.columns
+    }
 }
 
 fn segment_needs_own_layout(segment: &str, columns: u16) -> bool {

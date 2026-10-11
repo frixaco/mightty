@@ -91,6 +91,48 @@ pub fn filtered_command_indices(commands: &[PaletteCommand], query: &str) -> Vec
     matches.into_iter().map(|(index, _)| index).collect()
 }
 
+/// Split a normalized chord such as `alt-shift-left` into display keycaps.
+pub fn chord_keycaps(chord: &str) -> Vec<String> {
+    let (modifiers, key) = match chord.strip_suffix("--") {
+        Some(modifiers) => (modifiers, "-"),
+        None => chord.rsplit_once('-').unwrap_or(("", chord)),
+    };
+    let mut keycaps = modifiers
+        .split('-')
+        .filter(|modifier| !modifier.is_empty())
+        .map(|modifier| {
+            match modifier {
+                "ctrl" => "Ctrl",
+                "alt" if cfg!(target_os = "macos") => "⌥",
+                "alt" => "Alt",
+                "shift" => "Shift",
+                "cmd" if cfg!(target_os = "macos") => "⌘",
+                "cmd" => "Win",
+                "fn" => "Fn",
+                other => other,
+            }
+            .to_string()
+        })
+        .collect::<Vec<_>>();
+    let key = match key {
+        "left" => "←".to_string(),
+        "right" => "→".to_string(),
+        "up" => "↑".to_string(),
+        "down" => "↓".to_string(),
+        "enter" => "Enter".to_string(),
+        "escape" => "Esc".to_string(),
+        "space" => "Space".to_string(),
+        "tab" => "Tab".to_string(),
+        "backspace" => "Backspace".to_string(),
+        "delete" => "Del".to_string(),
+        "pageup" => "PgUp".to_string(),
+        "pagedown" => "PgDn".to_string(),
+        key => key.to_uppercase(),
+    };
+    keycaps.push(key);
+    keycaps
+}
+
 fn command_for_action(
     action: AppAction,
     title: Option<String>,
@@ -112,7 +154,7 @@ fn command_for_action(
     }
 }
 
-fn preferred_binding(settings: &ResolvedSettings, action: &AppAction) -> Option<String> {
+pub fn preferred_binding(settings: &ResolvedSettings, action: &AppAction) -> Option<String> {
     let bindings = settings
         .key_bindings
         .iter()
@@ -180,6 +222,16 @@ mod tests {
     fn fuzzy_filter_rejects_out_of_order_text() {
         assert_eq!(fuzzy_score("zx", "Toggle zoom"), None);
         assert!(fuzzy_score("tz", "Toggle zoom").is_some());
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn chords_render_as_keycaps() {
+        assert_eq!(chord_keycaps("ctrl-d"), ["Ctrl", "D"]);
+        assert_eq!(chord_keycaps("alt-shift-left"), ["Alt", "Shift", "←"]);
+        assert_eq!(chord_keycaps("ctrl-shift-f12"), ["Ctrl", "Shift", "F12"]);
+        assert_eq!(chord_keycaps("ctrl--"), ["Ctrl", "-"]);
+        assert_eq!(chord_keycaps("enter"), ["Enter"]);
     }
 
     fn test_command(title: &str) -> PaletteCommand {

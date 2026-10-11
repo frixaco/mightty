@@ -18,6 +18,19 @@ pub(crate) const MAGENTA: u32 = 0xff5ef1;
 pub(crate) const ORANGE: u32 = 0xffbd5e;
 pub(crate) const PURPLE: u32 = 0xbd5eff;
 
+// Window chrome around the terminal panes.
+pub(crate) const SIDEBAR_BG: u32 = 0x111315;
+pub(crate) const CHROME_BORDER: u32 = 0x23272b;
+pub(crate) const DIVIDER: u32 = 0x262a2f;
+pub(crate) const ROW_ACTIVE: u32 = 0x1f2226;
+pub(crate) const ROW_ACTIVE_BORDER: u32 = 0x2b3036;
+pub(crate) const PALETTE_BG: u32 = 0x1b1e21;
+pub(crate) const KEYCAP: u32 = 0x2a2e34;
+pub(crate) const FG_MUTED: u32 = 0xc9cfd8;
+pub(crate) const GREY_DIM: u32 = 0x5d6574;
+/// Focused-pane outline: `BLUE` at 55% alpha, as RGBA.
+pub(crate) const FOCUS_RING: u32 = (BLUE << 8) | 0x8c;
+
 // Matches Cyberdream's official Ghostty theme; ANSI magenta uses purple.
 pub(crate) const ANSI: [u32; 16] = [
     BG,
