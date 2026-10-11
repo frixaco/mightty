@@ -21,6 +21,7 @@ use crate::settings::{ReloadOutcome, SettingsStore};
 #[cfg(windows)]
 use crate::shell::PtyParts;
 use crate::split::{Split, SplitAxis};
+use crate::system_usage::{PaneProcesses, ProcessRoot, SystemUsage, TabProcesses};
 use crate::theme;
 use crate::widget::{TerminalConfig, TerminalEvent, TerminalWidget};
 use crate::workspace::{
@@ -35,6 +36,8 @@ const WINDOW_BACKGROUND: u32 = theme::BG;
 const TITLE_BAR_HEIGHT_PX: f32 = 32.0;
 const MAC_TRAFFIC_LIGHT_SPACER_PX: f32 = 78.0;
 const WINDOW_CONTROL_WIDTH_PX: f32 = 46.0;
+/// Title width kept before system usage meters are dropped.
+const TITLE_MIN_WIDTH_PX: f32 = 120.0;
 /// Sidebar width including its 1px right border.
 const SIDEBAR_WIDTH_PX: f32 = 180.0;
 const SIDEBAR_BUTTON_WIDTH_PX: f32 = 28.0;
@@ -85,6 +88,11 @@ pub struct PaneContainer {
     hovered_tab: Option<u64>,
     needs_focus: bool,
     titlebar_visible: bool,
+    /// Shared CPU, memory and GPU usage, shown in the title bar.
+    system_usage: Option<Entity<SystemUsage>>,
+    system_usage_visibility: Option<gpui_kit::Subscription>,
+    /// Whether the per-pane usage popup is open.
+    usage_popup_open: bool,
     bell_notification_pending: bool,
     settings: SettingsStore,
     settings_task: Task<()>,
@@ -329,6 +337,9 @@ impl PaneContainer {
             hovered_tab: None,
             needs_focus: true,
             titlebar_visible,
+            system_usage: titlebar_visible.then(|| SystemUsage::shared(cx)).flatten(),
+            system_usage_visibility: None,
+            usage_popup_open: false,
             bell_notification_pending: false,
             settings,
             settings_task: Task::ready(()),
@@ -343,6 +354,16 @@ impl PaneContainer {
             exit_tx,
             exit_task: Task::ready(()),
         };
+        if let Some(usage) = container.system_usage.clone() {
+            let viewer = cx.entity_id();
+            cx.on_release(move |_, cx| {
+                usage.update(cx, |usage, _| {
+                    usage.set_viewer(viewer, false);
+                    usage.set_process_roots(viewer, Vec::new());
+                })
+            })
+            .detach();
+        }
         container.start_exit_task(exit_rx, cx);
         container.start_settings_task(cx);
         container
@@ -1266,6 +1287,7 @@ fn caption_icon_font_family() -> &'static str {
 impl Render for PaneContainer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.establish_layout(window, cx);
+        self.watch_system_usage_visibility(window, cx);
         if self.needs_focus {
             self.needs_focus = false;
             self.focus_active_tab(window, cx);
@@ -1288,7 +1310,8 @@ impl Render for PaneContainer {
                 )
             });
             let title = self.window_title(window, cx);
-            render_titlebar(window, sidebar_toggle, title)
+            let usage = self.render_system_usage(window, cx);
+            render_titlebar(window, sidebar_toggle, title, usage)
         });
 
         div()
@@ -1390,6 +1413,7 @@ fn render_titlebar(
     window: &mut Window,
     sidebar_toggle: Option<AnyElement>,
     title: SharedString,
+    usage: Option<AnyElement>,
 ) -> impl IntoElement {
     let maximize_button = if window.is_maximized() {
         WindowsCaptionButton::Restore
@@ -1425,8 +1449,19 @@ fn render_titlebar(
                 .text_color(gpui_kit::rgb(theme::GREY))
                 .child(div().min_w_0().truncate().child(title)),
         )
-        // TODO(resource-usage): show system CPU, memory, GPU and VRAM usage here,
-        // sampled on a background task about once a second, as in the A2 design.
+        .when_some(usage, |titlebar, usage| {
+            titlebar
+                .child(usage)
+                .when(!cfg!(target_os = "macos"), |titlebar| {
+                    titlebar.child(
+                        div()
+                            .w(px(1.0))
+                            .h(px(14.0))
+                            .flex_shrink_0()
+                            .bg(gpui_kit::rgb(theme::ROW_ACTIVE_BORDER)),
+                    )
+                })
+        })
         .when(!cfg!(target_os = "macos"), |titlebar| {
             titlebar
                 .child(window_control_button(
@@ -1490,6 +1525,14 @@ fn display_directory(directory: &Path) -> String {
     }
 }
 
+/// A process identity as diagnostics report it: `pid` and `creation_time`.
+fn process_root(identity: &serde_json::Value) -> Option<ProcessRoot> {
+    Some(ProcessRoot {
+        pid: u32::try_from(identity["pid"].as_u64()?).ok()?,
+        created: identity["creation_time"].as_str()?.parse().ok()?,
+    })
+}
+
 struct SidebarTab {
     title: String,
     pane_count: usize,
@@ -1536,6 +1579,108 @@ impl PaneContainer {
                 this.dispatch_app_action(action.clone(), window, cx);
             }))
             .into_any_element()
+    }
+
+    /// Let the shared usage sampler pause while this window is hidden or minimized.
+    fn watch_system_usage_visibility(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.system_usage_visibility.is_some() {
+            return;
+        }
+        let Some(usage) = self.system_usage.clone() else {
+            return;
+        };
+        let viewer = cx.entity_id();
+        let visible = window.is_visible();
+        usage.update(cx, |usage, _| usage.set_viewer(viewer, visible));
+        self.system_usage_visibility = Some(cx.observe_window_visibility(
+            window,
+            move |_, visibility, _, cx| {
+                usage.update(cx, |usage, _| {
+                    usage.set_viewer(viewer, visibility.is_visible())
+                })
+            },
+        ));
+    }
+
+    /// Usage meters that fit beside a readable title. Reading the shared model
+    /// here makes its samples redraw this window without notifying the panes.
+    fn render_system_usage(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let usage = self.system_usage.as_ref()?;
+        let leading = if self.sidebar_visible {
+            SIDEBAR_WIDTH_PX
+        } else {
+            // Sidebar toggle and its inset, plus the macOS traffic lights.
+            let traffic_lights = if cfg!(target_os = "macos") {
+                MAC_TRAFFIC_LIGHT_SPACER_PX
+            } else {
+                0.0
+            };
+            traffic_lights + 4.0 + SIDEBAR_BUTTON_WIDTH_PX
+        };
+        // Caption buttons and the divider before them.
+        let trailing = if cfg!(target_os = "macos") {
+            0.0
+        } else {
+            WINDOW_CONTROL_WIDTH_PX * 3.0 + 1.0
+        };
+        let title = 12.0 + TITLE_MIN_WIDTH_PX;
+        let available = window.viewport_size().width - px(leading + trailing + title);
+        // Pane process trees are sampled only while the popup is open.
+        let tabs = if self.usage_popup_open {
+            self.usage_tab_processes(cx)
+        } else {
+            Vec::new()
+        };
+        let roots = tabs
+            .iter()
+            .flat_map(|tab| &tab.panes)
+            .filter_map(|pane| pane.root)
+            .collect();
+        let viewer = cx.entity_id();
+        usage.update(cx, |usage, _| usage.set_process_roots(viewer, roots));
+        let this = cx.entity().downgrade();
+        usage.read(cx).render(available, tabs, move |open, _, cx| {
+            let open = *open;
+            this.update(cx, |this, cx| {
+                this.usage_popup_open = open;
+                cx.notify();
+            })
+            .ok();
+        })
+    }
+
+    /// Each tab's panes in layout order, with their root processes.
+    fn usage_tab_processes(&self, cx: &gpui_kit::App) -> Vec<TabProcesses> {
+        self.tabs
+            .iter()
+            .enumerate()
+            .map(|(index, tab)| {
+                let split = tab.split.read(cx);
+                let panes = split
+                    .topology()
+                    .pane_ids()
+                    .into_iter()
+                    .filter_map(|pane| split.terminal(pane))
+                    .map(|terminal| {
+                        let terminal = terminal.read(cx);
+                        PaneProcesses {
+                            title: terminal
+                                .tab_title()
+                                .unwrap_or_else(|| tab.default_title.clone())
+                                .into(),
+                            root: terminal
+                                .control_root_process()
+                                .and_then(|root| process_root(&root.identity)),
+                        }
+                    })
+                    .collect();
+                TabProcesses {
+                    title: tab.title.clone().into(),
+                    active: index == self.active_tab_index,
+                    panes,
+                }
+            })
+            .collect()
     }
 
     fn window_title(&self, window: &Window, cx: &mut Context<Self>) -> SharedString {

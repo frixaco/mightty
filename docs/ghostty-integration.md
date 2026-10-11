@@ -13,11 +13,10 @@ mightty has one terminal-engine upstream: the Ghostty source pinned by the
 - The rest of `src/ghostty/` is mightty's project-owned safe Rust interface.
 
 Zig `0.16.0` is a build tool here. It compiles the pinned Ghostty source into
-the native library. Zig is not required at runtime. The small local bridge at
-`tools/ghostty-search/` adapts pinned Ghostty search/observation internals and
-counts synchronized-output starts using Ghostty's exported parser functions.
-It has no second terminal engine or ANSI parser. Its header is included in
-binding generation alongside the upstream public headers.
+the native library. Zig is not required at runtime. mightty uses only Ghostty's
+public C API: search, render holds (synchronized output), and resets come from
+Ghostty's public search handles and terminal callbacks, so updating Ghostty
+never depends on its internal Zig types.
 
 ```text
 mightty widget code
@@ -39,7 +38,9 @@ Every developer and CI build then uses the same source.
 ## What this repo owns
 
 - `build.rs` validates and builds the submodule, then links the static library.
-- `src/ghostty/terminal.rs` owns the terminal handle and PTY reply callback.
+- `src/ghostty/terminal.rs` owns the terminal handle, its callbacks, and
+  output writes that stop when a render hold begins.
+- `src/ghostty/search.rs` owns interactive and control-wait search handles.
 - `src/ghostty/selection.rs` owns reusable selection gesture state and events.
 - `src/ghostty/render.rs` owns render state and lending row/cell iterators.
 - `src/ghostty/key.rs` owns reusable key events and key encoding.
@@ -78,10 +79,14 @@ or support dynamic linking.
   colors, protocol cursor, selection, search highlights, viewport and geometry,
   plus owned graphics references, before atomically publishing an immutable frame.
   Painters, IME anchors and capture use owned frame data. Raw diagnostic reads use
-  a separate non-consuming observation path and are labeled live.
-- Mode 2026 gates publication while parsing/input/replies continue. One-second
-  generation-safe recovery resets the actual mode; resize/reset/EOF also release
-  holds. A failed frame build retains the prior frame and retryable dirty work.
+  public terminal getters, never a render state, so they cannot consume the live
+  renderer's dirty state; they are labeled live.
+- Ghostty's render-hold callback gates publication while parsing/input/replies
+  continue. Writes stop when a hold begins so the frame completed before it can
+  be committed. One-second per-hold recovery resets the actual mode;
+  resize/reset/EOF also release holds. A failed frame build retains the prior
+  frame and retryable dirty work, and the retry copies from a fresh render state.
+- Search handles are freed before their terminal.
 - Raw C types and functions never leave the private `ffi` module.
 - Tests compare every struct reported by `ghostty_type_json()` with Rust's
   target-native size, alignment, fields, and offsets.

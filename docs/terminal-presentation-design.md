@@ -84,12 +84,14 @@ may reset the phase, but cannot change protocol visibility or shape.
 
 ## Presentation gate
 
-Read synchronized-output mode from Ghostty. Never scan PTY bytes with a second
-ANSI parser, and never use pipe-read boundaries as application-frame boundaries.
+Take synchronized-output holds from Ghostty's render-hold callback. Never scan
+PTY bytes with a second ANSI parser, and never use pipe-read boundaries as
+application-frame boundaries.
 
 | State/event | Required behavior |
 | --- | --- |
 | Synchronization inactive | Publish changed terminal state at a presentation opportunity. |
+| Synchronization begins | If output changed the terminal since the last commit, commit the completed frame Ghostty still holds before parsing further (at most once per drain turn). |
 | Synchronization active | Continue parsing, input encoding, replies, and effects; retain the committed terminal frame. |
 | Synchronization ends | Make the latest state eligible for publication; wake presentation. |
 | Repaint while active | Reuse committed content; do not refresh any terminal-backed layer. |
@@ -104,10 +106,13 @@ generation so an old timer cannot terminate a later update. Do not indefinitely
 extend the hold just because output continues.
 
 A begin/end pair entirely inside one parse batch needs no artificial delay. If a
-batch ends inside a later synchronized update, retain the prior committed frame;
-intervening completed states may be coalesced. Rendering every application update
-is not required. Publishing an unfinished synchronized state is forbidden except
-for an explicit recovery event such as timeout or resize.
+batch ends inside a later synchronized update, the committed frame is the one
+completed before the first such hold in that drain turn; later completed states
+in the same turn may be coalesced. Rendering every application update is not
+required, but an application that redraws continuously with back-to-back holds
+must keep advancing rather than appear frozen. Publishing an unfinished
+synchronized state is forbidden except for an explicit recovery event such as
+timeout or resize.
 
 For unsynchronized applications, process the stream normally and honor cursor
 visibility. Do not invent frame boundaries using idle delays or app-name rules.
@@ -140,21 +145,28 @@ cursor cell metrics. Preserve the existing ordered PTY I/O and EOF handling.
 
 - `Snapshot::cursor` exposes protocol appearance through the safe Ghostty module;
   `Terminal::set_default_cursor` initializes configuration defaults.
-- The existing pinned Zig bridge calls exported `vt_write_until_ground` and
-  `vt_write` functions, counting false-to-true mode transitions at native parser
-  ground boundaries. It divides printable runs at ESC only to enter the native
-  parser, without interpreting ANSI sequences or UTF-8 itself. This detects
-  end/begin pairs inside one PTY chunk and protects newer holds from stale timers.
+- `Terminal::vt_write_until_hold` calls Ghostty's public `vt_write_until_ground`
+  and `vt_write`, dividing printable runs at ESC only to enter the native parser,
+  without interpreting ANSI sequences or UTF-8 itself. Ghostty's render-hold
+  callback reports each hold; the write stops right after a hold begins, so the
+  widget can commit the frame completed before it. Ghostty only starts holds from
+  ESC-introduced mode 2026 sequences (8-bit C1 bytes never enter CSI parameters),
+  so a hold cannot begin inside a printable run. Each hold gets its own
+  one-second deadline, protecting newer holds from stale timers. Mightty's own
+  recovery reset produces no callback, so it clears the hold itself.
 - Parsing remains bounded by the existing drain-turn budget. Publication happens
   at rendering/offscreen opportunities, coalescing completed updates. Mode polling
   at drain completion starts the timeout even when the pane is not being painted.
 - A builder failure keeps the old frame and dirty work, logs the error, and retries
   after 16 ms without requiring further output. This is a failure retry, not an
-  output batching delay. Recovery forces a complete native copy because a failed
-  update may have consumed row dirty flags. Failed resize retains the previous
+  output batching delay. Recovery copies from a fresh render state because a
+  failed update may have consumed row dirty flags. Failed resize retains the previous
   frame's rows and metrics and retries the resize before publication. Frames retain
   owned strings and `Arc<RenderImage>` handles.
-- Search ranges carry output revision and grid geometry; stale ranges are excluded
+- Search keeps only Ghostty's match count, selected match, and the matches on
+  pages covering the viewport, so each step costs the same however many matches
+  the scrollback holds. Output, scrolling and resizing feed the search again.
+  Ranges carry output revision and grid geometry; stale ranges are excluded
   from a new frame. Selection text and hyperlink targets are committed with cells.
 - `PaintedTerminal` retains the frame and local appearance used to construct the
   element tree, separately for live and offscreen painting. Capture metadata

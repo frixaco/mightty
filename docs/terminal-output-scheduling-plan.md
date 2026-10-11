@@ -586,8 +586,12 @@ the actual mode on recovery. Resize/reset/EOF release holds. Failed frame buildi
 retains dirty work and retries after 16 ms without new output. Native parsing is
 still authoritative; retries force a full snapshot copy if an earlier update
 consumed dirty flags, and failed resize retains matching rows/metrics until recovery.
-The bridge observes transitions at exported parser ground
-boundaries so end/begin pairs in one chunk are handled correctly.
+The bridge observed transitions at exported parser ground
+boundaries so end/begin pairs in one chunk were handled correctly. (Superseded:
+the Zig bridge was removed in October 2026. Ghostty's public render-hold
+callback now reports holds, and writes stop when a hold begins so the completed
+frame before it is committed; see the
+[presentation design](terminal-presentation-design.md).)
 
 Fresh final measurements use Debug Rust and confirmed ReleaseSafe Ghostty,
 installed Amp home animation with character typing/erasing, repeated window

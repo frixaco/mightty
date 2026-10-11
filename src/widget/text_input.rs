@@ -109,7 +109,7 @@ impl EntityInputHandler for TerminalWidget {
         } else {
             match self.key_encoder.encode_text(&self.terminal, text) {
                 Ok(bytes) if !bytes.is_empty() => {
-                    self.terminal.scroll_viewport(ViewportScroll::Bottom);
+                    self.scroll_viewport(ViewportScroll::Bottom, cx);
                     let _ = self.terminal.clear_selection();
                     self.send_pty_command(super::PtyCommand::Write(bytes));
                 }

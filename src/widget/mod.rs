@@ -151,6 +151,8 @@ pub struct TerminalWidget {
     presentation_dirty: bool,
     sync_hold: Option<(u64, Instant)>,
     sync_task: Task<()>,
+    /// A completed frame was committed at a hold start during this drain turn.
+    hold_frame_captured: bool,
     presentation_retry: Task<()>,
     presentation_snapshot_invalid: bool,
     presentation_resize_failed: bool,
@@ -425,6 +427,7 @@ impl TerminalWidget {
             presentation_dirty: true,
             sync_hold: None,
             sync_task: Task::ready(()),
+            hold_frame_captured: false,
             presentation_retry: Task::ready(()),
             presentation_snapshot_invalid: false,
             presentation_resize_failed: false,
@@ -489,7 +492,7 @@ impl TerminalWidget {
         self.has_exited
     }
     pub fn presentation_held(&self) -> bool {
-        self.terminal.synchronized_output().unwrap_or(true)
+        self.terminal.render_held()
     }
     pub fn launch_succeeded(&self) -> bool {
         self.pty_worker.is_some()
@@ -555,6 +558,7 @@ impl TerminalWidget {
     pub(crate) fn jump_to_prompt(&mut self, direction: PromptDirection, cx: &mut Context<Self>) {
         match self.terminal.jump_to_prompt(direction) {
             Ok(true) => {
+                self.schedule_search_step(cx);
                 self.presentation_dirty = true;
                 cx.notify();
             }
@@ -639,8 +643,7 @@ impl TerminalWidget {
             return;
         };
         search.revision = search.revision.wrapping_add(1);
-        search.ranges.clear();
-        search.active = None;
+        search.results = Default::default();
         search.diagnostic = None;
         search.step_scheduled = false;
         if search.query.is_empty() {
@@ -664,6 +667,13 @@ impl TerminalWidget {
                 cx.notify();
             }
         }
+    }
+
+    /// Move the viewport. Search highlights are fed per viewport, so an open
+    /// search steps again even when nothing repaints, e.g. a hidden window.
+    fn scroll_viewport(&mut self, scroll: ViewportScroll, cx: &mut Context<Self>) {
+        self.terminal.scroll_viewport(scroll);
+        self.schedule_search_step(cx);
     }
 
     fn schedule_search_step(&mut self, cx: &mut Context<Self>) {
@@ -691,21 +701,24 @@ impl TerminalWidget {
                 }
                 search.step_scheduled = false;
 
-                let progress = this.terminal.search_step();
-                let ranges = this.terminal.search_ranges();
+                let scrollbar = this.terminal.scrollbar();
+                // Feed while still scanning history when output, scrolling or
+                // resizing changed what the results describe.
+                let refresh = search.output_revision != this.terminal.write_revision()
+                    || search.geometry != this.size
+                    || scrollbar
+                        .as_ref()
+                        .is_ok_and(|scrollbar| scrollbar.offset != search.viewport_offset);
+                let progress = this.terminal.search_step(refresh);
+                let results = this.terminal.search_results();
                 let search = this.search.as_mut().expect("search remains open");
-                match (progress, ranges) {
-                    (Ok(progress), Ok(ranges)) => {
+                match (progress, results, scrollbar) {
+                    (Ok(progress), Ok(results), Ok(scrollbar)) => {
                         search.progress = progress;
-                        search.ranges = ranges;
+                        search.results = results;
                         search.output_revision = this.terminal.write_revision();
                         search.geometry = this.size;
-                        if search
-                            .active
-                            .is_some_and(|active| !search.ranges.contains(&active))
-                        {
-                            search.active = None;
-                        }
+                        search.viewport_offset = scrollbar.offset;
                         search.diagnostic = None;
                         this.presentation_dirty = true;
                         cx.notify();
@@ -713,7 +726,7 @@ impl TerminalWidget {
                             this.schedule_search_step(cx);
                         }
                     }
-                    (Err(error), _) | (_, Err(error)) => {
+                    (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {
                         search.progress = SearchProgress::Complete;
                         search.diagnostic = Some(error.to_string());
                         this.presentation_dirty = true;
@@ -733,12 +746,11 @@ impl TerminalWidget {
             return;
         }
         match self.terminal.search_select(direction) {
-            Ok(Some(range)) => {
-                self.terminal
-                    .scroll_viewport(ViewportScroll::Row(range.start.row as usize));
+            Ok(Some((index, range))) => {
                 if let Some(search) = self.search.as_mut() {
-                    search.active = Some(range);
+                    search.results.selected = Some((index, range));
                 }
+                self.scroll_viewport(ViewportScroll::Row(range.start.row as usize), cx);
                 self.presentation_dirty = true;
                 cx.notify();
             }
@@ -799,6 +811,7 @@ impl TerminalWidget {
                     break;
                 };
                 let completed = widget.update(cx, |this, cx| {
+                    this.begin_output_turn();
                     let started = executor.now();
                     let mut drained_bytes = 0;
                     let mut event = first_event;
@@ -851,9 +864,26 @@ impl TerminalWidget {
     fn apply_pty_event(&mut self, event: PtyEvent, cx: &mut Context<Self>) {
         match event {
             PtyEvent::Output(data) => {
-                self.terminal.vt_write(&data);
-                self.presentation_dirty = true;
-                self.output_seq = self.output_seq.saturating_add(data.len() as u64);
+                let mut rest = data.as_slice();
+                while !rest.is_empty() {
+                    let progress = self.terminal.vt_write_until_hold(rest);
+                    rest = &rest[progress.consumed..];
+                    self.output_seq = self.output_seq.saturating_add(progress.consumed as u64);
+                    match progress.hold_began_after {
+                        // Output since the last commit completed a frame the
+                        // terminal still shows; the new hold starts after it.
+                        Some(before) if before > 0 || self.presentation_dirty => {
+                            self.capture_hold_frame(cx)
+                        }
+                        Some(_) => {}
+                        // An unfinished sequence changes nothing until it
+                        // completes; if it begins a hold, nothing was drawn.
+                        None if progress.consumed > progress.unfinished => {
+                            self.presentation_dirty = true
+                        }
+                        None => {}
+                    }
+                }
                 self.schedule_search_step(cx);
                 if !self.semantic_commands_available {
                     self.semantic_commands_available =
@@ -1241,7 +1271,7 @@ impl TerminalWidget {
             action,
             keystroke,
         ) {
-            self.terminal.scroll_viewport(ViewportScroll::Bottom);
+            self.scroll_viewport(ViewportScroll::Bottom, cx);
             if let Err(error) = self.terminal.clear_selection() {
                 eprintln!("Failed to clear terminal selection after typing: {error}");
             }
@@ -1404,8 +1434,7 @@ impl TerminalWidget {
                     );
                 }
             } else {
-                self.terminal
-                    .scroll_viewport(wheel_rows_to_viewport_scroll(wheel_rows));
+                self.scroll_viewport(wheel_rows_to_viewport_scroll(wheel_rows), cx);
                 self.presentation_dirty = true;
                 cx.notify();
             }
@@ -1568,7 +1597,7 @@ impl TerminalWidget {
         let Some(row) = scrollbar_row_at(scrollbar, track_height, local_y) else {
             return;
         };
-        self.terminal.scroll_viewport(ViewportScroll::Row(row));
+        self.scroll_viewport(ViewportScroll::Row(row), cx);
         self.presentation_dirty = true;
         cx.notify();
     }
@@ -1616,7 +1645,7 @@ impl TerminalWidget {
     fn write_paste(&mut self, text: &[u8], cx: &mut Context<Self>) {
         match self.terminal.encode_paste(text) {
             Ok(bytes) => {
-                self.terminal.scroll_viewport(ViewportScroll::Bottom);
+                self.scroll_viewport(ViewportScroll::Bottom, cx);
                 if let Err(error) = self.terminal.clear_selection() {
                     eprintln!("Failed to clear terminal selection after paste: {error}");
                 }

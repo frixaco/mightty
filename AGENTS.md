@@ -29,6 +29,11 @@ src/
 ├── feedback.rs          # Serializable terminal/frame capture data
 ├── pane_container.rs    # Tabs, sidebar, top-level pane actions, and key bindings
 ├── split.rs             # Orientation-aware terminal split tree
+├── system_usage/
+│   ├── mod.rs           # Shared usage model and title-bar meters
+│   ├── windows.rs       # CPU, memory, and D3DKMT GPU counters
+│   └── windows/
+│       └── processes.rs # Per-pane process tree usage
 ├── widget/
 │   ├── mod.rs           # TerminalWidget lifecycle and GPUI task wiring
 │   ├── pty.rs           # Wake-driven PTY worker bridge
@@ -89,6 +94,14 @@ requirement because `build.rs` validates the submodule revision.
   that closes the tab and its panes.
 - The sidebar header holds the sidebar toggle, command palette, and new-tab
   buttons. The title bar shows the active tab title and working directory.
+- On Windows, the title bar also shows system CPU, memory, GPU, and dedicated
+  GPU memory usage. One shared sampler reads them once a second, only while a
+  window showing them is visible. GPU usage is the busiest engine on the
+  adapter with the most dedicated memory, as Task Manager reports it. As the
+  window narrows, graphs are dropped first, then VRAM, GPU, and memory meters.
+- Hovering the meters opens a scrollable popup with CPU, private memory, and
+  GPU usage for each pane's shell and its descendants, grouped by tab. Pane
+  process trees are sampled only while the popup is open.
 - `Ctrl+B` toggles the sidebar; while hidden, its toggle moves to the title bar.
 - `Alt+Enter` splits the active pane to the right.
 - `Alt+Shift+Enter` splits the active pane downward.

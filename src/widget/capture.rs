@@ -173,7 +173,7 @@ impl TerminalWidget {
             "lifecycle":if self.has_exited {"output_ended"} else {"running"},"output_eof":self.output_eof,"io_error":self.io_error,"processes":self.pty_worker.as_ref().and_then(|worker|worker.root_process()).map(|root|root.state()).unwrap_or(serde_json::json!({"availability":"unavailable"})),
             "font":{"family":self.config.font_family,"size_px":self.config.font_size_px},
             "viewport":self.terminal.scrollbar().ok().map(|s|json!({"offset":s.offset,"length":s.len,"total":s.total})),
-            "selection":self.terminal.has_selection().ok(),"selection_coordinates":self.terminal.selection_coordinates().ok().flatten(),"search_open":self.search.is_some(),"search":self.search.as_ref().map(|search|json!({"query":search.query,"progress":format!("{:?}",search.progress),"matches":search.ranges.len(),"diagnostic":search.diagnostic}))})
+            "selection":self.terminal.has_selection().ok(),"selection_coordinates":self.terminal.selection_coordinates().ok().flatten(),"search_open":self.search.is_some(),"search":self.search.as_ref().map(|search|json!({"query":search.query,"progress":format!("{:?}",search.progress),"matches":search.results.total,"diagnostic":search.diagnostic}))})
     }
 
     pub fn control_read(
@@ -212,9 +212,7 @@ impl TerminalWidget {
                 "choose viewport or tail",
             ));
         }
-        let mut state = crate::ghostty::RenderState::new()?;
-        let snapshot = state.observe(&self.terminal)?;
-        let colors = snapshot.colors()?;
+        let colors = self.terminal.colors()?;
         let observation = self.terminal.diagnostic_rows(
             viewport,
             (tail as usize).min(crate::control::MAX_READ_ROWS),

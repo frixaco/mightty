@@ -6,7 +6,8 @@ use std::ptr::NonNull;
 use std::rc::Rc;
 
 use crate::ghostty::error::{from_result, from_result_with_len};
-use crate::ghostty::search::SearchState;
+use crate::ghostty::render::Colors;
+use crate::ghostty::search::{ControlSearch, SearchState};
 use crate::ghostty::selection::{SelectionDrag, SelectionGesture, SelectionPress, SelectionUpdate};
 use crate::ghostty::style::{Palette, RgbColor};
 use crate::ghostty::{Error, Result, ffi};
@@ -18,11 +19,10 @@ use crate::ghostty::{Error, Result, ffi};
 pub struct Terminal {
     raw: NonNull<ffi::TerminalImpl>,
     pub(crate) search: Option<SearchState>,
-    pub(crate) control_searches: std::collections::BTreeMap<u64, SearchState>,
+    pub(crate) control_searches: std::collections::BTreeMap<u64, ControlSearch>,
     pub(crate) next_control_search: u64,
     selection_gesture: SelectionGesture,
     callbacks: Box<CallbackState>,
-    sync_generation: u64,
     write_revision: u64,
     _not_send_or_sync: PhantomData<Rc<()>>,
 }
@@ -33,6 +33,19 @@ pub struct TerminalOptions {
     pub cols: u16,
     pub rows: u16,
     pub max_scrollback: usize,
+}
+
+/// Result of [`Terminal::vt_write_until_hold`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WriteProgress {
+    /// Bytes applied to the terminal.
+    pub consumed: usize,
+    /// Set when a render hold began: how many bytes of this call preceded
+    /// the sequence that began it, so zero means only that sequence ran.
+    pub hold_began_after: Option<usize>,
+    /// Trailing bytes of an escape sequence still being parsed. They change
+    /// nothing until a later write completes the sequence.
+    pub unfinished: usize,
 }
 
 /// A terminal viewport movement in Ghostty's scrollback row space.
@@ -141,31 +154,164 @@ impl Terminal {
             next_control_search: 1,
             selection_gesture,
             callbacks: Box::new(CallbackState::default()),
-            sync_generation: 0,
             write_revision: 0,
             _not_send_or_sync: PhantomData,
         };
         let userdata = std::ptr::from_mut(terminal.callbacks.as_mut()).cast::<c_void>();
         terminal.set_raw_pointer(ffi::TerminalOption::USERDATA, userdata)?;
+        let render_hold: ffi::TerminalRenderHoldFn = Some(render_hold_trampoline);
+        terminal.set_raw_pointer(
+            ffi::TerminalOption::RENDER_HOLD,
+            render_hold.map_or(std::ptr::null(), |callback| {
+                callback as *const () as *const c_void
+            }),
+        )?;
+        let reset: ffi::TerminalResetFn = Some(reset_trampoline);
+        terminal.set_raw_pointer(
+            ffi::TerminalOption::RESET,
+            reset.map_or(std::ptr::null(), |callback| {
+                callback as *const () as *const c_void
+            }),
+        )?;
         Ok(terminal)
     }
 
-    pub fn vt_write(&mut self, data: &[u8]) {
-        self.write_revision = self.write_revision.wrapping_add(1);
-        self.sync_generation = self.sync_generation.wrapping_add(unsafe {
-            ffi::mightty_ghostty_vt_write(self.as_raw(), data.as_ptr(), data.len())
-        });
+    pub fn vt_write(&mut self, mut data: &[u8]) {
+        while !data.is_empty() {
+            let progress = self.vt_write_until_hold(data);
+            data = &data[progress.consumed..];
+        }
+    }
+
+    /// Write output, stopping right after a render hold begins.
+    ///
+    /// When a program starts synchronized output, the terminal still holds
+    /// the frame it wants left on screen; the caller can present it before
+    /// writing the rest. Ghostty owns all parsing: printable runs are divided
+    /// only at ESC so each sequence completes in its own native call.
+    pub fn vt_write_until_hold(&mut self, data: &[u8]) -> WriteProgress {
+        let progress = self.write_until_hold(data);
+        // Buffering part of a sequence changes nothing visible yet.
+        if progress.consumed > progress.unfinished {
+            self.write_revision = self.write_revision.wrapping_add(1);
+        }
+        progress
+    }
+
+    fn write_until_hold(&mut self, data: &[u8]) -> WriteProgress {
+        let holds = self.callbacks.hold_starts;
+        let mut consumed = 0;
+        // Start of the escape sequence being parsed, when it began in this call.
+        let mut sequence_start = None;
+        let mut at_ground = true;
+        while consumed < data.len() {
+            let rest = &data[consumed..];
+            let mut written = 0;
+            let result = unsafe {
+                ffi::ghostty_terminal_vt_write_until_ground(
+                    self.as_raw(),
+                    rest.as_ptr(),
+                    rest.len(),
+                    &raw mut written,
+                )
+            };
+            at_ground = result != ffi::Result::NO_VALUE;
+            if !at_ground {
+                written = rest.len();
+            }
+            if written == 0 {
+                // At ground: a printable run, or one ESC to enter the parser.
+                let run = rest
+                    .iter()
+                    .position(|&byte| byte == 0x1b)
+                    .unwrap_or(rest.len());
+                let take = run.max(1);
+                if run == 0 {
+                    sequence_start = Some(consumed);
+                    at_ground = false;
+                }
+                unsafe { ffi::ghostty_terminal_vt_write(self.as_raw(), rest.as_ptr(), take) };
+                written = take;
+            }
+            consumed += written.min(rest.len());
+            if self.callbacks.hold_starts != holds {
+                return WriteProgress {
+                    consumed,
+                    hold_began_after: Some(sequence_start.unwrap_or(0)),
+                    unfinished: 0,
+                };
+            }
+        }
+        WriteProgress {
+            consumed,
+            hold_began_after: None,
+            unfinished: if at_ground {
+                0
+            } else {
+                consumed - sequence_start.unwrap_or(0)
+            },
+        }
     }
 
     pub fn synchronized_output(&self) -> Result<bool> {
         self.mode(2026)
     }
-    pub fn sync_generation(&self) -> u64 {
-        self.sync_generation
+
+    /// Current colors, resolved as Ghostty's render state resolves them,
+    /// without consuming any renderer's dirty state.
+    pub fn colors(&self) -> Result<Colors> {
+        let effective = |data| {
+            let mut color = ffi::ColorRgb::default();
+            let result = unsafe {
+                ffi::ghostty_terminal_get(
+                    self.as_raw(),
+                    data,
+                    std::ptr::from_mut(&mut color).cast(),
+                )
+            };
+            if result == ffi::Result::NO_VALUE {
+                return Ok(None);
+            }
+            from_result(result).map(|()| Some(RgbColor::from(color)))
+        };
+        let mut background = RgbColor { r: 0, g: 0, b: 0 };
+        let mut foreground = RgbColor {
+            r: 0xff,
+            g: 0xff,
+            b: 0xff,
+        };
+        if let (Some(bg), Some(fg)) = (
+            effective(ffi::TerminalData::COLOR_BACKGROUND)?,
+            effective(ffi::TerminalData::COLOR_FOREGROUND)?,
+        ) {
+            // DECSCNM (reverse video) swaps the defaults.
+            (background, foreground) = if self.mode(5)? { (fg, bg) } else { (bg, fg) };
+        }
+        let palette: [ffi::ColorRgb; 256] =
+            unsafe { self.get_unchecked(ffi::TerminalData::COLOR_PALETTE) }?;
+        Ok(Colors {
+            background,
+            foreground,
+            cursor: effective(ffi::TerminalData::COLOR_CURSOR)?,
+            palette: palette.map(RgbColor::from),
+        })
+    }
+    /// Whether the program holds presentation (synchronized output).
+    pub fn render_held(&self) -> bool {
+        self.callbacks.render_held
+    }
+    /// Number of render holds begun; each hold gets its own deadline.
+    pub fn hold_generation(&self) -> u64 {
+        self.callbacks.hold_starts
+    }
+    /// Number of full resets (RIS) performed by the program.
+    pub fn reset_generation(&self) -> u64 {
+        self.callbacks.resets
     }
     pub fn write_revision(&self) -> u64 {
         self.write_revision
     }
+    /// End a render hold ourselves; Ghostty reports no callback for this.
     pub fn end_synchronized_output(&mut self) -> Result<()> {
         let config = ffi::TerminalModeConfig {
             mode: 2026,
@@ -174,7 +320,9 @@ impl Terminal {
         self.set_raw_pointer(
             ffi::TerminalOption::MODE,
             std::ptr::from_ref(&config).cast(),
-        )
+        )?;
+        self.callbacks.render_held = false;
+        Ok(())
     }
     pub fn set_default_cursor(
         &mut self,
@@ -623,6 +771,38 @@ struct CallbackState {
     title_changed: Option<Box<MetadataCallback>>,
     working_directory_changed: Option<Box<MetadataCallback>>,
     clipboard_write: Option<Box<ClipboardWriteCallback>>,
+    render_held: bool,
+    hold_starts: u64,
+    resets: u64,
+    /// The last title reported to listeners was non-empty.
+    has_title: bool,
+}
+
+unsafe extern "C" fn render_hold_trampoline(
+    _terminal: ffi::Terminal,
+    userdata: *mut c_void,
+    held: bool,
+) {
+    invoke_callback(userdata, |callbacks| {
+        if held {
+            callbacks.hold_starts = callbacks.hold_starts.wrapping_add(1);
+        }
+        callbacks.render_held = held;
+    });
+}
+
+unsafe extern "C" fn reset_trampoline(_terminal: ffi::Terminal, userdata: *mut c_void) {
+    invoke_callback(userdata, |callbacks| {
+        callbacks.resets = callbacks.resets.wrapping_add(1);
+        // A full reset clears the title without its callback; report that once.
+        // The shell still runs in its last reported directory, which it
+        // re-reports at the next prompt, so that report is kept.
+        if std::mem::take(&mut callbacks.has_title)
+            && let Some(callback) = callbacks.title_changed.as_deref_mut()
+        {
+            callback(Ok(None));
+        }
+    });
 }
 
 unsafe extern "C" fn pty_write_trampoline(
@@ -658,6 +838,10 @@ unsafe extern "C" fn bell_trampoline(_terminal: ffi::Terminal, userdata: *mut c_
 unsafe extern "C" fn title_changed_trampoline(terminal: ffi::Terminal, userdata: *mut c_void) {
     let title = terminal_string(terminal, ffi::TerminalData::TITLE);
     invoke_callback(userdata, |callbacks| {
+        // Listeners keep their previous title when a new one is invalid.
+        if let Ok(title) = &title {
+            callbacks.has_title = title.is_some();
+        }
         if let Some(callback) = callbacks.title_changed.as_deref_mut() {
             callback(title);
         }
@@ -867,6 +1051,30 @@ mod tests {
     }
 
     #[test]
+    fn writes_stop_at_holds_and_report_unfinished_sequences() {
+        let mut terminal = selection_terminal(20, 2);
+        terminal.vt_write(b"abc");
+        let before = terminal.write_revision();
+        let progress = terminal.vt_write_until_hold(b"x\x1b[?20");
+        assert_eq!((progress.consumed, progress.unfinished), (6, 5));
+        assert_eq!(progress.hold_began_after, None);
+        let revision = terminal.write_revision();
+        assert_eq!(revision, before + 1);
+        // Only part of a sequence: nothing visible changed.
+        let progress = terminal.vt_write_until_hold(b"2");
+        assert_eq!((progress.consumed, progress.unfinished), (1, 1));
+        assert_eq!(terminal.write_revision(), revision);
+        let progress = terminal.vt_write_until_hold(b"6hnext");
+        assert_eq!(progress.consumed, 2);
+        assert_eq!(progress.hold_began_after, Some(0));
+        assert!(terminal.render_held());
+        let progress = terminal.vt_write_until_hold(b"ab\x1b[?2026l\x1b[?2026hcd");
+        assert_eq!(progress.consumed, 18);
+        assert_eq!(progress.hold_began_after, Some(10));
+        assert_eq!(terminal.hold_generation(), 2);
+    }
+
+    #[test]
     fn contains_panics_from_terminal_callbacks() {
         let mut terminal = Terminal::new(TerminalOptions {
             cols: 80,
@@ -937,6 +1145,17 @@ mod tests {
         );
         assert_eq!(*bells.borrow(), 1);
         assert_eq!(clipboard.borrow()[0].contents[0].data.as_slice(), b"hello");
+
+        // A full reset clears the title, which listeners must not keep. The
+        // shell's directory is unchanged, so its last report stands.
+        let directory_reports = directories.borrow().len();
+        terminal.vt_write(b"\x1bc");
+        assert_eq!(titles.borrow().last(), Some(&Ok(None)));
+        assert_eq!(directories.borrow().len(), directory_reports);
+        // A reset without a title reports nothing.
+        let title_reports = titles.borrow().len();
+        terminal.vt_write(b"\x1bc");
+        assert_eq!(titles.borrow().len(), title_reports);
     }
 
     #[test]

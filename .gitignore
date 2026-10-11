@@ -5,6 +5,4 @@ target/
 /cmux/
 /ghostling/
 /fonts/
-/tools/ghostty-search/.zig-cache/
-/tools/ghostty-search/zig-pkg/
 .DS_Store

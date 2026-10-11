@@ -176,7 +176,7 @@ impl TerminalWidget {
             if request.args.contains_key("rows") {
                 return Err(ControlError::new("invalid_argument", "choose rows or to"));
             }
-            self.terminal.scroll_viewport(match to {
+            let to = match to {
                 "top" => ViewportScroll::Top,
                 "bottom" => ViewportScroll::Bottom,
                 _ => {
@@ -185,7 +185,8 @@ impl TerminalWidget {
                         "to must be top or bottom",
                     ));
                 }
-            });
+            };
+            self.scroll_viewport(to, cx);
         } else {
             let rows = control::number_arg(request, "rows", 0.0)?;
             if rows.fract() != 0.0 || rows.abs() > 1_000_000.0 {
@@ -194,8 +195,7 @@ impl TerminalWidget {
                     "rows must be an integer within +/-1000000",
                 ));
             }
-            self.terminal
-                .scroll_viewport(ViewportScroll::Delta(rows as isize));
+            self.scroll_viewport(ViewportScroll::Delta(rows as isize), cx);
         }
         self.presentation_dirty = true;
         cx.notify();

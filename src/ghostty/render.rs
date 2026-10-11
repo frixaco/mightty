@@ -59,15 +59,6 @@ impl RenderState {
         from_result(result)?;
         Ok(Snapshot { state: self })
     }
-
-    /// Copy presentation data without consuming terminal dirty flags.
-    /// Used by live diagnostics and complete rebuilds after a failed snapshot update.
-    pub fn observe(&mut self, terminal: &Terminal) -> Result<Snapshot<'_>> {
-        from_result(unsafe {
-            ffi::mightty_ghostty_render_observe(self.raw.as_ptr(), terminal.as_raw())
-        })?;
-        Ok(Snapshot { state: self })
-    }
 }
 
 impl Snapshot<'_> {
@@ -460,13 +451,18 @@ pub struct Colors {
 #[cfg(test)]
 mod observation_tests {
     use super::*;
-    fn text(state: &mut RenderState, terminal: &Terminal, observe: bool) -> String {
-        let snapshot = if observe {
-            state.observe(terminal)
-        } else {
-            state.update(terminal)
-        }
-        .unwrap();
+
+    fn terminal() -> Terminal {
+        Terminal::new(crate::ghostty::TerminalOptions {
+            cols: 12,
+            rows: 2,
+            max_scrollback: 100,
+        })
+        .unwrap()
+    }
+
+    fn text(state: &mut RenderState, terminal: &Terminal) -> String {
+        let snapshot = state.update(terminal).unwrap();
         let mut rows = RowIterator::new().unwrap();
         let mut cells = CellIterator::new().unwrap();
         let mut result = String::new();
@@ -479,21 +475,44 @@ mod observation_tests {
         }
         result
     }
+
     #[test]
-    fn independent_observation_preserves_the_live_renderers_updates() {
-        let mut terminal = Terminal::new(crate::ghostty::TerminalOptions {
-            cols: 12,
-            rows: 2,
-            max_scrollback: 100,
-        })
-        .unwrap();
+    fn terminal_colors_match_the_render_state() {
+        let mut terminal = terminal();
+        let check = |terminal: &mut Terminal, bytes: &[u8]| {
+            terminal.vt_write(bytes);
+            // A fresh render state copies everything, including the palette.
+            let mut state = RenderState::new().unwrap();
+            let rendered = state.update(terminal).unwrap().colors().unwrap();
+            assert_eq!(terminal.colors().unwrap(), rendered, "after {bytes:?}");
+        };
+        check(&mut terminal, b"");
+        check(&mut terminal, b"\x1b[?5h");
+        terminal
+            .set_default_fg_color(Some(RgbColor { r: 1, g: 2, b: 3 }))
+            .unwrap()
+            .set_default_bg_color(Some(RgbColor { r: 4, g: 5, b: 6 }))
+            .unwrap();
+        check(&mut terminal, b"");
+        check(&mut terminal, b"\x1b[?5l");
+        check(
+            &mut terminal,
+            b"\x1b]10;#102030\x07\x1b]11;#405060\x07\x1b]12;#708090\x07\x1b]4;1;#a0b0c0\x07",
+        );
+        check(&mut terminal, b"\x1b[?5h");
+        check(&mut terminal, b"\x1bc");
+    }
+
+    #[test]
+    fn diagnostic_reads_leave_the_live_renderers_updates() {
+        let mut terminal = terminal();
         let mut live = RenderState::new().unwrap();
         terminal.vt_write(b"before");
-        assert!(text(&mut live, &terminal, false).contains("before"));
+        assert!(text(&mut live, &terminal).contains("before"));
         terminal.vt_write(b"\r\x1b[2Kafter");
-        assert!(text(&mut RenderState::new().unwrap(), &terminal, true).contains("after"));
-        assert!(text(&mut live, &terminal, false).contains("after"));
-        // A second independent observation must also work after all flags are clean.
-        assert!(text(&mut RenderState::new().unwrap(), &terminal, true).contains("after"));
+        let colors = terminal.colors().unwrap();
+        let rows = terminal.diagnostic_rows(true, 2, 4096, &colors).unwrap();
+        assert!(rows.rows[0].cells.iter().any(|cell| cell.text == "a"));
+        assert!(text(&mut live, &terminal).contains("after"));
     }
 }

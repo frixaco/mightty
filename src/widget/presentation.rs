@@ -68,16 +68,16 @@ impl TerminalWidget {
         self.publish_terminal(cx);
     }
 
+    /// Start a drain turn of PTY output, which may commit one completed frame
+    /// at a hold start.
+    pub(super) fn begin_output_turn(&mut self) {
+        self.hold_frame_captured = false;
+    }
+
+    /// Returns whether presentation is held.
     pub(super) fn poll_presentation_mode(&mut self, cx: &mut Context<Self>) -> bool {
-        let active = match self.terminal.synchronized_output() {
-            Ok(active) => active,
-            Err(error) => {
-                self.presentation_failure(error);
-                return true;
-            }
-        };
-        let generation = self.terminal.sync_generation();
-        if active {
+        if self.terminal.render_held() {
+            let generation = self.terminal.hold_generation();
             if self.sync_hold.is_none_or(|(old, _)| old != generation) {
                 let deadline = cx.background_executor().now() + Duration::from_secs(1);
                 self.sync_hold = Some((generation, deadline));
@@ -86,7 +86,8 @@ impl TerminalWidget {
                     let _ = this.update(cx, |this, cx| {
                         if this.sync_hold.is_some_and(|(old, deadline)| {
                             old == generation && cx.background_executor().now() >= deadline
-                        }) && this.terminal.sync_generation() == generation
+                        }) && this.terminal.render_held()
+                            && this.terminal.hold_generation() == generation
                         {
                             this.recover_presentation(cx);
                         }
@@ -98,6 +99,20 @@ impl TerminalWidget {
         self.sync_hold = None;
         self.sync_task = Task::ready(());
         false
+    }
+
+    /// Commit the frame a program completed before starting a render hold.
+    ///
+    /// The terminal holds exactly that frame when the hold begins. At most one
+    /// capture per drain turn bounds the work when completed frames arrive
+    /// faster than they can be shown; later holds keep this complete frame.
+    pub(super) fn capture_hold_frame(&mut self, cx: &mut Context<Self>) {
+        self.presentation_dirty = true;
+        if self.hold_frame_captured || self.presentation_resize_failed {
+            return;
+        }
+        self.hold_frame_captured = true;
+        self.commit_terminal_frame(cx);
     }
 
     pub(super) fn publish_terminal(&mut self, cx: &mut Context<Self>) {
@@ -112,6 +127,10 @@ impl TerminalWidget {
         {
             return;
         }
+        self.commit_terminal_frame(cx);
+    }
+
+    fn commit_terminal_frame(&mut self, cx: &mut Context<Self>) {
         match self.build_terminal_frame() {
             Ok(frame) => {
                 let blinking_changed = self.committed.as_ref().is_none_or(|old| {
@@ -125,7 +144,15 @@ impl TerminalWidget {
                         frame.cursor.position.is_some(),
                     )
                 });
+                // Search highlights are fed per viewport; follow any scroll.
+                let scrolled = self
+                    .search
+                    .as_ref()
+                    .is_some_and(|search| search.viewport_offset != frame.scrollbar.offset);
                 self.committed = Some(Rc::new(frame));
+                if scrolled {
+                    self.schedule_search_step(cx);
+                }
                 self.presentation_dirty = false;
                 self.presentation_snapshot_invalid = false;
                 self.presentation_retry = Task::ready(());
@@ -169,12 +196,12 @@ impl TerminalWidget {
     }
 
     fn build_terminal_frame(&mut self) -> crate::ghostty::Result<TerminalFrame> {
-        // A failed native update may already have consumed some row dirty flags.
-        let snapshot = if self.presentation_snapshot_invalid {
-            self.render_state.observe(&self.terminal)?
-        } else {
-            self.render_state.update(&self.terminal)?
-        };
+        // A failed native update may already have consumed some row dirty
+        // flags, leaving cached rows stale; a fresh state copies every row.
+        if self.presentation_snapshot_invalid {
+            self.render_state = RenderState::new()?;
+        }
+        let snapshot = self.render_state.update(&self.terminal)?;
         let colors = snapshot.colors()?;
         let cursor = snapshot.cursor()?;
         let mut rows = Vec::with_capacity(usize::from(self.size.1));
@@ -263,6 +290,7 @@ mod tests {
     }
     fn write(widget: &gpui_kit::Entity<TerminalWidget>, bytes: &[u8], cx: &mut TestAppContext) {
         widget.update(cx, |widget, cx| {
+            widget.begin_output_turn();
             widget.apply_pty_event(PtyEvent::Output(bytes.to_vec()), cx);
             widget.publish_terminal(cx);
         });
@@ -308,28 +336,48 @@ mod tests {
                 assert_eq!(frame.output_seq, widget.output_seq);
             });
         }
-        let mut stream = Vec::new();
-        for index in 0..80 {
-            stream.extend_from_slice(
+        let frames = (0..80)
+            .map(|index| {
                 format!(
                     "\x1b[?2026h\x1b[?25l\x1b[H\x1b[2Kframe-{index:03}\x1b[2;1H\x1b[1;38;2;123;80;40m界e\u{301}😀\x1b[0m\x1b]8;;https://example.com\x1b\\label\x1b]8;;\x1b\\\x1b[3;8H\x1b[6 q\x1b[?25h\x1b[?2026l"
                 )
-                .as_bytes(),
-            );
-        }
+                .into_bytes()
+            })
+            .collect::<Vec<_>>();
+        let stream = frames.concat();
+        // Every frame the program completes; nothing else may be committed.
         write(&widget, b"\x1bc", cx);
-        write(&widget, &stream, cx);
-        let expected = widget.read_with(cx, |widget, _| {
-            appearance(widget.committed.as_ref().unwrap())
-        });
+        let committed = |cx: &mut TestAppContext| {
+            widget.read_with(cx, |widget, _| {
+                appearance(widget.committed.as_ref().unwrap()).to_string()
+            })
+        };
+        let mut complete = std::collections::HashSet::from([committed(cx)]);
+        for frame in &frames {
+            write(&widget, frame, cx);
+            complete.insert(committed(cx));
+        }
+        let expected = committed(cx);
+        // Every unfinished state here differs from complete frames in its text
+        // or cursor (hidden until the frame ends), so compare a whole frame
+        // the first time its text and cursor are committed.
+        let mut verified = std::collections::HashSet::new();
+        let mut assert_complete = |cx: &mut TestAppContext, context: &str| {
+            let key = widget.read_with(cx, |widget, _| {
+                let frame = widget.committed.as_ref().unwrap();
+                format!("{}{:?}", text(frame), frame.cursor)
+            });
+            if verified.insert(key) {
+                assert!(complete.contains(&committed(cx)), "{context}");
+            }
+        };
         for chunk_size in [1, 2, 7, 31, 1024, stream.len()] {
             write(&widget, b"\x1bc", cx);
             for chunk in stream.chunks(chunk_size) {
                 write(&widget, chunk, cx);
+                assert_complete(cx, &format!("chunk size {chunk_size}"));
             }
-            widget.read_with(cx, |widget, _| {
-                assert_eq!(appearance(widget.committed.as_ref().unwrap()), expected)
-            });
+            assert_eq!(committed(cx), expected);
         }
         for seed in 1..=12u64 {
             write(&widget, b"\x1bc", cx);
@@ -338,19 +386,177 @@ mod tests {
             while !remaining.is_empty() {
                 random = random.wrapping_mul(6364136223846793005).wrapping_add(1);
                 let count = (1 + (random as usize % 113)).min(remaining.len());
-                let before = widget.read_with(cx, |widget, _| widget.committed.clone().unwrap());
                 write(&widget, &remaining[..count], cx);
-                widget.read_with(cx, |widget, _| {
-                    if widget.terminal.synchronized_output().unwrap() {
-                        assert!(Rc::ptr_eq(&before, widget.committed.as_ref().unwrap()));
-                    }
-                });
+                assert_complete(cx, &format!("seed {seed}"));
                 remaining = &remaining[count..];
             }
+            assert_eq!(committed(cx), expected);
+        }
+    }
+
+    #[gpui_kit::test]
+    fn continuous_holds_publish_each_completed_frame(cx: &mut TestAppContext) {
+        let widget = widget(cx);
+        write(&widget, b"\x1b[?2026h\rf0", cx);
+        // Every drain turn completes one frame and starts the next hold.
+        for frame in 1..=5 {
+            cx.background_executor
+                .advance_clock(Duration::from_millis(400));
+            cx.run_until_parked();
+            write(
+                &widget,
+                format!("\x1b[?2026l\x1b[?2026h\r\x1b[2Kf{frame}").as_bytes(),
+                cx,
+            );
             widget.read_with(cx, |widget, _| {
-                assert_eq!(appearance(widget.committed.as_ref().unwrap()), expected)
+                assert!(widget.terminal.synchronized_output().unwrap());
+                let previous = format!("f{}", frame - 1);
+                assert!(
+                    text(widget.committed.as_ref().unwrap()).starts_with(&previous),
+                    "frame {frame} did not publish {previous}"
+                );
             });
         }
+    }
+
+    #[gpui_kit::test]
+    fn output_task_commits_completed_frames_in_every_drain_turn(cx: &mut TestAppContext) {
+        let (tx, rx) = flume::bounded(64);
+        let widget = cx.new(|cx| {
+            TerminalWidget::with_pty(
+                TerminalConfig {
+                    initial_cols: 24,
+                    initial_rows: 4,
+                    cursor_blink: false,
+                    ..Default::default()
+                },
+                Arc::new(AtomicBool::new(false)),
+                None,
+                Some(rx),
+                None,
+                cx,
+            )
+        });
+        tx.send(PtyEvent::Output(b"\x1b[?2026h\rf0".to_vec()))
+            .unwrap();
+        cx.run_until_parked();
+        for frame in 1..=3 {
+            tx.send(PtyEvent::Output(
+                format!("\x1b[?2026l\x1b[?2026h\r\x1b[2Kf{frame}").into_bytes(),
+            ))
+            .unwrap();
+            // The task yields on a 1 ms timer between drain turns.
+            cx.background_executor
+                .advance_clock(Duration::from_millis(1));
+            cx.run_until_parked();
+            widget.read_with(cx, |widget, _| {
+                assert!(widget.terminal.render_held());
+                let previous = format!("f{}", frame - 1);
+                assert!(text(widget.committed.as_ref().unwrap()).starts_with(&previous));
+            });
+        }
+    }
+
+    #[gpui_kit::test]
+    fn scrolling_refeeds_search_highlights_without_a_repaint(cx: &mut TestAppContext) {
+        let widget = widget(cx);
+        let mut lines = String::new();
+        for line in 0..400 {
+            lines.push_str(&format!("needle {line}\r\nfiller\r\n"));
+        }
+        write(&widget, lines.as_bytes(), cx);
+        widget.update(cx, |widget, cx| {
+            widget.terminal.start_search("needle").unwrap();
+            widget.search = Some(search::SearchOverlay {
+                query: "needle".into(),
+                progress: SearchProgress::Pending,
+                ..Default::default()
+            });
+            widget.schedule_search_step(cx);
+        });
+        for _ in 0..1000 {
+            cx.background_executor
+                .advance_clock(Duration::from_millis(1));
+            cx.run_until_parked();
+            if widget.read_with(cx, |widget, _| {
+                widget.search.as_ref().unwrap().progress == SearchProgress::Complete
+            }) {
+                break;
+            }
+        }
+        widget.update(cx, |widget, cx| {
+            assert_ne!(widget.search.as_ref().unwrap().viewport_offset, 0);
+            widget.scroll_viewport(ViewportScroll::Top, cx);
+        });
+        // Only the search step runs; nothing publishes a frame in between.
+        cx.background_executor
+            .advance_clock(Duration::from_millis(1));
+        cx.run_until_parked();
+        widget.read_with(cx, |widget, _| {
+            let search = widget.search.as_ref().unwrap();
+            assert_eq!(search.viewport_offset, 0);
+            assert!(
+                search
+                    .results
+                    .visible
+                    .iter()
+                    .any(|range| range.start.row == 0)
+            );
+        });
+    }
+
+    #[gpui_kit::test]
+    fn hold_start_does_not_commit_while_a_resize_failed(cx: &mut TestAppContext) {
+        let widget = widget(cx);
+        write(&widget, b"before", cx);
+        let before = widget.read_with(cx, |widget, _| widget.committed.clone().unwrap());
+        widget.update(cx, |widget, cx| {
+            widget.presentation_resize_failed = true;
+            widget.begin_output_turn();
+            widget.apply_pty_event(
+                PtyEvent::Output(b"\r\x1b[2Kafter\x1b[?2026h\r\x1b[2Kpartial".to_vec()),
+                cx,
+            );
+            assert!(Rc::ptr_eq(&before, widget.committed.as_ref().unwrap()));
+            assert!(widget.presentation_dirty);
+        });
+    }
+
+    #[gpui_kit::test]
+    fn split_hold_start_does_not_rebuild_an_unchanged_frame(cx: &mut TestAppContext) {
+        let widget = widget(cx);
+        write(&widget, b"before", cx);
+        let before = widget.read_with(cx, |widget, _| widget.committed.clone().unwrap());
+        write(&widget, b"\x1b[?20", cx);
+        write(&widget, b"26h\r\x1b[2Kpartial", cx);
+        widget.read_with(cx, |widget, _| {
+            assert!(widget.terminal.render_held());
+            assert!(Rc::ptr_eq(&before, widget.committed.as_ref().unwrap()));
+        });
+    }
+
+    #[gpui_kit::test]
+    fn completed_frame_floods_capture_once_per_drain_turn(cx: &mut TestAppContext) {
+        let widget = widget(cx);
+        write(&widget, b"start", cx);
+        let before = widget.read_with(cx, |widget, _| widget.committed.as_ref().unwrap().revision);
+        let mut flood = Vec::new();
+        for frame in 0..50 {
+            flood.extend_from_slice(
+                format!("\x1b[?2026h\r\x1b[2Kf{frame:02}\x1b[?2026l").as_bytes(),
+            );
+        }
+        flood.extend_from_slice(b"\x1b[?2026h\r\x1b[2Kunfinished");
+        write(&widget, &flood, cx);
+        widget.read_with(cx, |widget, _| {
+            let frame = widget.committed.as_ref().unwrap();
+            assert_eq!(frame.revision, before + 1);
+            assert!(text(frame).starts_with("f00"));
+        });
+        write(&widget, b"\x1b[?2026l", cx);
+        widget.read_with(cx, |widget, _| {
+            assert!(text(widget.committed.as_ref().unwrap()).starts_with("unfinished"))
+        });
     }
 
     #[gpui_kit::test]
@@ -362,7 +568,8 @@ mod tests {
         cx.background_executor
             .advance_clock(Duration::from_millis(700));
         cx.run_until_parked();
-        // End and restart in one chunk: the old deadline must not end this hold.
+        // End and restart in one chunk: the frame completed between the holds
+        // is shown, and the old deadline must not end the new hold.
         write(&widget, b"\x1b[?2026l\x1b[?2026h\rfresh", cx);
         cx.run_until_parked();
         cx.background_executor
@@ -370,7 +577,7 @@ mod tests {
         cx.run_until_parked();
         widget.read_with(cx, |widget, _| {
             assert!(widget.terminal.synchronized_output().unwrap());
-            assert!(text(widget.committed.as_ref().unwrap()).contains("old"));
+            assert!(text(widget.committed.as_ref().unwrap()).starts_with("new"));
         });
         cx.background_executor
             .advance_clock(Duration::from_millis(600));
@@ -446,10 +653,10 @@ mod tests {
                 .unwrap();
             widget.terminal.selection_release(Some(point(3))).unwrap();
             widget.terminal.start_search("base").unwrap();
-            while widget.terminal.search_step().unwrap() == SearchProgress::Pending {}
+            while widget.terminal.search_step(false).unwrap() == SearchProgress::Pending {}
             widget.search = Some(search::SearchOverlay {
                 query: "base".into(),
-                ranges: widget.terminal.search_ranges().unwrap(),
+                results: widget.terminal.search_results().unwrap(),
                 output_revision: widget.terminal.write_revision(),
                 geometry: widget.size,
                 ..Default::default()

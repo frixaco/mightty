@@ -33,7 +33,7 @@ mod ffi;
 
 pub use error::{Error, Result};
 pub use render::RenderState;
-pub use search::{SearchDirection, SearchPoint, SearchProgress, SearchRange};
+pub use search::{SearchDirection, SearchPoint, SearchProgress, SearchRange, SearchResults};
 pub use selection::{SelectionDrag, SelectionGeometry, SelectionPoint, SelectionPress};
 pub use semantic::PromptDirection;
 pub use terminal::{

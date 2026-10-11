@@ -25,6 +25,11 @@ The command palette, showing each command's category and shortcut.
 
 ![Command palette filtered to pane commands, each with its key binding](docs/screenshots/command-palette.png)
 
+Live CPU, memory, GPU, and VRAM usage in the title bar. Hover the meters for
+usage per pane, grouped by tab.
+
+![Title-bar usage meters with a popup listing CPU, memory, and GPU use for each tab and pane](docs/screenshots/usage-popup.png)
+
 ## Why mightty
 
 - **Everything is scriptable.** Every tab, pane, window, keystroke, and pixel is
@@ -143,6 +148,9 @@ wire protocol.
 
 **Windows integration**
 - Single-process app with a persistent quick-terminal window
+- Live CPU, memory, GPU, and VRAM usage in the title bar, read from the same
+  kernel counters as Task Manager and sampled only while the window is visible
+- Hover the usage meters for CPU, memory, and GPU use per pane, grouped by tab
 - Signed MSIX packages, AppInstaller updates, and default-terminal support
 - PowerShell and Bash shell integration for titles, working directories, and
   prompt navigation
@@ -266,6 +274,7 @@ src/
 ├── ui_control.rs        # Keyboard, pointer, and text injection
 ├── pane_container.rs    # Tabs, sidebar, workspaces, and action dispatch
 ├── split.rs             # Split tree and pane geometry
+├── system_usage/       # Title-bar CPU, memory, and GPU meters (Windows counters)
 ├── settings.rs          # Typed settings and safe reload
 ├── profile.rs           # Profiles and shell launch values
 ├── shell_integration.rs # Shell metadata and integration setup

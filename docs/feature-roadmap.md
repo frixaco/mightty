@@ -92,12 +92,12 @@ control-sequence paste opens a GPUI confirmation overlay before any bytes reach
 the PTY. Hyperlinks should require a configured modifier and pass through a URI
 scheme policy before Windows opens them.
 
-Search is the one missing engine boundary. Ghostty has a mature internal search
-worker, but the current `libghostty-vt` C API does not expose it. Add or upstream
-a small search API that returns tracked grid ranges, then wrap it safely in
-Rust. Do not scrape the rendered viewport: it omits scrollback, mishandles
-wrapped lines, and loses stable coordinates. The query editor and result
-navigation belong in a GPUI overlay; the search itself belongs in Ghostty.
+Search uses Ghostty's public `libghostty-vt` search API, wrapped safely in
+Rust. It covers scrollback and wrapped lines and keeps results in sync with the
+live screens. Do not scrape the rendered viewport: it omits scrollback,
+mishandles wrapped lines, and loses stable coordinates. The query editor and
+result navigation belong in a GPUI overlay; the search itself belongs in Ghostty.
+Navigation wraps around past the oldest and newest results.
 
 ### Important cases
 

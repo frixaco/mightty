@@ -19,3 +19,4 @@ pub mod workspace;
 
 pub mod pane_container;
 pub mod split;
+mod system_usage;

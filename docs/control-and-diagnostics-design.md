@@ -344,9 +344,10 @@ still be redrawing after PTY resize acknowledgement, so fixtures also wait for
 their output/state marker. There is no generic terminal-idle guarantee.
 
 Text waits match a literal in the current active buffer, including retained
-scrollback. `--after-output` requires at least one applied byte beyond its cursor;
-it does **not** establish that the matched text is new. Validate cursor identity
-and reject future sequences. Without a cursor, existing text can satisfy the wait.
+scrollback; as in Ghostty search, ASCII letters compare case-insensitively.
+`--after-output` requires at least one applied byte beyond its cursor; it does
+**not** establish that the matched text is new. Validate cursor identity and
+reject future sequences. Without a cursor, existing text can satisfy the wait.
 
 Deterministic fixtures emit a unique marker only at completion, constructing it
 from fragments so shell echo cannot contain the full marker. Semantic command
@@ -354,9 +355,9 @@ completion would require integration capability and command identity.
 
 Use independent incremental Ghostty search handles, not the interactive
 `Terminal.search` field. Bound waiter count and per-turn work. An unsatisfied
-text wait fails on buffer reset/switch (`buffer_changed`) or removal
-(`pane_closed`, with retained outcome). Evicted or transient text between scans
-may be missed. Process-exit waits follow the root through retained outcomes;
+text wait fails with `buffer_changed` when a probe finds a different active
+buffer or after any full reset (RIS), and with `pane_closed` on removal (with
+retained outcome). Evicted or transient text between scans may be missed. Process-exit waits follow the root through retained outcomes;
 unavailable observation or expired outcomes fail. Timeouts include last observed
 output sequence and lifecycle.
 
