@@ -376,7 +376,12 @@ impl PaneContainer {
         exit_tx: flume::Sender<()>,
         cx: &mut Context<Self>,
     ) -> Entity<TerminalWidget> {
+        // Unit tests run under GPUI's deterministic scheduler, so they get no
+        // shell; tools/control-smoke.ps1 covers real shells in a GUI instance.
+        #[cfg(not(test))]
         let terminal = cx.new(|cx| TerminalWidget::new(config, cx));
+        #[cfg(test)]
+        let terminal = cx.new(|cx| TerminalWidget::without_process(config, cx));
         terminal.update(cx, |terminal, _cx| terminal.set_exit_signal(exit_tx));
         cx.subscribe(&terminal, Self::on_terminal_event).detach();
         cx.observe(&terminal, |_, _, _| crate::diagnostics::mark_dirty())

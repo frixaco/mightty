@@ -303,6 +303,23 @@ impl TerminalWidget {
         )
     }
 
+    /// Create a live terminal with no shell process or PTY threads.
+    ///
+    /// GPUI's test scheduler requires every wake on the test thread; a real
+    /// PTY reader wakes the output task from its own thread whenever the
+    /// shell's first output arrives after that task's first poll.
+    #[cfg(test)]
+    pub(crate) fn without_process(config: TerminalConfig, cx: &mut Context<Self>) -> Self {
+        Self::with_pty(
+            config,
+            Arc::new(AtomicBool::new(false)),
+            None,
+            None,
+            None,
+            cx,
+        )
+    }
+
     fn with_pty(
         config: TerminalConfig,
         exit_flag: Arc<AtomicBool>,
